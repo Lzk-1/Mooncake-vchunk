@@ -3,11 +3,13 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
 #include "config_helper.h"
 #include "types.h"
+#include "vchunk_config.h"
 
 namespace mooncake {
 
@@ -841,6 +843,7 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    VChunkConfig vchunk_config_{};
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -982,6 +985,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
         enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_vchunk_config(VChunkConfig config) {
+        vchunk_config_ = std::move(config);
         return *this;
     }
 
@@ -1227,6 +1235,7 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -1381,6 +1390,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.vchunk_config = vchunk_config_;
     return config;
 }
 
