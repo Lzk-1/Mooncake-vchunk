@@ -7,6 +7,7 @@
 
 #include "ha/oplog/oplog_types.h"
 #include "metadata_store.h"
+#include "vchunk_ha_codec.h"
 
 namespace mooncake {
 
@@ -55,6 +56,8 @@ class OpLogApplier {
     void Recover(uint64_t last_applied_sequence_id);
 
     const StandbySegmentRegistry& GetSegmentRegistry() const;
+    const VChunkRecoveryEntries& GetVChunkRecoveryEntries() const;
+    bool LoadVChunkSnapshot(const VChunkSnapshot& snapshot);
     void ApplySegmentMount(const OpLogEntry& entry);
     void ApplySegmentUnmount(const OpLogEntry& entry);
     void ApplySegmentUpdate(const OpLogEntry& entry);
@@ -83,6 +86,7 @@ class OpLogApplier {
      * @param entry OpLog entry
      */
     void ApplyRemove(const OpLogEntry& entry);
+    bool ApplyVChunkEvent(const OpLogEntry& entry);
 
     MetadataStore* metadata_store_;
 
@@ -94,6 +98,9 @@ class OpLogApplier {
 
     // Standby segment registry
     StandbySegmentRegistry segment_registry_;
+    VChunkRecoveryEntries vchunk_entries_;
+    uint64_t vchunk_sequence_id_{0};
+    VChunkConfig vchunk_config_;
 };
 
 }  // namespace mooncake

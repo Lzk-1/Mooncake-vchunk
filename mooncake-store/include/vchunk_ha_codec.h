@@ -59,6 +59,7 @@ tl::expected<VChunkSnapshot, ErrorCode> DeserializeVChunkSnapshot(
 ErrorCode ApplyVChunkHAEvent(const VChunkHAEvent& event,
                              VChunkRecoveryEntries& entries,
                              uint64_t& applied_sequence_id,
-                             const VChunkConfig& config);
+                             const VChunkConfig& config,
+                             bool allow_global_sequence_gaps = false);
 
 }  // namespace mooncake

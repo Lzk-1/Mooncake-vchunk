@@ -167,6 +167,20 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
+tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode>
+CachelibBufferAllocator::reserveAt(const AllocationClaim& claim) {
+    if (claim.segment_name != segment_name_ || claim.allocated_length == 0 ||
+        claim.offset < base_ || claim.offset - base_ >= total_size_ ||
+        claim.allocated_length > total_size_ - (claim.offset - base_)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto buffer = allocate(claim.allocated_length);
+    if (!buffer || reinterpret_cast<uintptr_t>(buffer->data()) != claim.offset) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    return buffer;
+}
+
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         void* buffer = handle->get_descriptor().protocol_ == "cxl"
@@ -348,6 +362,20 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
                                                                size);
     }
     return allocated_buffer;
+}
+
+tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode>
+OffsetBufferAllocator::reserveAt(const AllocationClaim& claim) {
+    if (claim.segment_name != segment_name_ || claim.allocated_length == 0 ||
+        claim.offset < base_ || claim.offset - base_ >= total_size_ ||
+        claim.allocated_length > total_size_ - (claim.offset - base_)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto buffer = allocate(claim.allocated_length);
+    if (!buffer || reinterpret_cast<uintptr_t>(buffer->data()) != claim.offset) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    return buffer;
 }
 
 void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {

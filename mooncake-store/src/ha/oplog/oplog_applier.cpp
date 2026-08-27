@@ -79,6 +79,9 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
             break;
+        case OpType::VCHUNK_EVENT:
+            if (!ApplyVChunkEvent(entry)) return false;
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
@@ -203,6 +206,47 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
 
 const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {
     return segment_registry_;
+}
+
+const VChunkRecoveryEntries& OpLogApplier::GetVChunkRecoveryEntries() const {
+    return vchunk_entries_;
+}
+
+bool OpLogApplier::LoadVChunkSnapshot(const VChunkSnapshot& snapshot) {
+    auto encoded = SerializeVChunkSnapshot(snapshot, vchunk_config_);
+    if (!encoded) return false;
+    VChunkRecoveryEntries restored;
+    for (const auto& record : snapshot.records) {
+        std::string key = record.tenant_id;
+        key.push_back('\0');
+        key += record.key;
+        if (!restored.emplace(std::move(key), record).second) return false;
+    }
+    vchunk_entries_ = std::move(restored);
+    vchunk_sequence_id_ = snapshot.last_sequence_id;
+    return true;
+}
+
+bool OpLogApplier::ApplyVChunkEvent(const OpLogEntry& entry) {
+    std::vector<char> bytes(entry.payload.begin(), entry.payload.end());
+    auto event = DeserializeVChunkHAEvent(bytes, vchunk_config_);
+    if (!event || event->sequence_id != entry.sequence_id ||
+        event->record.tenant_id != entry.tenant_id ||
+        event->record.key != entry.object_key) {
+        LOG(ERROR) << "OpLogApplier: invalid vchunk event, sequence_id="
+                   << entry.sequence_id << ", key=" << entry.object_key;
+        return false;
+    }
+    const auto error = ApplyVChunkHAEvent(*event, vchunk_entries_,
+                                          vchunk_sequence_id_, vchunk_config_,
+                                          true);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "OpLogApplier: vchunk event apply failed, sequence_id="
+                   << entry.sequence_id << ", error="
+                   << static_cast<int>(error);
+        return false;
+    }
+    return true;
 }
 
 void OpLogApplier::LoadSegmentRegistry(

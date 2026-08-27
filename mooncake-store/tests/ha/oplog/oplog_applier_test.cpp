@@ -51,6 +51,34 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
     return std::string(result.begin(), result.end());
 }
 
+VChunkMetadataRecord MakeVChunkRecord(uint64_t version = 1) {
+    VChunkMetadataRecord record;
+    record.vchunk_id = "vchunk-id";
+    record.tenant_id = "tenant";
+    record.key = "vchunk-key";
+    record.total_size = 4096;
+    record.slice_count = 1;
+    record.row_size = 1;
+    record.created_at_ms = 1;
+    record.last_updated_at_ms = 2;
+    record.leader_epoch = 7;
+    record.metadata_version = version;
+    record.slices.push_back({0, "segment", 0, 4096, 4096,
+                             VCSliceStatus::PENDING, 0});
+    return record;
+}
+
+std::string MakeVChunkEventPayload(uint64_t sequence_id) {
+    VChunkHAEvent event;
+    event.sequence_id = sequence_id;
+    event.leader_epoch = 7;
+    event.record = MakeVChunkRecord();
+    auto encoded = SerializeVChunkHAEvent(event, VChunkConfig{});
+    EXPECT_TRUE(encoded.has_value());
+    return encoded ? std::string(encoded->begin(), encoded->end())
+                   : std::string();
+}
+
 class OpLogApplierTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -68,6 +96,31 @@ class OpLogApplierTest : public ::testing::Test {
     std::unique_ptr<OpLogApplier> applier_;
     std::string cluster_id_;
 };
+
+TEST_F(OpLogApplierTest, AppliesVChunkEventInGlobalOpLogSequence) {
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "ordinary", MakeValidPayload())));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        2, OpType::VCHUNK_EVENT, "vchunk-key", MakeVChunkEventPayload(2))));
+
+    const auto& recovered = applier_->GetVChunkRecoveryEntries();
+    ASSERT_EQ(recovered.size(), 1U);
+    EXPECT_EQ(recovered.begin()->second.vchunk_id, "vchunk-id");
+    EXPECT_EQ(applier_->GetExpectedSequenceId(), 3U);
+}
+
+TEST_F(OpLogApplierTest, LoadsVChunkSnapshotAndRejectsInvalidEvent) {
+    VChunkSnapshot snapshot;
+    snapshot.last_sequence_id = 10;
+    snapshot.leader_epoch = 7;
+    snapshot.records.push_back(MakeVChunkRecord());
+    ASSERT_TRUE(applier_->LoadVChunkSnapshot(snapshot));
+    EXPECT_EQ(applier_->GetVChunkRecoveryEntries().size(), 1U);
+
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::VCHUNK_EVENT, "bad", "not-an-event")));
+    EXPECT_EQ(applier_->GetExpectedSequenceId(), 1U);
+}
 
 // ========== 4.1.1 Basic apply tests ==========
 

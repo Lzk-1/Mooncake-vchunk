@@ -111,6 +111,29 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
     }
 }
 
+TEST_F(BufferAllocatorTest, ReserveAtClaimsOnlyTheRequestedAddress) {
+    constexpr uintptr_t kBase = 0x170000000ULL;
+    constexpr size_t kCapacity = 4096;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "claim-segment", kBase, kCapacity, "claim-endpoint");
+    ASSERT_TRUE(allocator->supportsExactClaim());
+
+    AllocationClaim claim;
+    claim.segment_name = "claim-segment";
+    claim.offset = kBase;
+    claim.allocated_length = 128;
+    auto claimed = allocator->reserveAt(claim);
+    ASSERT_TRUE(claimed.has_value());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>((*claimed)->data()), kBase);
+
+    auto duplicate = allocator->reserveAt(claim);
+    EXPECT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    claim.segment_name = "other-segment";
+    EXPECT_EQ(allocator->reserveAt(claim).error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;

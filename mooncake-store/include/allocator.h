@@ -34,6 +34,19 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 // Forward declarations
 class BufferAllocatorBase;
 
+struct AllocationClaim {
+    std::string segment_name;
+    std::string segment_instance_id;
+    uint64_t offset{0};
+    uint64_t allocated_length{0};
+    std::string owner_vchunk_id;
+    uint64_t leader_epoch{0};
+    uint64_t generation{0};
+
+    YLT_REFL(AllocationClaim, segment_name, segment_instance_id, offset,
+             allocated_length, owner_vchunk_id, leader_epoch, generation);
+};
+
 class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
@@ -128,6 +141,11 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+    virtual bool supportsExactClaim() const { return false; }
+    virtual tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
+        const AllocationClaim&) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
 };
 
 /**
@@ -212,6 +230,9 @@ class CachelibBufferAllocator
     size_t getLargestFreeRegion() const override {
         return kAllocatorUnknownFreeSpace;
     }
+    bool supportsExactClaim() const override { return true; }
+    tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
+        const AllocationClaim& claim) override;
 
    private:
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
@@ -282,6 +303,9 @@ class OffsetBufferAllocator
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
+    bool supportsExactClaim() const override { return true; }
+    tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
+        const AllocationClaim& claim) override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()

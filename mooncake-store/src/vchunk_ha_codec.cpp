@@ -94,11 +94,13 @@ tl::expected<VChunkSnapshot, ErrorCode> DeserializeVChunkSnapshot(
 ErrorCode ApplyVChunkHAEvent(const VChunkHAEvent& event,
                              VChunkRecoveryEntries& entries,
                              uint64_t& applied_sequence_id,
-                             const VChunkConfig& config) {
+                             const VChunkConfig& config,
+                             bool allow_global_sequence_gaps) {
     auto encoded = SerializeVChunkHAEvent(event, config);
     if (!encoded) return encoded.error();
     if (event.sequence_id <= applied_sequence_id) return ErrorCode::OK;
-    if (event.sequence_id != applied_sequence_id + 1) {
+    if (!allow_global_sequence_gaps &&
+        event.sequence_id != applied_sequence_id + 1) {
         return ErrorCode::INVALID_VERSION;
     }
     const auto key = ScopedKey(event.record);
