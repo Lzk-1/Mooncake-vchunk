@@ -43,6 +43,9 @@ class VChunkTestAllocator
     std::string getTransportEndpoint() const override {
         return segment_name_;
     }
+    std::string getSegmentInstanceId() const override {
+        return segment_name_ + "-instance";
+    }
     size_t getLargestFreeRegion() const override {
         const auto used = used_.load();
         return used < capacity_ ? capacity_ - used : 0;

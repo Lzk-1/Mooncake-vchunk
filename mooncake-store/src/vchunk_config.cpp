@@ -28,6 +28,7 @@ VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
 ErrorCode VChunkConfig::Validate() const {
     if (creating_timeout_ms == 0 || releasing_timeout_ms == 0 ||
         recovering_timeout_ms == 0 || max_recovering_attempts == 0 ||
+        replica_num == 0 || replica_num > max_replica_count ||
         max_replica_count == 0 || max_slice_count == 0 ||
         max_metadata_bytes == 0 || max_creating_objects == 0 ||
         reaper_interval_ms == 0 || reaper_max_scan == 0 ||

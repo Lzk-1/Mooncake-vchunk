@@ -19,6 +19,11 @@ std::string AllocatedBuffer::getSegmentName() const noexcept {
     return std::string();
 }
 
+std::string AllocatedBuffer::getSegmentInstanceId() const noexcept {
+    auto alloc = allocator_.lock();
+    return alloc ? alloc->getSegmentInstanceId() : std::string();
+}
+
 AllocatedBuffer::~AllocatedBuffer() {
     // Note: This is an edge case. If the 'weak_ptr' is released, the segment
     // has already been deallocated at this point, and its memory usage details
@@ -87,12 +92,14 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
-                                                 ReplicaType replica_type)
+                                                 ReplicaType replica_type,
+                                                 std::string segment_instance_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
+      segment_instance_id_(std::move(segment_instance_id)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
@@ -169,7 +176,9 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
 
 tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode>
 CachelibBufferAllocator::reserveAt(const AllocationClaim& claim) {
-    if (claim.segment_name != segment_name_ || claim.allocated_length == 0 ||
+    if (!supportsExactClaim() || claim.segment_name != segment_name_ ||
+        claim.segment_instance_id != segment_instance_id_ ||
+        claim.allocated_length == 0 ||
         claim.offset < base_ || claim.offset - base_ >= total_size_ ||
         claim.allocated_length > total_size_ - (claim.offset - base_)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -224,7 +233,7 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, std::string segment_instance_id) {
     if (replica_type != ReplicaType::MEMORY ||
         base % facebook::cachelib::Slab::kSize != 0 ||
         size < facebook::cachelib::Slab::kSize ||
@@ -250,7 +259,8 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     }
 
     auto allocator = std::make_shared<CachelibBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, transport_endpoint, replica_type,
+        std::move(segment_instance_id));
     if (!allocator->memory_allocator_->importAllocations(allocator->pool_id_,
                                                          imports)) {
         return std::nullopt;
@@ -269,12 +279,14 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
-                                             ReplicaType replica_type)
+                                             ReplicaType replica_type,
+                                             std::string segment_instance_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
+      segment_instance_id_(std::move(segment_instance_id)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
@@ -366,7 +378,9 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
 tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode>
 OffsetBufferAllocator::reserveAt(const AllocationClaim& claim) {
-    if (claim.segment_name != segment_name_ || claim.allocated_length == 0 ||
+    if (!supportsExactClaim() || claim.segment_name != segment_name_ ||
+        claim.segment_instance_id != segment_instance_id_ ||
+        claim.allocated_length == 0 ||
         claim.offset < base_ || claim.offset - base_ >= total_size_ ||
         claim.allocated_length > total_size_ - (claim.offset - base_)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -424,13 +438,14 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, std::string segment_instance_id) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
     const size_t end = base + size;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, transport_endpoint, replica_type,
+        std::move(segment_instance_id));
     const auto offset_allocator = allocator->getOffsetAllocator();
 
     std::vector<size_t> order(descriptors.size());

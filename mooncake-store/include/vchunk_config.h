@@ -40,6 +40,7 @@ struct VChunkConfig {
     uint64_t recovering_timeout_ms{60'000};
     uint32_t max_slice_retry{3};
     uint32_t max_recovering_attempts{2};
+    uint8_t replica_num{1};
     uint32_t max_replica_count{3};
     uint32_t max_slice_count{4096};
     uint64_t max_metadata_bytes{1024U * 1024U};
@@ -61,7 +62,8 @@ struct VChunkConfig {
 
     YLT_REFL(VChunkConfig, enabled, creating_timeout_ms,
              releasing_timeout_ms, recovering_timeout_ms, max_slice_retry,
-             max_recovering_attempts, max_replica_count, max_slice_count,
+             max_recovering_attempts, replica_num, max_replica_count,
+             max_slice_count,
              max_metadata_bytes, max_creating_objects, reaper_interval_ms,
              reaper_max_scan, enable_recovery, enable_read_merge,
              enable_replica_fallback, max_concurrent_reads, read_timeout_ms,

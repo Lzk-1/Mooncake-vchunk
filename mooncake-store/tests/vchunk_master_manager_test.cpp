@@ -87,6 +87,27 @@ TEST(VChunkMasterManagerTest, RevokeIsIdempotentAndReleasesBuffers) {
     EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
 }
 
+TEST(VChunkMasterManagerTest, PersistsConfiguredReplicaLayout) {
+    ManagerFixture fixture;
+    auto config = EnabledConfig();
+    config.replica_num = 2;
+    VChunkMasterManager manager(config);
+
+    auto created = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "replicated", 8192, false, 100);
+    ASSERT_TRUE(created.has_value());
+    EXPECT_EQ(created->replica_num, 2U);
+    EXPECT_EQ(created->slice_count, 2U);
+    ASSERT_EQ(created->slices.size(), 4U);
+    for (size_t i = 0; i < created->slices.size(); ++i) {
+        EXPECT_EQ(created->slices[i].slice_index, i % 2);
+        EXPECT_EQ(created->slices[i].replica_index, i / 2);
+        EXPECT_EQ(created->slices[i].replica_group_id, i % 2);
+        EXPECT_EQ(created->slices[i].allocation_generation, 1U);
+        EXPECT_FALSE(created->slices[i].segment_instance_id.empty());
+    }
+}
+
 TEST(VChunkMasterManagerTest, ConcurrentPutStartPublishesOneObject) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());

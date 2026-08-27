@@ -135,6 +135,8 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
                     VCSliceAllocation allocation;
                     allocation.slice_index = slice_index;
                     allocation.segment_name = candidate.name;
+                    allocation.segment_instance_id =
+                        buffer->getSegmentInstanceId();
                     allocation.target_offset =
                         reinterpret_cast<uintptr_t>(buffer->data());
                     allocation.logical_length = logical_length;

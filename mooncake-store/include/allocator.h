@@ -85,6 +85,7 @@ class AllocatedBuffer {
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
+    [[nodiscard]] std::string getSegmentInstanceId() const noexcept;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -130,6 +131,7 @@ class BufferAllocatorBase {
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+    virtual std::string getSegmentInstanceId() const { return {}; }
 
     /**
      * Returns the largest free region available in this allocator.
@@ -207,7 +209,8 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
-                            ReplicaType replica_type = ReplicaType::MEMORY);
+                            ReplicaType replica_type = ReplicaType::MEMORY,
+                            std::string segment_instance_id = {});
 
     ~CachelibBufferAllocator() override;
 
@@ -221,6 +224,9 @@ class CachelibBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getSegmentInstanceId() const override {
+        return segment_instance_id_;
+    }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -230,7 +236,9 @@ class CachelibBufferAllocator
     size_t getLargestFreeRegion() const override {
         return kAllocatorUnknownFreeSpace;
     }
-    bool supportsExactClaim() const override { return true; }
+    bool supportsExactClaim() const override {
+        return !segment_instance_id_.empty();
+    }
     tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
         const AllocationClaim& claim) override;
 
@@ -243,6 +251,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const std::string segment_instance_id_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -259,7 +268,7 @@ class CachelibBufferAllocator
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
         const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
+        ReplicaType replica_type, std::string segment_instance_id);
 };
 
 struct RestoredCachelibBufferAllocator {
@@ -271,7 +280,8 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    std::string segment_instance_id = {});
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -284,7 +294,8 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          ReplicaType replica_type = ReplicaType::MEMORY);
+                          ReplicaType replica_type = ReplicaType::MEMORY,
+                          std::string segment_instance_id = {});
 
     ~OffsetBufferAllocator() override;
 
@@ -298,12 +309,17 @@ class OffsetBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getSegmentInstanceId() const override {
+        return segment_instance_id_;
+    }
 
     /**
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
-    bool supportsExactClaim() const override { return true; }
+    bool supportsExactClaim() const override {
+        return !segment_instance_id_.empty();
+    }
     tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
         const AllocationClaim& claim) override;
 
@@ -320,6 +336,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const std::string segment_instance_id_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation
@@ -341,7 +358,8 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    std::string segment_instance_id = {});
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

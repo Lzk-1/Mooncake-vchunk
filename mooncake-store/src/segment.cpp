@@ -182,11 +182,13 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    ReplicaType::MEMORY, UuidToString(segment.id));
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    ReplicaType::MEMORY, UuidToString(segment.id));
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
@@ -1349,12 +1351,12 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
                     segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
+                    ReplicaType::NOF_SSD, UuidToString(segment.id));
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
                     segment.name, buffer, size, segment.te_endpoint,
-                    ReplicaType::NOF_SSD);
+                    ReplicaType::NOF_SSD, UuidToString(segment.id));
                 break;
             default:
                 LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name

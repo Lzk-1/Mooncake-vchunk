@@ -2160,7 +2160,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     auto restored = RestoreOffsetBufferAllocator(
                         restore.segment.name, restore.segment.base,
                         restore.segment.size, restore.segment.te_endpoint,
-                        restore.descriptors);
+                        restore.descriptors, ReplicaType::MEMORY,
+                        UuidToString(restore.segment.id));
                     if (!restored) {
                         return fail_remount(ErrorCode::INVALID_PARAMS);
                     }
@@ -2171,7 +2172,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     auto restored = RestoreCachelibBufferAllocator(
                         restore.segment.name, restore.segment.base,
                         restore.segment.size, restore.segment.te_endpoint,
-                        restore.descriptors);
+                        restore.descriptors, ReplicaType::MEMORY,
+                        UuidToString(restore.segment.id));
                     if (!restored) {
                         return fail_remount(ErrorCode::INVALID_PARAMS);
                     }

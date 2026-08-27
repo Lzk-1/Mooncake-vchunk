@@ -115,11 +115,13 @@ TEST_F(BufferAllocatorTest, ReserveAtClaimsOnlyTheRequestedAddress) {
     constexpr uintptr_t kBase = 0x170000000ULL;
     constexpr size_t kCapacity = 4096;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "claim-segment", kBase, kCapacity, "claim-endpoint");
+        "claim-segment", kBase, kCapacity, "claim-endpoint",
+        ReplicaType::MEMORY, "instance-1");
     ASSERT_TRUE(allocator->supportsExactClaim());
 
     AllocationClaim claim;
     claim.segment_name = "claim-segment";
+    claim.segment_instance_id = "instance-1";
     claim.offset = kBase;
     claim.allocated_length = 128;
     auto claimed = allocator->reserveAt(claim);

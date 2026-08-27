@@ -20,6 +20,7 @@ class AllocatorManager;
 struct VCSliceAllocation {
     uint32_t slice_index{0};
     std::string segment_name;
+    std::string segment_instance_id;
     uint64_t target_offset{0};
     uint32_t logical_length{0};
     uint32_t allocated_length{0};

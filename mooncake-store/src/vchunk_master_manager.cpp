@@ -64,7 +64,8 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     }
 
     auto allocation = AllocateVChunk(allocator_manager, total_size,
-                                     slice_size_level, excluded_segments);
+                                     slice_size_level, excluded_segments,
+                                     config_.replica_num);
     if (!allocation) {
         ReleasePendingPut(scoped_key);
         metrics_->AddAllocationFailure();
@@ -77,8 +78,8 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.tenant_id = tenant_id.value();
     record.key = key;
     record.total_size = total_size;
-    record.slice_count =
-        static_cast<uint32_t>(allocation->allocations.size());
+    record.slice_count = static_cast<uint32_t>(
+        allocation->allocations.size() / allocation->replica_num);
     record.slice_size_level = slice_size_level;
     record.row_size = static_cast<uint32_t>(allocation->row_size);
     record.replica_num = allocation->replica_num;
@@ -90,10 +91,18 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.slices.reserve(record.slice_count);
     entry->buffers.reserve(record.slice_count);
     for (auto& allocated : allocation->allocations) {
-        record.slices.push_back(VCSliceDescriptor{
-            allocated.slice_index, allocated.segment_name,
-            allocated.target_offset, allocated.logical_length,
-            allocated.allocated_length, VCSliceStatus::PENDING, 0});
+        VCSliceDescriptor descriptor;
+        descriptor.slice_index = allocated.slice_index;
+        descriptor.target_segment_name = allocated.segment_name;
+        descriptor.target_offset = allocated.target_offset;
+        descriptor.logical_length = allocated.logical_length;
+        descriptor.allocated_length = allocated.allocated_length;
+        descriptor.status = VCSliceStatus::PENDING;
+        descriptor.replica_group_id = allocated.slice_index;
+        descriptor.replica_index = allocated.replica_index;
+        descriptor.segment_instance_id = allocated.segment_instance_id;
+        descriptor.allocation_generation = record.metadata_version;
+        record.slices.push_back(std::move(descriptor));
         entry->buffers.push_back(std::move(allocated.buffer));
     }
     const auto serialized = SerializeVChunkMetadata(record, config_);
