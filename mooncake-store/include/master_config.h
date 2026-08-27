@@ -135,6 +135,8 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
@@ -258,6 +260,8 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
     bool strict_replica_allocation = false;
@@ -418,6 +422,10 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                     ? config.etcd_endpoints
+                                     : config.vchunk_etcd_endpoints;
 
         pod_name = config.pod_name;
         pod_namespace = config.pod_namespace;
@@ -571,6 +579,8 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -686,6 +696,10 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints.empty()
+                                     ? config.etcd_endpoints
+                                     : config.vchunk_etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -776,6 +790,8 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
     }
 };
 
@@ -1244,6 +1260,7 @@ class MasterServiceConfig {
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
     VChunkConfig vchunk_config{};
+    std::string vchunk_etcd_endpoints;
     std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store;
     MasterServiceConfig() = default;
 
@@ -1333,6 +1350,12 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        vchunk_config = config.vchunk_config;
+        vchunk_etcd_endpoints = config.vchunk_etcd_endpoints;
+        if (vchunk_config.enabled && !vchunk_etcd_endpoints.empty()) {
+            vchunk_metadata_store = std::make_shared<EtcdVChunkMetadataStore>(
+                vchunk_etcd_endpoints, vchunk_config, cluster_id);
+        }
     }
 
     // Static factory method to create a builder
