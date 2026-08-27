@@ -44,9 +44,9 @@ std::unique_ptr<AllocatedBuffer> AllocateFromCandidate(Candidate& candidate,
 tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     const AllocatorManager& allocator_manager, uint64_t total_size,
     VCSliceSizeLevel slice_size_level,
-    const std::set<std::string>& excluded_segments) {
+    const std::set<std::string>& excluded_segments, uint8_t replica_num) {
     const uint64_t slice_size = SliceSizeLevelToBytes(slice_size_level);
-    if (total_size == 0 || slice_size == 0 ||
+    if (total_size == 0 || slice_size == 0 || replica_num == 0 ||
         total_size > std::numeric_limits<uint64_t>::max() - (slice_size - 1)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -85,58 +85,98 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     if (candidates.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
+    if (replica_num > candidates.size()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
 
     const auto slice_count = static_cast<uint32_t>(slice_count_u64);
     VChunkAllocationResult result;
+    result.replica_num = replica_num;
     result.row_size = std::min<size_t>(slice_count, candidates.size());
-    result.allocations.reserve(slice_count);
+    result.allocations.reserve(static_cast<size_t>(slice_count) * replica_num);
     const size_t start_offset = randomIndex(candidates.size());
+    std::vector<std::unordered_set<std::string>> slice_segments(slice_count);
 
-    while (result.allocations.size() < slice_count) {
-        std::unordered_set<std::string> used_in_row;
-        used_in_row.reserve(result.row_size);
-        const size_t row = result.allocations.size() / result.row_size;
-        const size_t row_width = std::min<size_t>(
-            result.row_size, slice_count - result.allocations.size());
-        for (size_t column = 0; column < row_width; ++column) {
-            bool allocated = false;
-            for (size_t attempt = 0; attempt < candidates.size(); ++attempt) {
-                const size_t index =
-                    (start_offset + row + column + attempt) % candidates.size();
-                auto& candidate = candidates[index];
-                if (used_in_row.contains(candidate.name) ||
-                    candidate.allocated_slices >= candidate.remaining_slices) {
-                    continue;
-                }
-                auto buffer = AllocateFromCandidate(candidate, slice_size);
-                if (!buffer) {
-                    candidate.remaining_slices = candidate.allocated_slices;
-                    continue;
-                }
-
+    for (uint8_t replica = 0; replica < replica_num; ++replica) {
+        for (uint32_t row_start = 0; row_start < slice_count;
+             row_start += result.row_size) {
+            std::unordered_set<std::string> used_in_row;
+            used_in_row.reserve(result.row_size);
+            const size_t row = row_start / result.row_size;
+            const size_t row_width = std::min<size_t>(
+                result.row_size, slice_count - row_start);
+            for (size_t column = 0; column < row_width; ++column) {
                 const auto slice_index =
-                    static_cast<uint32_t>(result.allocations.size());
-                const uint64_t consumed = slice_index * slice_size;
-                const uint32_t logical_length = static_cast<uint32_t>(
-                    std::min<uint64_t>(slice_size, total_size - consumed));
-                VCSliceAllocation allocation;
-                allocation.slice_index = slice_index;
-                allocation.segment_name = candidate.name;
-                allocation.target_offset =
-                    reinterpret_cast<uintptr_t>(buffer->data());
-                allocation.logical_length = logical_length;
-                allocation.allocated_length =
-                    static_cast<uint32_t>(buffer->size());
-                allocation.buffer = std::move(buffer);
-                result.allocations.push_back(std::move(allocation));
-                used_in_row.insert(candidate.name);
-                allocated = true;
-                break;
-            }
-            if (!allocated) {
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                    static_cast<uint32_t>(row_start + column);
+                bool allocated = false;
+                for (size_t attempt = 0; attempt < candidates.size();
+                     ++attempt) {
+                    const size_t index =
+                        (start_offset + replica + row + column + attempt) %
+                        candidates.size();
+                    auto& candidate = candidates[index];
+                    if (used_in_row.contains(candidate.name) ||
+                        slice_segments[slice_index].contains(candidate.name) ||
+                        candidate.allocated_slices >=
+                            candidate.remaining_slices) {
+                        continue;
+                    }
+                    auto buffer = AllocateFromCandidate(candidate, slice_size);
+                    if (!buffer) {
+                        candidate.remaining_slices =
+                            candidate.allocated_slices;
+                        continue;
+                    }
+
+                    const uint64_t consumed = slice_index * slice_size;
+                    const uint32_t logical_length = static_cast<uint32_t>(
+                        std::min<uint64_t>(slice_size,
+                                           total_size - consumed));
+                    VCSliceAllocation allocation;
+                    allocation.slice_index = slice_index;
+                    allocation.segment_name = candidate.name;
+                    allocation.target_offset =
+                        reinterpret_cast<uintptr_t>(buffer->data());
+                    allocation.logical_length = logical_length;
+                    allocation.allocated_length =
+                        static_cast<uint32_t>(buffer->size());
+                    allocation.replica_index = replica;
+                    allocation.buffer = std::move(buffer);
+                    result.allocations.push_back(std::move(allocation));
+                    used_in_row.insert(candidate.name);
+                    slice_segments[slice_index].insert(candidate.name);
+                    allocated = true;
+                    break;
+                }
+                if (!allocated) {
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                }
             }
         }
+    }
+
+    SliceGroup current;
+    for (const auto& allocation : result.allocations) {
+        const bool contiguous = !current.slice_indices.empty() &&
+                                current.replica_index ==
+                                    allocation.replica_index &&
+                                current.segment_name == allocation.segment_name &&
+                                current.slice_indices.back() + 1 ==
+                                    allocation.slice_index;
+        if (!contiguous && !current.slice_indices.empty()) {
+            result.slice_groups.push_back(std::move(current));
+            current = SliceGroup{};
+        }
+        if (current.slice_indices.empty()) {
+            current.group_id =
+                static_cast<uint32_t>(result.slice_groups.size());
+            current.segment_name = allocation.segment_name;
+            current.replica_index = allocation.replica_index;
+        }
+        current.slice_indices.push_back(allocation.slice_index);
+    }
+    if (!current.slice_indices.empty()) {
+        result.slice_groups.push_back(std::move(current));
     }
     return result;
 }

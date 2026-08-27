@@ -479,8 +479,16 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64(
         "vchunk_releasing_timeout_ms",
         &master_config.vchunk_config.releasing_timeout_ms, 60'000);
+    default_config.GetUInt64(
+        "vchunk_recovering_timeout_ms",
+        &master_config.vchunk_config.recovering_timeout_ms, 60'000);
     default_config.GetUInt32("vchunk_max_slice_retry",
                              &master_config.vchunk_config.max_slice_retry, 3);
+    default_config.GetUInt32(
+        "vchunk_max_recovering_attempts",
+        &master_config.vchunk_config.max_recovering_attempts, 2);
+    default_config.GetUInt32("vchunk_max_replica_count",
+                             &master_config.vchunk_config.max_replica_count, 3);
     default_config.GetUInt32("vchunk_max_slice_count",
                              &master_config.vchunk_config.max_slice_count,
                              4096);
@@ -490,6 +498,32 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32(
         "vchunk_max_creating_objects",
         &master_config.vchunk_config.max_creating_objects, 1024);
+    default_config.GetBool("vchunk_enable_recovery",
+                           &master_config.vchunk_config.enable_recovery, true);
+    default_config.GetBool("vchunk_enable_read_merge",
+                           &master_config.vchunk_config.enable_read_merge,
+                           true);
+    default_config.GetBool(
+        "vchunk_enable_replica_fallback",
+        &master_config.vchunk_config.enable_replica_fallback, true);
+    default_config.GetUInt32(
+        "vchunk_max_concurrent_reads",
+        &master_config.vchunk_config.max_concurrent_reads, 0);
+    default_config.GetUInt64("vchunk_read_timeout_ms",
+                             &master_config.vchunk_config.read_timeout_ms,
+                             10'000);
+    default_config.GetBool(
+        "vchunk_etcd_incremental_update",
+        &master_config.vchunk_config.etcd_incremental_update, true);
+    default_config.GetBool(
+        "vchunk_enable_ha_recovery",
+        &master_config.vchunk_config.enable_ha_recovery, false);
+    default_config.GetUInt64(
+        "vchunk_allocator_claim_timeout_ms",
+        &master_config.vchunk_config.allocator_claim_timeout_ms, 30'000);
+    default_config.GetBool(
+        "vchunk_verify_recovered_data",
+        &master_config.vchunk_config.verify_recovered_data, true);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,

@@ -81,6 +81,8 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         static_cast<uint32_t>(allocation->allocations.size());
     record.slice_size_level = slice_size_level;
     record.row_size = static_cast<uint32_t>(allocation->row_size);
+    record.replica_num = allocation->replica_num;
+    record.slice_groups = allocation->slice_groups;
     record.status = VChunkStatus::CREATING;
     record.created_at_ms = now_ms;
     record.last_updated_at_ms = now_ms;
@@ -270,6 +272,8 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms,
         // CREATING records cannot be resumed safely either: their buffers were
         // owned by the previous process. Treat all incomplete writes as stale.
         if (record.status == VChunkStatus::CREATING ||
+            record.status == VChunkStatus::RECOVERING ||
+            record.status == VChunkStatus::ABANDONED ||
             record.status == VChunkStatus::RELEASING ||
             record.status == VChunkStatus::RELEASED ||
             record.status == VChunkStatus::FAILED) {
@@ -344,7 +348,7 @@ VChunkMetricsSnapshot VChunkMasterManager::MetricsSnapshot() const {
 }
 
 void VChunkMasterManager::RefreshStateMetricsLocked() {
-    std::array<uint64_t, 5> counts{};
+    std::array<uint64_t, 7> counts{};
     uint64_t allocated_bytes = 0;
     for (const auto& [_, entry] : entries_) {
         ++counts[static_cast<size_t>(entry->record.status)];

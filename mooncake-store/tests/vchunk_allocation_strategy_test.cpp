@@ -103,6 +103,70 @@ TEST(VChunkAllocationStrategyTest, PartialFailureRollsBackAllBuffers) {
     EXPECT_EQ(second->size(), 0U);
 }
 
+TEST(VChunkAllocationStrategyTest, AllocatesReplicasOnDistinctSegments) {
+    AllocatorManager manager;
+    std::vector<std::shared_ptr<VChunkTestAllocator>> allocators;
+    for (size_t i = 0; i < 4; ++i) {
+        auto allocator = std::make_shared<VChunkTestAllocator>(
+            "segment-" + std::to_string(i), 0x700000000ULL + i * 0x100000,
+            64U * 1024U);
+        manager.addAllocator(allocator->getSegmentName(), allocator);
+        allocators.push_back(std::move(allocator));
+    }
+
+    {
+        auto result = AllocateVChunk(manager, 4U * 4096U,
+                                     VCSliceSizeLevel::k4K, {}, 2);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->replica_num, 2U);
+        ASSERT_EQ(result->allocations.size(), 8U);
+        std::vector<std::unordered_set<std::string>> placements(4);
+        for (const auto& allocation : result->allocations) {
+            ASSERT_LT(allocation.slice_index, placements.size());
+            EXPECT_TRUE(placements[allocation.slice_index]
+                            .insert(allocation.segment_name)
+                            .second);
+            EXPECT_LT(allocation.replica_index, 2U);
+        }
+        for (const auto& placement : placements) {
+            EXPECT_EQ(placement.size(), 2U);
+        }
+        EXPECT_FALSE(result->slice_groups.empty());
+    }
+    for (const auto& allocator : allocators) {
+        EXPECT_EQ(allocator->size(), 0U);
+    }
+}
+
+TEST(VChunkAllocationStrategyTest, RejectsInsufficientReplicaDomains) {
+    AllocatorManager manager;
+    auto allocator = std::make_shared<VChunkTestAllocator>(
+        "segment-a", 0x800000000ULL, 64U * 1024U);
+    manager.addAllocator("segment-a", allocator);
+
+    auto result = AllocateVChunk(manager, 4096, VCSliceSizeLevel::k4K, {}, 2);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(allocator->size(), 0U);
+}
+
+TEST(VChunkAllocationStrategyTest, RollsBackPartialReplicaAllocation) {
+    AllocatorManager manager;
+    auto first = std::make_shared<VChunkTestAllocator>(
+        "segment-a", 0x900000000ULL, 2U * 4096U);
+    auto second = std::make_shared<VChunkTestAllocator>(
+        "segment-b", 0xA00000000ULL, 4096U);
+    manager.addAllocator("segment-a", first);
+    manager.addAllocator("segment-b", second);
+
+    auto result =
+        AllocateVChunk(manager, 2U * 4096U, VCSliceSizeLevel::k4K, {}, 2);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(first->size(), 0U);
+    EXPECT_EQ(second->size(), 0U);
+}
+
 TEST(VChunkAllocationStrategyTest, RejectsInvalidAndEmptyInputs) {
     AllocatorManager manager;
     auto empty = AllocateVChunk(manager, 4096, VCSliceSizeLevel::k4K);
@@ -112,6 +176,11 @@ TEST(VChunkAllocationStrategyTest, RejectsInvalidAndEmptyInputs) {
     auto zero = AllocateVChunk(manager, 0, VCSliceSizeLevel::k4K);
     EXPECT_FALSE(zero.has_value());
     EXPECT_EQ(zero.error(), ErrorCode::INVALID_PARAMS);
+
+    auto no_replicas =
+        AllocateVChunk(manager, 4096, VCSliceSizeLevel::k4K, {}, 0);
+    EXPECT_FALSE(no_replicas.has_value());
+    EXPECT_EQ(no_replicas.error(), ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace

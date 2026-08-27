@@ -10,6 +10,36 @@
 namespace mooncake {
 namespace {
 
+struct LegacySlice {
+    uint32_t slice_index{0};
+    std::string target_segment_name;
+    uint64_t target_offset{0};
+    uint32_t logical_length{0};
+    uint32_t allocated_length{0};
+    VCSliceStatus status{VCSliceStatus::PENDING};
+    uint32_t retry_count{0};
+    YLT_REFL(LegacySlice, slice_index, target_segment_name, target_offset,
+             logical_length, allocated_length, status, retry_count);
+};
+
+struct LegacyRecord {
+    uint32_t schema_version{1};
+    std::string vchunk_id;
+    std::string tenant_id;
+    std::string key;
+    uint64_t total_size{0};
+    uint32_t slice_count{0};
+    VCSliceSizeLevel slice_size_level{VCSliceSizeLevel::k4K};
+    std::vector<LegacySlice> slices;
+    uint32_t row_size{0};
+    VChunkStatus status{VChunkStatus::CREATING};
+    int64_t created_at_ms{0};
+    int64_t last_updated_at_ms{0};
+    YLT_REFL(LegacyRecord, schema_version, vchunk_id, tenant_id, key,
+             total_size, slice_count, slice_size_level, slices, row_size,
+             status, created_at_ms, last_updated_at_ms);
+};
+
 VChunkMetadataRecord MakeValidRecord() {
     VChunkMetadataRecord record;
     record.vchunk_id = "vchunk-1";
@@ -39,7 +69,14 @@ TEST(VChunkMetadataTest, AcceptsValidLayout) {
 }
 
 TEST(VChunkMetadataTest, RoundTripsStableRecord) {
-    const auto original = MakeValidRecord();
+    auto original = MakeValidRecord();
+    original.leader_epoch = 7;
+    original.metadata_version = 11;
+    original.slices[0].segment_instance_id = "instance-a";
+    original.slices[0].allocation_generation = 5;
+    original.slices[0].content_checksum = 1234;
+    original.slice_groups.push_back(
+        SliceGroup{0, "segment-a", 0, {0, 2}});
     auto serialized = SerializeVChunkMetadata(original, VChunkConfig{});
     ASSERT_TRUE(serialized.has_value());
 
@@ -54,6 +91,35 @@ TEST(VChunkMetadataTest, RoundTripsStableRecord) {
     EXPECT_EQ(restored->slices.size(), original.slices.size());
     EXPECT_EQ(restored->slices.back().logical_length, 2048U);
     EXPECT_EQ(restored->created_at_ms, 100);
+    EXPECT_EQ(restored->leader_epoch, 7U);
+    EXPECT_EQ(restored->metadata_version, 11U);
+    EXPECT_EQ(restored->slices[0].segment_instance_id, "instance-a");
+    EXPECT_EQ(restored->slices[0].content_checksum, 1234U);
+    ASSERT_EQ(restored->slice_groups.size(), 1U);
+    EXPECT_EQ(restored->slice_groups[0].slice_indices.size(), 2U);
+}
+
+TEST(VChunkMetadataTest, UpgradesSchemaVersionOneRecords) {
+    LegacyRecord legacy;
+    legacy.vchunk_id = "legacy-vchunk";
+    legacy.tenant_id = "tenant";
+    legacy.key = "key";
+    legacy.total_size = 4096;
+    legacy.slice_count = 1;
+    legacy.row_size = 1;
+    legacy.created_at_ms = 10;
+    legacy.last_updated_at_ms = 20;
+    legacy.slices.push_back(
+        LegacySlice{0, "segment", 0, 4096, 4096,
+                    VCSliceStatus::COMPLETED, 0});
+
+    const auto bytes = struct_pack::serialize(legacy);
+    auto restored = DeserializeVChunkMetadata(bytes, VChunkConfig{});
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->schema_version, kVChunkMetadataSchemaVersion);
+    EXPECT_EQ(restored->vchunk_id, "legacy-vchunk");
+    EXPECT_EQ(restored->replica_num, 1U);
+    EXPECT_EQ(restored->slices[0].replica_index, 0U);
 }
 
 TEST(VChunkMetadataTest, RejectsUnsupportedSchema) {
@@ -100,6 +166,41 @@ TEST(VChunkMetadataTest, RejectsOffsetOverflowAndRetryOverflow) {
               ErrorCode::INVALID_PARAMS);
 }
 
+TEST(VChunkMetadataTest, RejectsInvalidReplicaAndSliceGroup) {
+    auto record = MakeValidRecord();
+    record.replica_num = 0;
+    EXPECT_EQ(ValidateVChunkMetadata(record, VChunkConfig{}),
+              ErrorCode::INVALID_PARAMS);
+
+    record = MakeValidRecord();
+    record.slices[0].replica_index = 1;
+    EXPECT_EQ(ValidateVChunkMetadata(record, VChunkConfig{}),
+              ErrorCode::INVALID_PARAMS);
+
+    record = MakeValidRecord();
+    record.slice_groups.push_back(SliceGroup{0, "segment-a", 0, {3}});
+    EXPECT_EQ(ValidateVChunkMetadata(record, VChunkConfig{}),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST(VChunkMetadataTest, BuildsIndexAndPartitionsBySegment) {
+    auto record = MakeValidRecord();
+    record.metadata_version = 9;
+    const auto index = BuildVChunkMetadataIndex(record);
+    EXPECT_EQ(index.vchunk_id, record.vchunk_id);
+    EXPECT_EQ(index.metadata_version, 9U);
+    EXPECT_EQ(index.slice_count, 3U);
+
+    const auto partitions = PartitionVChunkSlices(record);
+    ASSERT_EQ(partitions.size(), 2U);
+    EXPECT_EQ(partitions[0].segment_name, "segment-a");
+    ASSERT_EQ(partitions[0].slices.size(), 2U);
+    EXPECT_EQ(partitions[0].slices[0].slice_index, 0U);
+    EXPECT_EQ(partitions[0].slices[1].slice_index, 2U);
+    EXPECT_EQ(partitions[1].segment_name, "segment-b");
+    ASSERT_EQ(partitions[1].slices.size(), 1U);
+}
+
 TEST(VChunkMetadataTest, EnforcesMetadataSizeLimit) {
     auto config = VChunkConfig{};
     config.max_metadata_bytes = 8;
@@ -135,6 +236,24 @@ TEST(VChunkMetadataTest, RuntimeStateTransitionsAreValidated) {
     const auto snapshot = metadata.Snapshot();
     EXPECT_EQ(snapshot.status, VChunkStatus::RELEASED);
     EXPECT_EQ(snapshot.last_updated_at_ms, 400);
+}
+
+TEST(VChunkMetadataTest, RecoveryStateTransitionsAreValidated) {
+    EXPECT_EQ(ValidateVChunkTransition(VChunkStatus::CREATING,
+                                       VChunkStatus::RECOVERING),
+              ErrorCode::OK);
+    EXPECT_EQ(ValidateVChunkTransition(VChunkStatus::ACTIVE,
+                                       VChunkStatus::RECOVERING),
+              ErrorCode::OK);
+    EXPECT_EQ(ValidateVChunkTransition(VChunkStatus::RECOVERING,
+                                       VChunkStatus::ACTIVE),
+              ErrorCode::OK);
+    EXPECT_EQ(ValidateVChunkTransition(VChunkStatus::RECOVERING,
+                                       VChunkStatus::ABANDONED),
+              ErrorCode::OK);
+    EXPECT_EQ(ValidateVChunkTransition(VChunkStatus::ABANDONED,
+                                       VChunkStatus::ACTIVE),
+              ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace

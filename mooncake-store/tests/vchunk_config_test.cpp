@@ -14,6 +14,14 @@ TEST(VChunkConfigTest, DefaultsAreSafeForProductionOptIn) {
     EXPECT_EQ(config.max_creating_objects, 1024U);
     EXPECT_EQ(config.reaper_interval_ms, 1000U);
     EXPECT_EQ(config.reaper_max_scan, 128U);
+    EXPECT_EQ(config.recovering_timeout_ms, 60'000U);
+    EXPECT_EQ(config.max_recovering_attempts, 2U);
+    EXPECT_EQ(config.max_replica_count, 3U);
+    EXPECT_TRUE(config.enable_recovery);
+    EXPECT_TRUE(config.enable_read_merge);
+    EXPECT_TRUE(config.enable_replica_fallback);
+    EXPECT_EQ(config.read_timeout_ms, 10'000U);
+    EXPECT_FALSE(config.enable_ha_recovery);
 }
 
 TEST(VChunkConfigTest, RejectsInvalidLimits) {
@@ -35,6 +43,18 @@ TEST(VChunkConfigTest, RejectsInvalidLimits) {
 
     config = VChunkConfig{};
     config.reaper_interval_ms = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.recovering_timeout_ms = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.max_replica_count = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.read_timeout_ms = 0;
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 

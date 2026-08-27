@@ -11,6 +11,7 @@
 
 #include "allocator.h"
 #include "vchunk_config.h"
+#include "vchunk_metadata.h"
 
 namespace mooncake {
 
@@ -22,6 +23,7 @@ struct VCSliceAllocation {
     uint64_t target_offset{0};
     uint32_t logical_length{0};
     uint32_t allocated_length{0};
+    uint8_t replica_index{0};
     std::unique_ptr<AllocatedBuffer> buffer;
 
     VCSliceAllocation() = default;
@@ -41,12 +43,15 @@ class VChunkAllocationResult {
     VChunkAllocationResult& operator=(const VChunkAllocationResult&) = delete;
 
     size_t row_size{0};
+    uint8_t replica_num{1};
     std::vector<VCSliceAllocation> allocations;
+    std::vector<SliceGroup> slice_groups;
 };
 
 tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     const AllocatorManager& allocator_manager, uint64_t total_size,
     VCSliceSizeLevel slice_size_level,
-    const std::set<std::string>& excluded_segments = {});
+    const std::set<std::string>& excluded_segments = {},
+    uint8_t replica_num = 1);
 
 }  // namespace mooncake

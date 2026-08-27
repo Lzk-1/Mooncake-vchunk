@@ -25,7 +25,7 @@ struct VChunkMetricsSnapshot {
     uint64_t rollbacks{0};
     uint64_t metadata_bytes{0};
     uint64_t allocated_bytes{0};
-    std::array<uint64_t, 5> states{};
+    std::array<uint64_t, 7> states{};
 };
 
 class VChunkMetrics {
@@ -57,7 +57,7 @@ class VChunkMetrics {
     std::atomic<uint64_t> rollbacks_{0};
     std::atomic<uint64_t> metadata_bytes_{0};
     std::atomic<uint64_t> allocated_bytes_{0};
-    std::array<std::atomic<uint64_t>, 5> states_{};
+    std::array<std::atomic<uint64_t>, 7> states_{};
 };
 
 }  // namespace mooncake
