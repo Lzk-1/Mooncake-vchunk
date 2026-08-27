@@ -94,5 +94,68 @@ TEST(VChunkTransferEngineTest, RejectsUnknownMetadataVersion) {
     EXPECT_EQ(requests.error(), ErrorCode::INVALID_VERSION);
 }
 
+TEST(VChunkTransferEngineTest, GroupsWritesBySegment) {
+    auto record = MakeRecord();
+    std::array<char, 4096 + 17> buffer{};
+    auto batches = BuildVChunkTransferBatches(
+        record, buffer.data(), buffer.size(), TransferRequest::WRITE,
+        [](const std::string& name)
+            -> tl::expected<SegmentHandle, ErrorCode> {
+            return name == "a" ? 11 : 22;
+        });
+    ASSERT_TRUE(batches.has_value());
+    ASSERT_EQ(batches->size(), 2U);
+    EXPECT_EQ((*batches)[0].segment_name, "a");
+    EXPECT_EQ((*batches)[0].requests.size(), 1U);
+    EXPECT_EQ((*batches)[1].segment_name, "b");
+    EXPECT_EQ((*batches)[1].requests.size(), 1U);
+}
+
+TEST(VChunkTransferEngineTest, MergesAdjacentReadsOnOneSegment) {
+    auto record = MakeRecord();
+    record.slices[1].target_segment_name = "a";
+    record.slices[1].target_offset = 1000 + 4096;
+    record.row_size = 1;
+    std::array<char, 4096 + 17> buffer{};
+    auto batches = BuildVChunkTransferBatches(
+        record, buffer.data(), buffer.size(), TransferRequest::READ,
+        [](const std::string&)
+            -> tl::expected<SegmentHandle, ErrorCode> { return 11; });
+    ASSERT_TRUE(batches.has_value());
+    ASSERT_EQ(batches->size(), 1U);
+    ASSERT_EQ((*batches)[0].requests.size(), 1U);
+    EXPECT_EQ((*batches)[0].requests[0].length, buffer.size());
+}
+
+TEST(VChunkTransferEngineTest, FallsBackToHealthyReplicaPerSlice) {
+    auto record = MakeRecord();
+    record.replica_num = 2;
+    auto replica_a = record.slices[0];
+    replica_a.target_segment_name = "c";
+    replica_a.replica_index = 1;
+    auto replica_b = record.slices[1];
+    replica_b.target_segment_name = "d";
+    replica_b.replica_index = 1;
+    record.slices.push_back(replica_a);
+    record.slices.push_back(replica_b);
+    std::array<char, 4096 + 17> buffer{};
+
+    auto batches = BuildVChunkTransferBatches(
+        record, buffer.data(), buffer.size(), TransferRequest::READ,
+        [](const std::string& name)
+            -> tl::expected<SegmentHandle, ErrorCode> {
+            if (name == "a") {
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
+            if (name == "b") return 22;
+            if (name == "c") return 33;
+            return 44;
+        });
+    ASSERT_TRUE(batches.has_value());
+    ASSERT_EQ(batches->size(), 2U);
+    EXPECT_EQ((*batches)[0].segment_name, "c");
+    EXPECT_EQ((*batches)[1].segment_name, "b");
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -121,7 +121,9 @@ ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
     }
     if (record.slice_count == 0 ||
         record.slice_count > config.max_slice_count ||
-        record.slices.size() != record.slice_count || record.row_size == 0 ||
+        record.slices.size() !=
+            static_cast<size_t>(record.slice_count) * record.replica_num ||
+        record.row_size == 0 ||
         record.row_size > record.slice_count || record.replica_num == 0 ||
         record.replica_num > config.max_replica_count ||
         record.created_at_ms < 0 ||
@@ -134,9 +136,15 @@ ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
     uint64_t covered_bytes = 0;
     std::unordered_set<std::string> segments_in_row;
     segments_in_row.reserve(record.row_size);
-    for (uint32_t i = 0; i < record.slice_count; ++i) {
+    for (size_t i = 0; i < record.slices.size(); ++i) {
         const auto& slice = record.slices[i];
-        if (slice.slice_index != i || slice.target_segment_name.empty() ||
+        const auto expected_slice =
+            static_cast<uint32_t>(i % record.slice_count);
+        const auto expected_replica =
+            static_cast<uint8_t>(i / record.slice_count);
+        if (slice.slice_index != expected_slice ||
+            slice.replica_index != expected_replica ||
+            slice.target_segment_name.empty() ||
             slice.logical_length == 0 ||
             slice.logical_length > slice.allocated_length ||
             slice.allocated_length < slice_size ||
@@ -155,7 +163,7 @@ ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
         }
         covered_bytes += slice.logical_length;
 
-        if (i % record.row_size == 0) {
+        if (expected_slice % record.row_size == 0) {
             segments_in_row.clear();
         }
         if (!segments_in_row.insert(slice.target_segment_name).second) {
@@ -163,7 +171,9 @@ ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
         }
     }
 
-    if (covered_bytes != record.total_size) {
+    if (record.total_size >
+            std::numeric_limits<uint64_t>::max() / record.replica_num ||
+        covered_bytes != record.total_size * record.replica_num) {
         return ErrorCode::INVALID_PARAMS;
     }
     for (const auto& group : record.slice_groups) {

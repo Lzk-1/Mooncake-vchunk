@@ -1,5 +1,7 @@
 #include "vchunk_transfer_engine.h"
 
+#include <algorithm>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +35,22 @@ tl::expected<std::vector<TransferRequest>, ErrorCode>
 BuildVChunkTransferRequests(const VChunkMetadataRecord& record, void* buffer,
                             size_t length, TransferRequest::OpCode opcode,
                             const VChunkSegmentResolver& resolve_segment) {
+    auto batches = BuildVChunkTransferBatches(record, buffer, length, opcode,
+                                              resolve_segment, false);
+    if (!batches) return tl::make_unexpected(batches.error());
+    std::vector<TransferRequest> requests;
+    for (auto& batch : *batches) {
+        requests.insert(requests.end(), batch.requests.begin(),
+                        batch.requests.end());
+    }
+    return requests;
+}
+
+tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
+BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
+                           size_t length, TransferRequest::OpCode opcode,
+                           const VChunkSegmentResolver& resolve_segment,
+                           bool merge_adjacent_reads) {
     VChunkConfig validation_config;
     validation_config.enabled = true;
     if (!buffer || !resolve_segment || record.total_size != length ||
@@ -44,10 +62,10 @@ BuildVChunkTransferRequests(const VChunkMetadataRecord& record, void* buffer,
         return tl::make_unexpected(validation);
     }
     std::unordered_map<std::string, SegmentHandle> handles;
-    std::vector<TransferRequest> requests;
-    requests.reserve(record.slices.size());
-    size_t logical_offset = 0;
-    for (const auto& slice : record.slices) {
+    std::unordered_map<std::string, size_t> batch_positions;
+    std::vector<VChunkTransferBatch> batches;
+    auto resolve = [&](const VCSliceDescriptor& slice)
+        -> tl::expected<SegmentHandle, ErrorCode> {
         auto it = handles.find(slice.target_segment_name);
         if (it == handles.end()) {
             auto handle = resolve_segment(slice.target_segment_name);
@@ -56,18 +74,89 @@ BuildVChunkTransferRequests(const VChunkMetadataRecord& record, void* buffer,
             }
             it = handles.emplace(slice.target_segment_name, *handle).first;
         }
-        if (slice.logical_length > length - logical_offset) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return it->second;
+    };
+    auto append = [&](const VCSliceDescriptor& slice,
+                      SegmentHandle handle) -> ErrorCode {
+        const size_t logical_offset =
+            static_cast<size_t>(slice.slice_index) *
+            SliceSizeLevelToBytes(record.slice_size_level);
+        if (logical_offset > length ||
+            slice.logical_length > length - logical_offset) {
+            return ErrorCode::INVALID_PARAMS;
         }
-        requests.push_back(TransferRequest{
-            opcode, static_cast<char*>(buffer) + logical_offset, it->second,
-            slice.target_offset, slice.logical_length});
-        logical_offset += slice.logical_length;
+        auto [position, inserted] = batch_positions.emplace(
+            slice.target_segment_name, batches.size());
+        if (inserted) {
+            batches.push_back(VChunkTransferBatch{slice.target_segment_name,
+                                                  {}});
+        }
+        auto& requests = batches[position->second].requests;
+        TransferRequest request{
+            opcode, static_cast<char*>(buffer) + logical_offset, handle,
+            slice.target_offset, slice.logical_length};
+        if (opcode == TransferRequest::READ && merge_adjacent_reads &&
+            !requests.empty()) {
+            auto& previous = requests.back();
+            if (previous.target_id == request.target_id &&
+                previous.target_offset + previous.length ==
+                    request.target_offset &&
+                static_cast<char*>(previous.source) + previous.length ==
+                    request.source) {
+                previous.length += request.length;
+                return ErrorCode::OK;
+            }
+        }
+        requests.push_back(request);
+        return ErrorCode::OK;
+    };
+
+    if (opcode == TransferRequest::WRITE) {
+        for (const auto& slice : record.slices) {
+            auto handle = resolve(slice);
+            if (!handle) return tl::make_unexpected(handle.error());
+            const auto error = append(slice, *handle);
+            if (error != ErrorCode::OK) {
+                return tl::make_unexpected(error);
+            }
+        }
+    } else {
+        for (uint32_t slice_index = 0; slice_index < record.slice_count;
+             ++slice_index) {
+            ErrorCode last_error = ErrorCode::SEGMENT_NOT_FOUND;
+            bool selected = false;
+            for (uint8_t replica = 0; replica < record.replica_num; ++replica) {
+                const auto& slice =
+                    record.slices[static_cast<size_t>(replica) *
+                                      record.slice_count +
+                                  slice_index];
+                if (slice.status == VCSliceStatus::FAILED) continue;
+                auto handle = resolve(slice);
+                if (!handle) {
+                    last_error = handle.error();
+                    continue;
+                }
+                const auto error = append(slice, *handle);
+                if (error != ErrorCode::OK) {
+                    return tl::make_unexpected(error);
+                }
+                selected = true;
+                break;
+            }
+            if (!selected) {
+                return tl::make_unexpected(last_error);
+            }
+        }
     }
-    if (logical_offset != length) {
+    if (batches.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return requests;
+    for (const auto& batch : batches) {
+        if (batch.requests.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    return batches;
 }
 
 ErrorCode TransferEngineVChunkDataPlane::Write(
@@ -88,7 +177,7 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
     const VChunkMetadataRecord& record, void* buffer, size_t length,
     TransferRequest::OpCode opcode,
     std::chrono::steady_clock::time_point deadline) {
-    auto requests = BuildVChunkTransferRequests(
+    auto batches = BuildVChunkTransferBatches(
         record, buffer, length, opcode, [this](const std::string& segment) {
             const auto handle = engine_.openSegment(segment);
             if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
@@ -97,41 +186,76 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
             }
             return tl::expected<SegmentHandle, ErrorCode>(handle);
         });
-    if (!requests) {
-        return requests.error();
+    if (!batches) {
+        return batches.error();
     }
 
-    BatchGuard batch(engine_, requests->size());
-    if (batch.id() == INVALID_BATCH_ID) {
-        return ErrorCode::TRANSFER_FAIL;
+    struct ActiveBatch {
+        std::unique_ptr<BatchGuard> guard;
+        size_t expected_bytes{0};
+        bool finished{false};
+        bool failed{false};
+    };
+    std::vector<ActiveBatch> active;
+    active.reserve(batches->size());
+    bool submit_failed = false;
+    for (const auto& batch : *batches) {
+        auto guard = std::make_unique<BatchGuard>(engine_, batch.requests.size());
+        if (guard->id() == INVALID_BATCH_ID) {
+            return ErrorCode::TRANSFER_FAIL;
+        }
+        size_t expected_bytes = 0;
+        for (const auto& request : batch.requests) {
+            expected_bytes += request.length;
+        }
+        bool finished = false;
+        bool failed = false;
+        if (!engine_.submitTransfer(guard->id(), batch.requests).ok()) {
+            submit_failed = true;
+            failed = true;
+            finished = guard->TryFree();
+        }
+        active.push_back(ActiveBatch{std::move(guard), expected_bytes, finished,
+                                     failed});
     }
-    const bool submit_failed =
-        !engine_.submitTransfer(batch.id(), *requests).ok();
-    if (submit_failed && batch.TryFree()) return ErrorCode::TRANSFER_FAIL;
     bool deadline_exceeded = false;
     for (;;) {
         deadline_exceeded = deadline_exceeded ||
                             std::chrono::steady_clock::now() >= deadline;
-        TransferStatus status{};
-        if (!engine_.getBatchTransferStatus(batch.id(), status).ok()) {
-            // Do not release an in-flight batch: TransferEngine may still be
-            // using the caller's buffer. Keep draining until a terminal state.
-            if (batch.TryFree()) return ErrorCode::TRANSFER_FAIL;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+        bool all_finished = true;
+        for (auto& batch : active) {
+            if (batch.finished) continue;
+            all_finished = false;
+            TransferStatus status{};
+            if (!engine_
+                     .getBatchTransferStatus(batch.guard->id(), status)
+                     .ok()) {
+                continue;
+            }
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                batch.finished = true;
+                batch.failed =
+                    status.transferred_bytes != batch.expected_bytes;
+            } else if (status.s == TransferStatusEnum::FAILED ||
+                       status.s == TransferStatusEnum::TIMEOUT ||
+                       status.s == TransferStatusEnum::CANCELED ||
+                       status.s == TransferStatusEnum::INVALID) {
+                batch.finished = true;
+                batch.failed = true;
+            }
         }
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            if (submit_failed) return ErrorCode::TRANSFER_FAIL;
+        all_finished = std::all_of(
+            active.begin(), active.end(),
+            [](const ActiveBatch& batch) { return batch.finished; });
+        if (all_finished) {
             if (deadline_exceeded) return ErrorCode::RPC_TIMEOUT;
-            return status.transferred_bytes == length ? ErrorCode::OK
-                                                      : ErrorCode::TRANSFER_FAIL;
-        }
-        if (status.s == TransferStatusEnum::FAILED ||
-            status.s == TransferStatusEnum::TIMEOUT ||
-            status.s == TransferStatusEnum::CANCELED ||
-            status.s == TransferStatusEnum::INVALID) {
-            return deadline_exceeded ? ErrorCode::RPC_TIMEOUT
-                                     : ErrorCode::TRANSFER_FAIL;
+            const bool transfer_failed =
+                submit_failed ||
+                std::any_of(active.begin(), active.end(),
+                            [](const ActiveBatch& batch) {
+                                return batch.failed;
+                            });
+            return transfer_failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

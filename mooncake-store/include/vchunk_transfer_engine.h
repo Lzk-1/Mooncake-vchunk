@@ -12,10 +12,21 @@ namespace mooncake {
 using VChunkSegmentResolver =
     std::function<tl::expected<SegmentHandle, ErrorCode>(const std::string&)>;
 
+struct VChunkTransferBatch {
+    std::string segment_name;
+    std::vector<TransferRequest> requests;
+};
+
 tl::expected<std::vector<TransferRequest>, ErrorCode>
 BuildVChunkTransferRequests(const VChunkMetadataRecord& record, void* buffer,
                             size_t length, TransferRequest::OpCode opcode,
                             const VChunkSegmentResolver& resolve_segment);
+
+tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
+BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
+                           size_t length, TransferRequest::OpCode opcode,
+                           const VChunkSegmentResolver& resolve_segment,
+                           bool merge_adjacent_reads = true);
 
 class TransferEngineVChunkDataPlane final : public VChunkDataPlane {
    public:
