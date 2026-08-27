@@ -39,6 +39,7 @@ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(vchunk_config_test vchunk_config_test.cpp)
 add_store_test(vchunk_metadata_test vchunk_metadata_test.cpp)
+add_store_test(vchunk_ha_codec_test vchunk_ha_codec_test.cpp)
 add_store_test(vchunk_allocation_strategy_test
                vchunk_allocation_strategy_test.cpp)
 add_store_test(vchunk_master_manager_test vchunk_master_manager_test.cpp)

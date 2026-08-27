@@ -201,6 +201,50 @@ TEST(VChunkMetadataTest, BuildsIndexAndPartitionsBySegment) {
     ASSERT_EQ(partitions[1].slices.size(), 1U);
 }
 
+TEST(VChunkMetadataTest, RoundTripsIndexAndPartitionLayout) {
+    auto record = MakeValidRecord();
+    record.metadata_version = 4;
+    auto encoded_index =
+        SerializeVChunkMetadataIndex(BuildVChunkMetadataIndex(record),
+                                     VChunkConfig{});
+    ASSERT_TRUE(encoded_index.has_value());
+    auto index =
+        DeserializeVChunkMetadataIndex(*encoded_index, VChunkConfig{});
+    ASSERT_TRUE(index.has_value());
+
+    std::vector<VCSlicePartition> restored_partitions;
+    for (const auto& partition : PartitionVChunkSlices(record)) {
+        auto encoded =
+            SerializeVChunkSlicePartition(partition, VChunkConfig{});
+        ASSERT_TRUE(encoded.has_value());
+        auto restored =
+            DeserializeVChunkSlicePartition(*encoded, VChunkConfig{});
+        ASSERT_TRUE(restored.has_value());
+        restored_partitions.push_back(std::move(*restored));
+    }
+    auto assembled = AssembleVChunkMetadata(
+        std::move(*index), std::move(restored_partitions), VChunkConfig{});
+    ASSERT_TRUE(assembled.has_value());
+    EXPECT_EQ(assembled->metadata_version, 4U);
+    ASSERT_EQ(assembled->slices.size(), record.slices.size());
+    for (size_t i = 0; i < record.slices.size(); ++i) {
+        EXPECT_EQ(assembled->slices[i].slice_index,
+                  record.slices[i].slice_index);
+        EXPECT_EQ(assembled->slices[i].target_segment_name,
+                  record.slices[i].target_segment_name);
+    }
+}
+
+TEST(VChunkMetadataTest, RejectsMismatchedSlicePartition) {
+    auto record = MakeValidRecord();
+    auto partitions = PartitionVChunkSlices(record);
+    partitions[0].slices[0].target_segment_name = "other";
+    auto encoded =
+        SerializeVChunkSlicePartition(partitions[0], VChunkConfig{});
+    ASSERT_FALSE(encoded.has_value());
+    EXPECT_EQ(encoded.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VChunkMetadataTest, EnforcesMetadataSizeLimit) {
     auto config = VChunkConfig{};
     config.max_metadata_bytes = 8;

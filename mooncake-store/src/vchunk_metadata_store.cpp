@@ -4,6 +4,8 @@
 
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>
@@ -58,6 +60,20 @@ std::string MakePersistentRecordKey(std::string_view namespace_prefix,
                                     const VChunkMetadataRecord& record) {
     return std::string(namespace_prefix) + "/records/" +
            HexEncode(record.tenant_id) + "/" + record.vchunk_id;
+}
+
+std::string MakeIndexKey(std::string_view namespace_prefix,
+                         const VChunkMetadataRecord& record) {
+    return std::string(namespace_prefix) + "/index/" +
+           HexEncode(record.tenant_id) + "/" + record.vchunk_id;
+}
+
+std::string MakePartitionKey(std::string_view namespace_prefix,
+                             const VChunkMetadataRecord& record,
+                             std::string_view segment_name) {
+    return std::string(namespace_prefix) + "/partitions/" +
+           HexEncode(record.tenant_id) + "/" + record.vchunk_id + "/" +
+           HexEncode(segment_name);
 }
 
 std::string BytesToString(const std::vector<char>& bytes) {
@@ -124,20 +140,32 @@ EtcdVChunkMetadataStore::EtcdVChunkMetadataStore(std::string endpoints,
 
 ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
     if (connection_error_ != ErrorCode::OK) return connection_error_;
-    auto encoded = SerializeVChunkMetadata(record, config_);
-    if (!encoded) return encoded.error();
-    const auto metadata_key = MakePersistentRecordKey(namespace_prefix_, record);
+    const auto index = BuildVChunkMetadataIndex(record);
+    auto encoded_index = SerializeVChunkMetadataIndex(index, config_);
+    if (!encoded_index) return encoded_index.error();
+    const auto partitions = PartitionVChunkSlices(record);
+    const auto metadata_key = MakeIndexKey(namespace_prefix_, record);
     const auto object_key = MakeObjectIndexKey(namespace_prefix_, record);
-    const auto value = HexEncode(BytesToString(*encoded));
+    const auto value = HexEncode(BytesToString(*encoded_index));
+    std::vector<EtcdHelper::TxnPut> puts{{metadata_key, value}};
+    puts.reserve(partitions.size() + 2);
+    for (const auto& partition : partitions) {
+        auto encoded = SerializeVChunkSlicePartition(partition, config_);
+        if (!encoded) return encoded.error();
+        puts.push_back({MakePartitionKey(namespace_prefix_, record,
+                                         partition.segment_name),
+                        HexEncode(BytesToString(*encoded))});
+    }
 
     if (record.status == VChunkStatus::CREATING) {
         if (record.metadata_version != 1) {
             return ErrorCode::INVALID_VERSION;
         }
+        puts.push_back({object_key, record.vchunk_id});
         const auto error = EtcdHelper::TxnCompareAndPut(
             {{object_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}},
              {metadata_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}}},
-            {{object_key, record.vchunk_id}, {metadata_key, value}});
+            puts);
         return error == ErrorCode::ETCD_TRANSACTION_FAIL
                    ? ErrorCode::OBJECT_ALREADY_EXISTS
                    : error;
@@ -150,34 +178,63 @@ ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
     if (error != ErrorCode::OK) return error;
     auto current_bytes = HexDecode(current);
     if (!current_bytes) return current_bytes.error();
-    auto current_record = DeserializeVChunkMetadata(*current_bytes, config_);
-    if (!current_record) return current_record.error();
-    if (record.metadata_version != current_record->metadata_version + 1) {
+    auto current_index =
+        DeserializeVChunkMetadataIndex(*current_bytes, config_);
+    if (!current_index) return current_index.error();
+    if (record.metadata_version != current_index->metadata_version + 1) {
         return ErrorCode::INVALID_VERSION;
+    }
+    std::unordered_set<std::string> desired_segments;
+    for (const auto& partition : partitions) {
+        desired_segments.insert(partition.segment_name);
+    }
+    std::vector<std::string> stale_partition_keys;
+    for (const auto& group : current_index->slice_groups) {
+        if (!desired_segments.contains(group.segment_name)) {
+            stale_partition_keys.push_back(MakePartitionKey(
+                namespace_prefix_, record, group.segment_name));
+        }
     }
     return EtcdHelper::TxnCompareAndPut(
         {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
           record.vchunk_id},
          {metadata_key, EtcdHelper::TxnCompareKind::kValueEquals, current}},
-        {{metadata_key, value}});
+        puts, stale_partition_keys);
 }
 
 ErrorCode EtcdVChunkMetadataStore::Remove(
     const VChunkMetadataRecord& record) {
     if (connection_error_ != ErrorCode::OK) return connection_error_;
-    const auto metadata_key = MakePersistentRecordKey(namespace_prefix_, record);
+    const auto metadata_key = MakeIndexKey(namespace_prefix_, record);
     const auto object_key = MakeObjectIndexKey(namespace_prefix_, record);
     std::string current;
     EtcdRevisionId revision = 0;
     auto error = EtcdHelper::Get(metadata_key.data(), metadata_key.size(),
                                  current, revision);
-    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
+    if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        const auto legacy_key =
+            MakePersistentRecordKey(namespace_prefix_, record);
+        error = EtcdHelper::Get(legacy_key.data(), legacy_key.size(), current,
+                                revision);
+        if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
+        if (error != ErrorCode::OK) return error;
+        return EtcdHelper::TxnCompareAndPut(
+            {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
+              record.vchunk_id},
+             {legacy_key, EtcdHelper::TxnCompareKind::kValueEquals, current}},
+            {}, {legacy_key, object_key});
+    }
     if (error != ErrorCode::OK) return error;
+    std::vector<std::string> delete_keys{metadata_key, object_key};
+    for (const auto& partition : PartitionVChunkSlices(record)) {
+        delete_keys.push_back(MakePartitionKey(namespace_prefix_, record,
+                                               partition.segment_name));
+    }
     return EtcdHelper::TxnCompareAndPut(
         {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
           record.vchunk_id},
          {metadata_key, EtcdHelper::TxnCompareKind::kValueEquals, current}},
-        {}, {metadata_key, object_key});
+        {}, delete_keys);
 }
 
 tl::expected<std::vector<VChunkMetadataRecord>, ErrorCode>
@@ -203,16 +260,48 @@ EtcdVChunkMetadataStore::List() {
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     std::vector<VChunkMetadataRecord> result;
+    std::unordered_map<std::string, VChunkMetadataIndex> indexes;
+    std::unordered_map<std::string, std::vector<VCSlicePartition>> partitions;
+    const std::string index_prefix = begin + "index/";
+    const std::string partition_prefix = begin + "partitions/";
+    const std::string legacy_prefix = begin + "records/";
     for (const auto& item : root) {
         if (!item.isObject() || !item["key"].isString() ||
             !item["value"].isString()) {
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         const auto key = item["key"].asString();
-        if (key.find(begin + "records/") != 0) continue;
         auto bytes = HexDecode(item["value"].asString());
         if (!bytes) return tl::unexpected(bytes.error());
-        auto record = DeserializeVChunkMetadata(*bytes, config_);
+        if (key.find(index_prefix) == 0) {
+            auto index = DeserializeVChunkMetadataIndex(*bytes, config_);
+            if (!index) return tl::unexpected(index.error());
+            indexes.emplace(key.substr(index_prefix.size()),
+                            std::move(*index));
+        } else if (key.find(partition_prefix) == 0) {
+            auto partition =
+                DeserializeVChunkSlicePartition(*bytes, config_);
+            if (!partition) return tl::unexpected(partition.error());
+            auto group = key.substr(partition_prefix.size());
+            const auto separator = group.rfind('/');
+            if (separator == std::string::npos) {
+                return tl::unexpected(ErrorCode::INVALID_VERSION);
+            }
+            group.resize(separator);
+            partitions[group].push_back(std::move(*partition));
+        } else if (key.find(legacy_prefix) == 0) {
+            auto record = DeserializeVChunkMetadata(*bytes, config_);
+            if (!record) return tl::unexpected(record.error());
+            result.push_back(std::move(*record));
+        }
+    }
+    for (auto& [group, index] : indexes) {
+        auto found = partitions.find(group);
+        if (found == partitions.end()) {
+            return tl::unexpected(ErrorCode::INVALID_VERSION);
+        }
+        auto record = AssembleVChunkMetadata(std::move(index),
+                                             std::move(found->second), config_);
         if (!record) return tl::unexpected(record.error());
         result.push_back(std::move(*record));
     }

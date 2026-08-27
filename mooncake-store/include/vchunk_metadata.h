@@ -137,6 +137,17 @@ VChunkMetadataIndex BuildVChunkMetadataIndex(
     const VChunkMetadataRecord& record);
 std::vector<VCSlicePartition> PartitionVChunkSlices(
     const VChunkMetadataRecord& record);
+tl::expected<std::vector<char>, ErrorCode> SerializeVChunkMetadataIndex(
+    const VChunkMetadataIndex& index, const VChunkConfig& config);
+tl::expected<VChunkMetadataIndex, ErrorCode> DeserializeVChunkMetadataIndex(
+    const std::vector<char>& bytes, const VChunkConfig& config);
+tl::expected<std::vector<char>, ErrorCode> SerializeVChunkSlicePartition(
+    const VCSlicePartition& partition, const VChunkConfig& config);
+tl::expected<VCSlicePartition, ErrorCode> DeserializeVChunkSlicePartition(
+    const std::vector<char>& bytes, const VChunkConfig& config);
+tl::expected<VChunkMetadataRecord, ErrorCode> AssembleVChunkMetadata(
+    VChunkMetadataIndex index, std::vector<VCSlicePartition> partitions,
+    const VChunkConfig& config);
 
 tl::expected<std::vector<char>, ErrorCode> SerializeVChunkMetadata(
     const VChunkMetadataRecord& record, const VChunkConfig& config);

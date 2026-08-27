@@ -84,6 +84,7 @@ set(MOONCAKE_STORE_SOURCES
     memory_alloc.cpp
     vchunk_config.cpp
     vchunk_metadata.cpp
+    vchunk_ha_codec.cpp
     vchunk_allocation_strategy.cpp
     vchunk_master_manager.cpp
     vchunk_client.cpp

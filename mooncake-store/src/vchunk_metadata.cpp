@@ -1,6 +1,9 @@
 #include "vchunk_metadata.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -269,6 +272,103 @@ std::vector<VCSlicePartition> PartitionVChunkSlices(
         partitions[it->second].slices.push_back(slice);
     }
     return partitions;
+}
+
+tl::expected<std::vector<char>, ErrorCode> SerializeVChunkMetadataIndex(
+    const VChunkMetadataIndex& index, const VChunkConfig& config) {
+    if (config.Validate() != ErrorCode::OK ||
+        index.schema_version != kVChunkMetadataSchemaVersion ||
+        index.vchunk_id.empty() || index.tenant_id.empty() ||
+        index.key.empty() || index.slice_count == 0 || index.replica_num == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto bytes = struct_pack::serialize(index);
+    if (bytes.size() > config.max_metadata_bytes) {
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+    return bytes;
+}
+
+tl::expected<VChunkMetadataIndex, ErrorCode> DeserializeVChunkMetadataIndex(
+    const std::vector<char>& bytes, const VChunkConfig& config) {
+    if (bytes.empty() || bytes.size() > config.max_metadata_bytes) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    VChunkMetadataIndex index;
+    if (struct_pack::deserialize_to(index, bytes) != struct_pack::errc::ok) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto encoded = SerializeVChunkMetadataIndex(index, config);
+    if (!encoded) return tl::make_unexpected(encoded.error());
+    return index;
+}
+
+tl::expected<std::vector<char>, ErrorCode> SerializeVChunkSlicePartition(
+    const VCSlicePartition& partition, const VChunkConfig& config) {
+    if (config.Validate() != ErrorCode::OK || partition.segment_name.empty() ||
+        partition.slices.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& slice : partition.slices) {
+        if (slice.target_segment_name != partition.segment_name) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    auto bytes = struct_pack::serialize(partition);
+    if (bytes.size() > config.max_metadata_bytes) {
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+    return bytes;
+}
+
+tl::expected<VCSlicePartition, ErrorCode> DeserializeVChunkSlicePartition(
+    const std::vector<char>& bytes, const VChunkConfig& config) {
+    if (bytes.empty() || bytes.size() > config.max_metadata_bytes) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    VCSlicePartition partition;
+    if (struct_pack::deserialize_to(partition, bytes) !=
+        struct_pack::errc::ok) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto encoded = SerializeVChunkSlicePartition(partition, config);
+    if (!encoded) return tl::make_unexpected(encoded.error());
+    return partition;
+}
+
+tl::expected<VChunkMetadataRecord, ErrorCode> AssembleVChunkMetadata(
+    VChunkMetadataIndex index, std::vector<VCSlicePartition> partitions,
+    const VChunkConfig& config) {
+    VChunkMetadataRecord record;
+    record.schema_version = index.schema_version;
+    record.vchunk_id = std::move(index.vchunk_id);
+    record.tenant_id = std::move(index.tenant_id);
+    record.key = std::move(index.key);
+    record.total_size = index.total_size;
+    record.slice_count = index.slice_count;
+    record.slice_size_level = index.slice_size_level;
+    record.row_size = index.row_size;
+    record.status = index.status;
+    record.created_at_ms = index.created_at_ms;
+    record.last_updated_at_ms = index.last_updated_at_ms;
+    record.replica_num = index.replica_num;
+    record.leader_epoch = index.leader_epoch;
+    record.metadata_version = index.metadata_version;
+    record.slice_groups = std::move(index.slice_groups);
+    for (auto& partition : partitions) {
+        record.slices.insert(record.slices.end(),
+                             std::make_move_iterator(partition.slices.begin()),
+                             std::make_move_iterator(partition.slices.end()));
+    }
+    std::sort(record.slices.begin(), record.slices.end(),
+              [](const VCSliceDescriptor& lhs,
+                 const VCSliceDescriptor& rhs) {
+                  return std::tie(lhs.replica_index, lhs.slice_index) <
+                         std::tie(rhs.replica_index, rhs.slice_index);
+              });
+    const auto error = ValidateVChunkMetadata(record, config);
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    return record;
 }
 
 tl::expected<std::vector<char>, ErrorCode> SerializeVChunkMetadata(
