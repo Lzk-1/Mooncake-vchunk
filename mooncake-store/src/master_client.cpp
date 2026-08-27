@@ -1161,38 +1161,38 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
 
 tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
+    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch) {
     std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
     auto result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-        tenant_id, key, vchunk_id, now_ms);
+        tenant_id, key, vchunk_id, now_ms, leader_epoch);
     if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
         RefreshSubmasterRouting() == ErrorCode::OK &&
         SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
         result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-            tenant_id, key, vchunk_id, now_ms);
+            tenant_id, key, vchunk_id, now_ms, leader_epoch);
     }
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
+    const std::string& vchunk_id, uint64_t leader_epoch) {
     std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
     auto result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-        tenant_id, key, vchunk_id);
+        tenant_id, key, vchunk_id, leader_epoch);
     if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
         RefreshSubmasterRouting() == ErrorCode::OK &&
         SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
         result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-            tenant_id, key, vchunk_id);
+            tenant_id, key, vchunk_id, leader_epoch);
     }
     return result;
 }
@@ -1228,19 +1228,20 @@ tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
 }
 
 tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
+    const std::string& tenant_id, const std::string& key, int64_t now_ms,
+    uint64_t leader_epoch) {
     std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
     auto result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-        tenant_id, key, now_ms);
+        tenant_id, key, now_ms, leader_epoch);
     if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
         RefreshSubmasterRouting() == ErrorCode::OK &&
         SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
         result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-            tenant_id, key, now_ms);
+            tenant_id, key, now_ms, leader_epoch);
     }
     return result;
 }

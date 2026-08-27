@@ -31,14 +31,16 @@ class VChunkControlPlane {
         int64_t now_ms) = 0;
     virtual ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
                              const std::string& vchunk_id,
-                             int64_t now_ms) = 0;
+                             int64_t now_ms, uint64_t leader_epoch) = 0;
     virtual ErrorCode PutRevoke(const TenantId& tenant_id,
                                 const std::string& key,
-                                const std::string& vchunk_id) = 0;
+                                const std::string& vchunk_id,
+                                uint64_t leader_epoch) = 0;
     virtual tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
         const TenantId& tenant_id, const std::string& key) = 0;
     virtual ErrorCode Remove(const TenantId& tenant_id,
-                             const std::string& key, int64_t now_ms) = 0;
+                             const std::string& key, int64_t now_ms,
+                             uint64_t leader_epoch) = 0;
 };
 
 class LocalVChunkControlPlane final : public VChunkControlPlane {
@@ -48,12 +50,13 @@ class LocalVChunkControlPlane final : public VChunkControlPlane {
     tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
         const TenantId&, const std::string&, uint64_t, int64_t) override;
     ErrorCode PutEnd(const TenantId&, const std::string&, const std::string&,
-                     int64_t) override;
+                     int64_t, uint64_t) override;
     ErrorCode PutRevoke(const TenantId&, const std::string&,
-                        const std::string&) override;
+                        const std::string&, uint64_t) override;
     tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
         const TenantId&, const std::string&) override;
-    ErrorCode Remove(const TenantId&, const std::string&, int64_t) override;
+    ErrorCode Remove(const TenantId&, const std::string&, int64_t,
+                     uint64_t) override;
 
    private:
     MasterService& master_;
@@ -66,12 +69,13 @@ class RpcVChunkControlPlane final : public VChunkControlPlane {
     tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
         const TenantId&, const std::string&, uint64_t, int64_t) override;
     ErrorCode PutEnd(const TenantId&, const std::string&, const std::string&,
-                     int64_t) override;
+                     int64_t, uint64_t) override;
     ErrorCode PutRevoke(const TenantId&, const std::string&,
-                        const std::string&) override;
+                        const std::string&, uint64_t) override;
     tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
         const TenantId&, const std::string&) override;
-    ErrorCode Remove(const TenantId&, const std::string&, int64_t) override;
+    ErrorCode Remove(const TenantId&, const std::string&, int64_t,
+                     uint64_t) override;
 
    private:
     MasterClient& master_;

@@ -24,10 +24,42 @@ std::string VChunkMasterManager::ScopedKey(const TenantId& tenant_id,
     return tenant_id.MakeScopedKey(key);
 }
 
+ErrorCode VChunkMasterManager::CheckLeaderEpoch(
+    uint64_t expected_leader_epoch) const {
+    if (!accepts_mutations_.load()) return ErrorCode::NOT_LEADER;
+    const auto current = leader_epoch_.load();
+    if (expected_leader_epoch != 0 && expected_leader_epoch != current) {
+        return ErrorCode::STALE_EPOCH;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode VChunkMasterManager::ActivateLeaderEpoch(uint64_t leader_epoch) {
+    if (leader_epoch == 0) return ErrorCode::INVALID_PARAMS;
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto current = leader_epoch_.load();
+    while (leader_epoch > current &&
+           !leader_epoch_.compare_exchange_weak(current, leader_epoch)) {
+    }
+    if (leader_epoch < current) return ErrorCode::STALE_EPOCH;
+    accepts_mutations_.store(true);
+    return ErrorCode::OK;
+}
+
+void VChunkMasterManager::DeactivateLeader() {
+    accepts_mutations_.store(false);
+}
+
 tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     const AllocatorManager& allocator_manager, const TenantId& tenant_id,
     const std::string& key, uint64_t total_size, bool is_ssd_segment,
-    int64_t now_ms, const std::set<std::string>& excluded_segments) {
+    int64_t now_ms, const std::set<std::string>& excluded_segments,
+    uint64_t expected_leader_epoch) {
+    if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
+    const uint64_t operation_epoch = leader_epoch_.load();
     if (!config_.enabled || config_.Validate() != ErrorCode::OK ||
         !tenant_id.IsValid() || key.empty() || total_size == 0 || now_ms < 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -88,6 +120,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.created_at_ms = now_ms;
     record.last_updated_at_ms = now_ms;
     record.metadata_version = 1;
+    record.leader_epoch = operation_epoch;
     record.slices.reserve(record.slice_count);
     entry->buffers.reserve(record.slice_count);
     for (auto& allocated : allocation->allocations) {
@@ -110,6 +143,11 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         ReleasePendingPut(scoped_key);
         return tl::make_unexpected(serialized.error());
     }
+    if (const auto error = CheckLeaderEpoch(operation_epoch);
+        error != ErrorCode::OK) {
+        ReleasePendingPut(scoped_key);
+        return tl::make_unexpected(error);
+    }
     if (const auto error = metadata_store_->Put(record);
         error != ErrorCode::OK) {
         ReleasePendingPut(scoped_key);
@@ -130,7 +168,12 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
 ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
                                       const std::string& key,
                                       const std::string& vchunk_id,
-                                      int64_t now_ms) {
+                                      int64_t now_ms,
+                                      uint64_t expected_leader_epoch) {
+    if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return error;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -139,6 +182,9 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
     auto& record = it->second->record;
     if (record.vchunk_id != vchunk_id) {
         return ErrorCode::INVALID_VERSION;
+    }
+    if (record.leader_epoch != leader_epoch_.load()) {
+        return ErrorCode::STALE_EPOCH;
     }
     if (record.status == VChunkStatus::ACTIVE) {
         return ErrorCode::OK;
@@ -166,7 +212,12 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
 
 ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
                                          const std::string& key,
-                                         const std::string& vchunk_id) {
+                                         const std::string& vchunk_id,
+                                         uint64_t expected_leader_epoch) {
+    if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return error;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -174,6 +225,9 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
     }
     if (it->second->record.vchunk_id != vchunk_id) {
         return ErrorCode::INVALID_VERSION;
+    }
+    if (it->second->record.leader_epoch != leader_epoch_.load()) {
+        return ErrorCode::STALE_EPOCH;
     }
     if (it->second->record.status != VChunkStatus::CREATING &&
         it->second->record.status != VChunkStatus::FAILED) {
@@ -201,6 +255,9 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::Get(
 tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
 VChunkMasterManager::AcquireRead(const TenantId& tenant_id,
                                  const std::string& key) const {
+    if (!accepts_mutations_.load()) {
+        return tl::make_unexpected(ErrorCode::NOT_LEADER);
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -217,7 +274,12 @@ VChunkMasterManager::AcquireRead(const TenantId& tenant_id,
 
 ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
                                       const std::string& key,
-                                      int64_t now_ms) {
+                                      int64_t now_ms,
+                                      uint64_t expected_leader_epoch) {
+    if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return error;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto scoped_key = ScopedKey(tenant_id, key);
     const auto it = entries_.find(scoped_key);
@@ -225,6 +287,9 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
         return ErrorCode::OK;
     }
     auto& record = it->second->record;
+    if (record.leader_epoch != leader_epoch_.load()) {
+        return ErrorCode::STALE_EPOCH;
+    }
     if ((record.status != VChunkStatus::ACTIVE &&
          record.status != VChunkStatus::RELEASING) ||
         now_ms < record.last_updated_at_ms) {
@@ -252,6 +317,9 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
 
 ErrorCode VChunkMasterManager::Recover(int64_t now_ms,
                                        OwnershipPredicate owns) {
+    if (const auto error = CheckLeaderEpoch(0); error != ErrorCode::OK) {
+        return error;
+    }
     if (now_ms < 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -302,6 +370,9 @@ ErrorCode VChunkMasterManager::Recover(int64_t now_ms,
 
 tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
     int64_t now_ms, size_t max_scan, OwnershipPredicate owns) {
+    if (const auto error = CheckLeaderEpoch(0); error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
     if (now_ms < 0 || max_scan == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -321,7 +392,8 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
         auto next = std::next(it);
         if (next == entries_.end()) next = entries_.begin();
         const auto& record = it->second->record;
-        if (owns && !owns(record)) {
+        if (record.leader_epoch != leader_epoch_.load() ||
+            (owns && !owns(record))) {
             it = next;
             continue;
         }

@@ -378,6 +378,10 @@ enum class ErrorCode : int32_t {
     SLOT_NOT_OWNED =
         -1012,  ///< The key's slot is not owned by this master (KV partition
                 ///< rebalanced); the client should re-route.
+    NOT_LEADER = -1013,   ///< This service no longer owns leadership.
+    STALE_EPOCH = -1014,  ///< Request belongs to an obsolete leader epoch.
+    RECOVERY_IN_PROGRESS =
+        -1015,  ///< Service has not published a fully recovered view.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

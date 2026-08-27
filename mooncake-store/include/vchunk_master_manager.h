@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -53,12 +54,15 @@ class VChunkMasterManager {
         const AllocatorManager& allocator_manager, const TenantId& tenant_id,
         const std::string& key, uint64_t total_size, bool is_ssd_segment,
         int64_t now_ms,
-        const std::set<std::string>& excluded_segments = {});
+        const std::set<std::string>& excluded_segments = {},
+        uint64_t expected_leader_epoch = 0);
 
     ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
-                     const std::string& vchunk_id, int64_t now_ms);
+                     const std::string& vchunk_id, int64_t now_ms,
+                     uint64_t expected_leader_epoch = 0);
     ErrorCode PutRevoke(const TenantId& tenant_id, const std::string& key,
-                        const std::string& vchunk_id);
+                        const std::string& vchunk_id,
+                        uint64_t expected_leader_epoch = 0);
 
     tl::expected<VChunkMetadataRecord, ErrorCode> Get(
         const TenantId& tenant_id, const std::string& key) const;
@@ -66,7 +70,11 @@ class VChunkMasterManager {
         const TenantId& tenant_id, const std::string& key) const;
 
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
-                     int64_t now_ms);
+                     int64_t now_ms, uint64_t expected_leader_epoch = 0);
+
+    ErrorCode ActivateLeaderEpoch(uint64_t leader_epoch);
+    void DeactivateLeader();
+    uint64_t LeaderEpoch() const { return leader_epoch_.load(); }
 
     ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
@@ -87,10 +95,13 @@ class VChunkMasterManager {
                                  const std::string& key);
     void RefreshStateMetricsLocked();
     void ReleasePendingPut(const std::string& scoped_key);
+    ErrorCode CheckLeaderEpoch(uint64_t expected_leader_epoch) const;
 
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
     const std::shared_ptr<VChunkMetrics> metrics_;
+    std::atomic<uint64_t> leader_epoch_{1};
+    std::atomic<bool> accepts_mutations_{true};
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;

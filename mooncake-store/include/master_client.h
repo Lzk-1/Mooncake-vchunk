@@ -295,17 +295,18 @@ class MasterClient {
         uint64_t total_size, int64_t now_ms);
     [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutEnd(
         const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id, int64_t now_ms);
+        const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch);
     [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
         const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id);
+        const std::string& vchunk_id, uint64_t leader_epoch);
     [[nodiscard]] tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
         const std::string& tenant_id, const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
         const std::string& tenant_id, const std::string& key,
         const std::string& lease_id);
     [[nodiscard]] tl::expected<void, ErrorCode> RemoveVChunk(
-        const std::string& tenant_id, const std::string& key, int64_t now_ms);
+        const std::string& tenant_id, const std::string& key, int64_t now_ms,
+        uint64_t leader_epoch);
     [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
     GetVChunkRuntimeInfo();
 

@@ -39,14 +39,17 @@ LocalVChunkControlPlane::PutStart(const TenantId& tenant_id,
 ErrorCode LocalVChunkControlPlane::PutEnd(const TenantId& tenant_id,
                                           const std::string& key,
                                           const std::string& vchunk_id,
-                                          int64_t now_ms) {
-    return master_.VChunkPutEnd(tenant_id, key, vchunk_id, now_ms);
+                                          int64_t now_ms,
+                                          uint64_t leader_epoch) {
+    return master_.VChunkPutEnd(tenant_id, key, vchunk_id, now_ms,
+                                leader_epoch);
 }
 
 ErrorCode LocalVChunkControlPlane::PutRevoke(const TenantId& tenant_id,
                                              const std::string& key,
-                                             const std::string& vchunk_id) {
-    return master_.VChunkPutRevoke(tenant_id, key, vchunk_id);
+                                             const std::string& vchunk_id,
+                                             uint64_t leader_epoch) {
+    return master_.VChunkPutRevoke(tenant_id, key, vchunk_id, leader_epoch);
 }
 
 tl::expected<VChunkControlPlaneRead, ErrorCode> LocalVChunkControlPlane::Get(
@@ -60,8 +63,9 @@ tl::expected<VChunkControlPlaneRead, ErrorCode> LocalVChunkControlPlane::Get(
 
 ErrorCode LocalVChunkControlPlane::Remove(const TenantId& tenant_id,
                                           const std::string& key,
-                                          int64_t now_ms) {
-    return master_.RemoveVChunk(tenant_id, key, now_ms);
+                                          int64_t now_ms,
+                                          uint64_t leader_epoch) {
+    return master_.RemoveVChunk(tenant_id, key, now_ms, leader_epoch);
 }
 
 tl::expected<VChunkMetadataRecord, ErrorCode>
@@ -74,16 +78,19 @@ RpcVChunkControlPlane::PutStart(const TenantId& tenant_id,
 ErrorCode RpcVChunkControlPlane::PutEnd(const TenantId& tenant_id,
                                         const std::string& key,
                                         const std::string& vchunk_id,
-                                        int64_t now_ms) {
-    auto result =
-        master_.VChunkPutEnd(tenant_id.value(), key, vchunk_id, now_ms);
+                                        int64_t now_ms,
+                                        uint64_t leader_epoch) {
+    auto result = master_.VChunkPutEnd(tenant_id.value(), key, vchunk_id,
+                                       now_ms, leader_epoch);
     return result ? ErrorCode::OK : result.error();
 }
 
 ErrorCode RpcVChunkControlPlane::PutRevoke(const TenantId& tenant_id,
                                            const std::string& key,
-                                           const std::string& vchunk_id) {
-    auto result = master_.VChunkPutRevoke(tenant_id.value(), key, vchunk_id);
+                                           const std::string& vchunk_id,
+                                           uint64_t leader_epoch) {
+    auto result = master_.VChunkPutRevoke(tenant_id.value(), key, vchunk_id,
+                                           leader_epoch);
     return result ? ErrorCode::OK : result.error();
 }
 
@@ -99,8 +106,10 @@ tl::expected<VChunkControlPlaneRead, ErrorCode> RpcVChunkControlPlane::Get(
 
 ErrorCode RpcVChunkControlPlane::Remove(const TenantId& tenant_id,
                                         const std::string& key,
-                                        int64_t now_ms) {
-    auto result = master_.RemoveVChunk(tenant_id.value(), key, now_ms);
+                                        int64_t now_ms,
+                                        uint64_t leader_epoch) {
+    auto result = master_.RemoveVChunk(tenant_id.value(), key, now_ms,
+                                       leader_epoch);
     return result ? ErrorCode::OK : result.error();
 }
 

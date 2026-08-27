@@ -561,12 +561,12 @@ WrappedMasterService::VChunkPutStart(const std::string& tenant_id,
 
 tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
+    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch) {
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id) {
             const auto error = master_service_.VChunkPutEnd(
-                resolved_tenant_id, key, vchunk_id, now_ms);
+                resolved_tenant_id, key, vchunk_id, now_ms, leader_epoch);
             return error == ErrorCode::OK
                        ? tl::expected<void, ErrorCode>{}
                        : tl::expected<void, ErrorCode>{tl::unexpected(error)};
@@ -575,12 +575,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutRevoke(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
+    const std::string& vchunk_id, uint64_t leader_epoch) {
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id) {
             const auto error = master_service_.VChunkPutRevoke(
-                resolved_tenant_id, key, vchunk_id);
+                resolved_tenant_id, key, vchunk_id, leader_epoch);
             return error == ErrorCode::OK
                        ? tl::expected<void, ErrorCode>{}
                        : tl::expected<void, ErrorCode>{tl::unexpected(error)};
@@ -606,12 +606,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReleaseVChunkReadLease(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
+    const std::string& tenant_id, const std::string& key, int64_t now_ms,
+    uint64_t leader_epoch) {
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id) {
             const auto error = master_service_.RemoveVChunk(
-                resolved_tenant_id, key, now_ms);
+                resolved_tenant_id, key, now_ms, leader_epoch);
             return error == ErrorCode::OK
                        ? tl::expected<void, ErrorCode>{}
                        : tl::expected<void, ErrorCode>{tl::unexpected(error)};

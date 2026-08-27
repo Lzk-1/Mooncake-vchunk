@@ -249,10 +249,12 @@ class MasterService {
         uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
         const std::set<std::string>& excluded_segments = {});
     ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
-                           const std::string& vchunk_id, int64_t now_ms);
+                           const std::string& vchunk_id, int64_t now_ms,
+                           uint64_t leader_epoch = 0);
     ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
                               const std::string& key,
-                              const std::string& vchunk_id);
+                              const std::string& vchunk_id,
+                              uint64_t leader_epoch = 0);
     tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
         const TenantId& tenant_id, const std::string& key) const;
     tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
@@ -261,7 +263,7 @@ class MasterService {
         const TenantId& tenant_id, const std::string& key, int64_t now_ms);
     ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
     ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
-                           int64_t now_ms);
+                           int64_t now_ms, uint64_t leader_epoch = 0);
     VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
     tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
                                                        size_t max_scan);

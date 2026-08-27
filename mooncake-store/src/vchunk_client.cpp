@@ -86,7 +86,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         return created.error();
     }
     if (Clock::now() >= deadline) {
-        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id,
+                                        created->leader_epoch);
         metrics_->AddRollback();
         metrics_->AddTimeout();
         metrics_->Observe(
@@ -127,7 +128,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                        << " error=" << static_cast<int>(transfer);
         }
         const auto revoke =
-            control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+            control_plane_->PutRevoke(tenant_id, key, created->vchunk_id,
+                                      created->leader_epoch);
         metrics_->AddRollback();
         if (transfer == ErrorCode::RPC_TIMEOUT) {
             metrics_->AddTimeout();
@@ -144,7 +146,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         return result;
     }
     if (Clock::now() >= deadline) {
-        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+        (void)control_plane_->PutRevoke(tenant_id, key, created->vchunk_id,
+                                        created->leader_epoch);
         metrics_->AddRollback();
         metrics_->AddTimeout();
         metrics_->Observe(
@@ -154,8 +157,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                 .count());
         return ErrorCode::RPC_TIMEOUT;
     }
-    auto end =
-        control_plane_->PutEnd(tenant_id, key, created->vchunk_id, now_ms_());
+    auto end = control_plane_->PutEnd(tenant_id, key, created->vchunk_id,
+                                      now_ms_(), created->leader_epoch);
     // PutEnd may have committed durably while its RPC response was lost. Read
     // back before revoking so an ambiguous timeout cannot leave a successful
     // object reported as failed (or turn it into an orphan).
@@ -168,7 +171,8 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
         }
     }
     if (end != ErrorCode::OK) {
-        control_plane_->PutRevoke(tenant_id, key, created->vchunk_id);
+        control_plane_->PutRevoke(tenant_id, key, created->vchunk_id,
+                                  created->leader_epoch);
     }
     if (end == ErrorCode::OK) {
         consecutive_put_failures_.store(0);
@@ -264,10 +268,21 @@ ErrorCode VChunkClient::Remove(const TenantId& tenant_id,
         metrics_->Observe(VChunkOperation::REMOVE, false, 0);
         return ErrorCode::INVALID_PARAMS;
     }
-    auto result = control_plane_->Remove(tenant_id, key, now_ms_());
+    auto existing = control_plane_->Get(tenant_id, key);
+    if (!existing) {
+        const auto result = existing.error() == ErrorCode::OBJECT_NOT_FOUND
+                                ? ErrorCode::OK
+                                : existing.error();
+        metrics_->Observe(VChunkOperation::REMOVE, result == ErrorCode::OK, 0);
+        return result;
+    }
+    const auto leader_epoch = existing->record.leader_epoch;
+    auto result =
+        control_plane_->Remove(tenant_id, key, now_ms_(), leader_epoch);
     if (result == ErrorCode::RPC_TIMEOUT || result == ErrorCode::RPC_FAIL) {
         metrics_->AddRetry();
-        result = control_plane_->Remove(tenant_id, key, now_ms_());
+        result =
+            control_plane_->Remove(tenant_id, key, now_ms_(), leader_epoch);
     }
     metrics_->Observe(
         VChunkOperation::REMOVE, result == ErrorCode::OK,

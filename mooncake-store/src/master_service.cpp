@@ -596,19 +596,21 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
 ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
                                       const std::string& key,
                                       const std::string& vchunk_id,
-                                      int64_t now_ms) {
+                                      int64_t now_ms, uint64_t leader_epoch) {
     if (!vchunk_enabled_) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
     if (!OwnsVChunkSlot(cvm::KeySlot(tenant_id, key))) {
         return ErrorCode::SLOT_NOT_OWNED;
     }
-    return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+    return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms,
+                                  leader_epoch);
 }
 
 ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
                                          const std::string& key,
-                                         const std::string& vchunk_id) {
+                                         const std::string& vchunk_id,
+                                         uint64_t leader_epoch) {
     if (!vchunk_enabled_) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
@@ -616,7 +618,7 @@ ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,
         return ErrorCode::SLOT_NOT_OWNED;
     }
     auto allocator_access = segment_manager_.getAllocatorAccess();
-    return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id);
+    return vchunk_manager_.PutRevoke(tenant_id, key, vchunk_id, leader_epoch);
 }
 
 tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::GetVChunk(
@@ -679,7 +681,7 @@ ErrorCode MasterService::ReleaseVChunkReadLease(
 
 ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
                                       const std::string& key,
-                                      int64_t now_ms) {
+                                      int64_t now_ms, uint64_t leader_epoch) {
     if (!vchunk_enabled_) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
@@ -687,7 +689,7 @@ ErrorCode MasterService::RemoveVChunk(const TenantId& tenant_id,
         return ErrorCode::SLOT_NOT_OWNED;
     }
     auto allocator_access = segment_manager_.getAllocatorAccess();
-    return vchunk_manager_.Remove(tenant_id, key, now_ms);
+    return vchunk_manager_.Remove(tenant_id, key, now_ms, leader_epoch);
 }
 
 VChunkRuntimeInfo MasterService::GetVChunkRuntimeInfo() const {

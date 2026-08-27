@@ -108,6 +108,30 @@ TEST(VChunkMasterManagerTest, PersistsConfiguredReplicaLayout) {
     }
 }
 
+TEST(VChunkMasterManagerTest, FencesRequestsFromObsoleteLeaderEpoch) {
+    ManagerFixture fixture;
+    VChunkMasterManager manager(EnabledConfig());
+    ASSERT_EQ(manager.ActivateLeaderEpoch(2), ErrorCode::OK);
+    auto created = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "epoch-key", 4096, false, 100, {}, 2);
+    ASSERT_TRUE(created.has_value());
+    EXPECT_EQ(created->leader_epoch, 2U);
+    EXPECT_EQ(manager.PutEnd(TenantId("tenant"), "epoch-key",
+                             created->vchunk_id, 200, 1),
+              ErrorCode::STALE_EPOCH);
+
+    ASSERT_EQ(manager.ActivateLeaderEpoch(3), ErrorCode::OK);
+    EXPECT_EQ(manager.PutEnd(TenantId("tenant"), "epoch-key",
+                             created->vchunk_id, 200, 2),
+              ErrorCode::STALE_EPOCH);
+    manager.DeactivateLeader();
+    EXPECT_EQ(manager.PutRevoke(TenantId("tenant"), "epoch-key",
+                                created->vchunk_id, 3),
+              ErrorCode::NOT_LEADER);
+    EXPECT_EQ(manager.Get(TenantId("tenant"), "epoch-key").error(),
+              ErrorCode::NOT_LEADER);
+}
+
 TEST(VChunkMasterManagerTest, ConcurrentPutStartPublishesOneObject) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());
