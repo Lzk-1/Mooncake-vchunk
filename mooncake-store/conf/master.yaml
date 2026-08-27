@@ -41,6 +41,7 @@ vchunk_max_concurrent_reads: 0
 vchunk_read_timeout_ms: 10000
 vchunk_etcd_incremental_update: true
 vchunk_enable_ha_recovery: false
+vchunk_ha_mode: "active_only"
 vchunk_allocator_claim_timeout_ms: 30000
 vchunk_verify_recovered_data: true
 root_fs_dir: ""

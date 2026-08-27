@@ -74,7 +74,19 @@ std::string MakeVChunkMetadataStoreKey(const VChunkMetadataRecord& record) {
 ErrorCode InMemoryVChunkMetadataStore::Put(
     const VChunkMetadataRecord& record) {
     std::lock_guard<std::mutex> guard(mutex_);
-    records_[MakeVChunkMetadataStoreKey(record)] = record;
+    const auto key = MakeVChunkMetadataStoreKey(record);
+    const auto it = records_.find(key);
+    if (it == records_.end()) {
+        if (record.metadata_version != 0 && record.metadata_version != 1) {
+            return ErrorCode::INVALID_VERSION;
+        }
+        records_[key] = record;
+        return ErrorCode::OK;
+    }
+    if (record.metadata_version != it->second.metadata_version + 1) {
+        return ErrorCode::INVALID_VERSION;
+    }
+    it->second = record;
     return ErrorCode::OK;
 }
 
@@ -119,6 +131,9 @@ ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
     const auto value = HexEncode(BytesToString(*encoded));
 
     if (record.status == VChunkStatus::CREATING) {
+        if (record.metadata_version != 1) {
+            return ErrorCode::INVALID_VERSION;
+        }
         const auto error = EtcdHelper::TxnCompareAndPut(
             {{object_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}},
              {metadata_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}}},
@@ -133,6 +148,13 @@ ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
     auto error = EtcdHelper::Get(metadata_key.data(), metadata_key.size(),
                                  current, revision);
     if (error != ErrorCode::OK) return error;
+    auto current_bytes = HexDecode(current);
+    if (!current_bytes) return current_bytes.error();
+    auto current_record = DeserializeVChunkMetadata(*current_bytes, config_);
+    if (!current_record) return current_record.error();
+    if (record.metadata_version != current_record->metadata_version + 1) {
+        return ErrorCode::INVALID_VERSION;
+    }
     return EtcdHelper::TxnCompareAndPut(
         {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
           record.vchunk_id},

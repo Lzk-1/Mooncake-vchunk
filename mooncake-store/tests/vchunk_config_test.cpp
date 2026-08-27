@@ -79,5 +79,16 @@ TEST(VChunkConfigTest, SsdAlwaysUsesFourKiB) {
               VCSliceSizeLevel::k4K);
 }
 
+TEST(VChunkConfigTest, ParsesExplicitHaModes) {
+    EXPECT_EQ(*ParseVChunkHAMode("disabled"), VChunkHAMode::DISABLED);
+    EXPECT_EQ(*ParseVChunkHAMode("active_only"),
+              VChunkHAMode::ACTIVE_ONLY);
+    EXPECT_EQ(*ParseVChunkHAMode("shadow"), VChunkHAMode::SHADOW);
+    EXPECT_EQ(*ParseVChunkHAMode("recoverable"),
+              VChunkHAMode::RECOVERABLE);
+    EXPECT_EQ(ParseVChunkHAMode("unsafe").error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace
 }  // namespace mooncake

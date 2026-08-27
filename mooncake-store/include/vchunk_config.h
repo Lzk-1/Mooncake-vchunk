@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+
+#include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 
@@ -12,6 +15,16 @@ enum class VCSliceSizeLevel : uint32_t {
     k256K = 256U * 1024U,
     k1M = 1024U * 1024U,
 };
+
+enum class VChunkHAMode : uint8_t {
+    DISABLED = 0,
+    ACTIVE_ONLY = 1,
+    SHADOW = 2,
+    RECOVERABLE = 3,
+};
+
+tl::expected<VChunkHAMode, ErrorCode> ParseVChunkHAMode(
+    const std::string& value);
 
 constexpr uint32_t SliceSizeLevelToBytes(VCSliceSizeLevel level) {
     return static_cast<uint32_t>(level);
@@ -40,6 +53,7 @@ struct VChunkConfig {
     uint64_t read_timeout_ms{10'000};
     bool etcd_incremental_update{true};
     bool enable_ha_recovery{false};
+    VChunkHAMode ha_mode{VChunkHAMode::ACTIVE_ONLY};
     uint64_t allocator_claim_timeout_ms{30'000};
     bool verify_recovered_data{true};
 
@@ -52,7 +66,7 @@ struct VChunkConfig {
              reaper_max_scan, enable_recovery, enable_read_merge,
              enable_replica_fallback, max_concurrent_reads, read_timeout_ms,
              etcd_incremental_update, enable_ha_recovery,
-             allocator_claim_timeout_ms, verify_recovered_data);
+             ha_mode, allocator_claim_timeout_ms, verify_recovered_data);
 };
 
 }  // namespace mooncake

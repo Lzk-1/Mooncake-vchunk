@@ -97,10 +97,12 @@ TEST(VChunkMetadataStoreTest, PersistsCreatingThenActiveBeforeVisibility) {
     ASSERT_TRUE(created.has_value());
     ASSERT_EQ(fixture.store->records.size(), 1U);
     EXPECT_EQ(fixture.store->records[0].status, VChunkStatus::CREATING);
+    EXPECT_EQ(fixture.store->records[0].metadata_version, 1U);
     ASSERT_EQ(manager.PutEnd(TenantId("tenant"), "key", created->vchunk_id,
                              20),
               ErrorCode::OK);
     EXPECT_EQ(fixture.store->records[0].status, VChunkStatus::ACTIVE);
+    EXPECT_EQ(fixture.store->records[0].metadata_version, 2U);
 }
 
 TEST(VChunkMetadataStoreTest, RecoveryRejectsActiveWithoutAllocatorRestore) {
@@ -120,6 +122,7 @@ TEST(VChunkMetadataStoreTest, RecoveryRejectsActiveWithoutAllocatorRestore) {
     expired.vchunk_id = "expired";
     expired.key = "expired";
     expired.status = VChunkStatus::CREATING;
+    expired.metadata_version = 1;
     expired.last_updated_at_ms = 10;
     for (auto& slice : expired.slices) {
         slice.status = VCSliceStatus::PENDING;
@@ -259,6 +262,20 @@ TEST(VChunkMetadataStoreTest, StartupAllowsVChunkWithHaEnabled) {
 
     MasterService service(coexistence);
     EXPECT_TRUE(service.GetVChunkRuntimeInfo().enabled);
+}
+
+TEST(VChunkMetadataStoreTest, StartupHonorsExplicitHaModeGate) {
+    MasterServiceConfig disabled;
+    disabled.vchunk_config.enabled = true;
+    disabled.vchunk_config.ha_mode = VChunkHAMode::DISABLED;
+    disabled.enable_ha = true;
+    EXPECT_THROW(MasterService service(disabled), std::invalid_argument);
+
+    MasterServiceConfig recoverable;
+    recoverable.vchunk_config.enabled = true;
+    recoverable.vchunk_config.ha_mode = VChunkHAMode::RECOVERABLE;
+    recoverable.enable_ha = true;
+    EXPECT_THROW(MasterService service(recoverable), std::invalid_argument);
 }
 
 TEST(VChunkMetadataStoreTest, RecoveryRejectsUnknownSchemaVersion) {

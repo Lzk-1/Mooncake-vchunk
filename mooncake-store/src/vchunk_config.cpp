@@ -2,6 +2,15 @@
 
 namespace mooncake {
 
+tl::expected<VChunkHAMode, ErrorCode> ParseVChunkHAMode(
+    const std::string& value) {
+    if (value == "disabled") return VChunkHAMode::DISABLED;
+    if (value == "active_only") return VChunkHAMode::ACTIVE_ONLY;
+    if (value == "shadow") return VChunkHAMode::SHADOW;
+    if (value == "recoverable") return VChunkHAMode::RECOVERABLE;
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
 VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
                                       bool is_ssd_segment) {
     if (is_ssd_segment || value_size < 64U * 1024U) {
@@ -24,6 +33,15 @@ ErrorCode VChunkConfig::Validate() const {
         reaper_interval_ms == 0 || reaper_max_scan == 0 ||
         read_timeout_ms == 0 || allocator_claim_timeout_ms == 0) {
         return ErrorCode::INVALID_PARAMS;
+    }
+    switch (ha_mode) {
+        case VChunkHAMode::DISABLED:
+        case VChunkHAMode::ACTIVE_ONLY:
+        case VChunkHAMode::SHADOW:
+        case VChunkHAMode::RECOVERABLE:
+            break;
+        default:
+            return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
 }

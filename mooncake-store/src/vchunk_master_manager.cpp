@@ -86,6 +86,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.status = VChunkStatus::CREATING;
     record.created_at_ms = now_ms;
     record.last_updated_at_ms = now_ms;
+    record.metadata_version = 1;
     record.slices.reserve(record.slice_count);
     entry->buffers.reserve(record.slice_count);
     for (auto& allocated : allocation->allocations) {
@@ -144,6 +145,7 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
     }
     durable.status = VChunkStatus::ACTIVE;
     durable.last_updated_at_ms = now_ms;
+    ++durable.metadata_version;
     if (const auto error = metadata_store_->Put(durable);
         error != ErrorCode::OK) {
         return error;
@@ -223,6 +225,7 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
         auto releasing = record;
         releasing.status = VChunkStatus::RELEASING;
         releasing.last_updated_at_ms = now_ms;
+        ++releasing.metadata_version;
         if (const auto error = metadata_store_->Put(releasing);
             error != ErrorCode::OK) {
             return error;

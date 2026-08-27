@@ -518,6 +518,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool(
         "vchunk_enable_ha_recovery",
         &master_config.vchunk_config.enable_ha_recovery, false);
+    std::string vchunk_ha_mode;
+    default_config.GetString("vchunk_ha_mode", &vchunk_ha_mode,
+                             "active_only");
+    if (auto mode = mooncake::ParseVChunkHAMode(vchunk_ha_mode)) {
+        master_config.vchunk_config.ha_mode = *mode;
+    } else {
+        LOG(FATAL) << "Invalid vchunk_ha_mode: " << vchunk_ha_mode;
+    }
     default_config.GetUInt64(
         "vchunk_allocator_claim_timeout_ms",
         &master_config.vchunk_config.allocator_claim_timeout_ms, 30'000);

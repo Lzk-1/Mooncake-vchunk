@@ -242,6 +242,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
     const bool partitioned_vchunk =
         config.vchunk_config.enabled && config.enable_ha &&
         config.ha_backend_type == "etcd" && config.submaster_count > 1;
+    if (config.vchunk_config.enabled && config.enable_ha &&
+        config.vchunk_config.ha_mode == VChunkHAMode::DISABLED) {
+        throw std::invalid_argument(
+            "vchunk HA mode is disabled; use active_only or shadow explicitly");
+    }
+    if (config.vchunk_config.enabled && config.enable_ha &&
+        config.vchunk_config.ha_mode == VChunkHAMode::RECOVERABLE &&
+        !config.vchunk_config.enable_ha_recovery) {
+        throw std::invalid_argument(
+            "recoverable vchunk HA requires recovery capabilities");
+    }
     if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
         if (partitioned_vchunk) {
             vchunk_recovery_pending_ = true;
