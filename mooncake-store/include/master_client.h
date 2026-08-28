@@ -311,6 +311,8 @@ class MasterClient {
     [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
     GetVChunkRuntimeInfo();
     [[nodiscard]] tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks();
+    [[nodiscard]] tl::expected<VChunkPromotionStatus, ErrorCode>
+    GetVChunkPromotionStatus();
 
     /**
      * @brief Revokes a put operation for a batch of objects

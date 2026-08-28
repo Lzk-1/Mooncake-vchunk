@@ -28,6 +28,18 @@ enum class VChunkRecoveryPhase : uint8_t {
     FAILED = 7,
 };
 
+struct VChunkPromotionStatus {
+    bool accepting_mutations{false};
+    uint64_t pending_records{0};
+    uint64_t leader_epoch{0};
+    bool verifier_ready{false};
+    ErrorCode last_error{ErrorCode::OK};
+    std::string failure_reason;
+
+    YLT_REFL(VChunkPromotionStatus, accepting_mutations, pending_records,
+             leader_epoch, verifier_ready, last_error, failure_reason);
+};
+
 struct VChunkRecoveredEntry {
     VChunkMetadataRecord record;
     std::vector<std::unique_ptr<AllocatedBuffer>> claims;

@@ -630,6 +630,10 @@ WrappedMasterService::ScrubVChunks() {
     return master_service_.ScrubVChunks();
 }
 
+VChunkPromotionStatus WrappedMasterService::GetVChunkPromotionStatus() {
+    return master_service_.GetVChunkPromotionStatus();
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
@@ -2098,6 +2102,9 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::GetVChunkRuntimeInfo>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ScrubVChunks>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetVChunkPromotionStatus>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);

@@ -104,6 +104,7 @@ class VChunkMasterManager {
     ErrorCode ActivateLeaderEpoch(uint64_t leader_epoch);
     void DeactivateLeader();
     uint64_t LeaderEpoch() const { return leader_epoch_.load(); }
+    bool AcceptsMutations() const { return accepts_mutations_.load(); }
     ErrorCode PublishRecoveryView(VChunkRecoveryView view);
     ErrorCode ApplyRouteSnapshot(VChunkRouteSnapshot snapshot);
     void SetDurabilitySink(DurabilitySink sink);

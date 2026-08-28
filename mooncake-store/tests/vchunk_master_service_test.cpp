@@ -172,7 +172,6 @@ TEST(VChunkMasterServiceTest, RecoverablePromotionRetriesAfterSegmentMount) {
     config.vchunk_config.enabled = true;
     config.vchunk_config.ha_mode = VChunkHAMode::RECOVERABLE;
     config.vchunk_config.enable_ha_recovery = true;
-    config.vchunk_config.verify_recovered_data = false;
     MasterService service(config);
 
     auto segment = MakeVChunkSegment("recovery-segment", 0xC00000000ULL);
@@ -183,7 +182,7 @@ TEST(VChunkMasterServiceTest, RecoverablePromotionRetriesAfterSegmentMount) {
     record.total_size = 4096;
     record.slice_count = 1;
     record.row_size = 1;
-    record.status = VChunkStatus::CREATING;
+    record.status = VChunkStatus::ACTIVE;
     record.created_at_ms = 10;
     record.last_updated_at_ms = 10;
     record.leader_epoch = 3;
@@ -194,6 +193,8 @@ TEST(VChunkMasterServiceTest, RecoverablePromotionRetriesAfterSegmentMount) {
     slice.allocated_length = 4096;
     slice.segment_instance_id = UuidToString(segment.id);
     slice.allocation_generation = 1;
+    slice.content_checksum = 123;
+    slice.status = VCSliceStatus::COMPLETED;
     record.slices.push_back(std::move(slice));
 
     service.RestoreFromStandbySnapshot({}, 1, {}, {record}, 7);
@@ -201,11 +202,27 @@ TEST(VChunkMasterServiceTest, RecoverablePromotionRetriesAfterSegmentMount) {
               ErrorCode::OBJECT_NOT_FOUND);
 
     ASSERT_TRUE(service.MountSegment(segment, generate_uuid()).has_value());
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "recovered-key").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    auto pending = service.GetVChunkPromotionStatus();
+    EXPECT_FALSE(pending.accepting_mutations);
+    EXPECT_EQ(pending.pending_records, 1U);
+    EXPECT_EQ(pending.leader_epoch, 7U);
+    EXPECT_FALSE(pending.verifier_ready);
+    EXPECT_EQ(pending.last_error, ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+
+    service.SetVChunkRecoveryVerifier(
+        [](const auto&, const auto&) { return ErrorCode::OK; });
     auto recovered =
         service.GetVChunk(TenantId("tenant"), "recovered-key");
     ASSERT_TRUE(recovered.has_value());
-    EXPECT_EQ(recovered->status, VChunkStatus::RECOVERING);
+    EXPECT_EQ(recovered->status, VChunkStatus::ACTIVE);
     EXPECT_EQ(recovered->leader_epoch, 7U);
+    auto ready = service.GetVChunkPromotionStatus();
+    EXPECT_TRUE(ready.accepting_mutations);
+    EXPECT_EQ(ready.pending_records, 0U);
+    EXPECT_TRUE(ready.verifier_ready);
+    EXPECT_EQ(ready.last_error, ErrorCode::OK);
 }
 
 }  // namespace

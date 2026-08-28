@@ -131,6 +131,7 @@ class MasterService {
     ~MasterService();
 
     void SetNoFProbeFnForTesting(NoFProbeFn fn);
+    void SetVChunkRecoveryVerifier(VChunkRecoveryManager::VerifyFn verifier);
     size_t GetMountedNoFSegmentCountForTesting();
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
@@ -270,6 +271,7 @@ class MasterService {
                                                        size_t max_scan);
     VChunkMetricsSnapshot GetVChunkMetrics() const;
     tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks() const;
+    VChunkPromotionStatus GetVChunkPromotionStatus() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -2393,9 +2395,12 @@ class MasterService {
     void StartVChunkReaper();
     void VChunkReaperThreadFunc();
     void TryRecoverPendingVChunks();
-    std::mutex pending_vchunk_recovery_mutex_;
+    mutable std::mutex pending_vchunk_recovery_mutex_;
     std::vector<VChunkMetadataRecord> pending_vchunk_recovery_;
     uint64_t pending_vchunk_leader_epoch_{0};
+    VChunkRecoveryManager::VerifyFn vchunk_recovery_verifier_;
+    ErrorCode vchunk_recovery_last_error_{ErrorCode::OK};
+    std::string vchunk_recovery_failure_reason_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

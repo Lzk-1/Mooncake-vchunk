@@ -578,6 +578,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
+void MasterService::SetVChunkRecoveryVerifier(
+    VChunkRecoveryManager::VerifyFn verifier) {
+    {
+        std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
+        vchunk_recovery_verifier_ = std::move(verifier);
+    }
+    TryRecoverPendingVChunks();
+}
+
 tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
     const TenantId& tenant_id, const std::string& key, uint64_t total_size,
     bool is_ssd_segment, int64_t now_ms,
@@ -726,6 +735,16 @@ VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
 tl::expected<VChunkScrubReport, ErrorCode> MasterService::ScrubVChunks()
     const {
     return vchunk_manager_.Scrub();
+}
+
+VChunkPromotionStatus MasterService::GetVChunkPromotionStatus() const {
+    std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
+    return {vchunk_manager_.AcceptsMutations(),
+            pending_vchunk_recovery_.size(),
+            pending_vchunk_leader_epoch_,
+            static_cast<bool>(vchunk_recovery_verifier_),
+            vchunk_recovery_last_error_,
+            vchunk_recovery_failure_reason_};
 }
 
 void MasterService::VChunkReaperThreadFunc() {
@@ -3714,6 +3733,8 @@ void MasterService::RestoreFromStandbySnapshot(
         std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
         pending_vchunk_recovery_.clear();
         pending_vchunk_leader_epoch_ = 0;
+        vchunk_recovery_last_error_ = ErrorCode::OK;
+        vchunk_recovery_failure_reason_.clear();
         if (leader_epoch != 0 &&
             vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE) {
             pending_vchunk_recovery_ = vchunks;
@@ -12685,8 +12706,10 @@ void MasterService::TryRecoverPendingVChunks() {
     VChunkRecoveryManager recovery(vchunk_config_);
     auto view = recovery.BuildIsolatedView(
         pending_vchunk_recovery_, allocator_access.getAllocatorManager(),
-        pending_vchunk_leader_epoch_);
+        pending_vchunk_leader_epoch_, vchunk_recovery_verifier_);
     if (!view) {
+        vchunk_recovery_last_error_ = view.error();
+        vchunk_recovery_failure_reason_ = recovery.FailureReason();
         VLOG(1) << "vchunk promotion remains pending: "
                 << toString(view.error())
                 << ", reason=" << recovery.FailureReason();
@@ -12695,12 +12718,16 @@ void MasterService::TryRecoverPendingVChunks() {
     const auto published =
         vchunk_manager_.PublishRecoveryView(std::move(*view));
     if (published != ErrorCode::OK) {
+        vchunk_recovery_last_error_ = published;
+        vchunk_recovery_failure_reason_ = "recovery view publication failed";
         LOG(ERROR) << "vchunk promotion publish failed: "
                    << toString(published);
         return;
     }
     pending_vchunk_recovery_.clear();
     pending_vchunk_leader_epoch_ = 0;
+    vchunk_recovery_last_error_ = ErrorCode::OK;
+    vchunk_recovery_failure_reason_.clear();
 }
 
 ErrorCode MasterService::PersistVChunkEventForHA(
