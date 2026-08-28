@@ -259,7 +259,9 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
                                       const std::string& key,
                                       const std::string& vchunk_id,
                                       int64_t now_ms,
-                                      uint64_t expected_leader_epoch) {
+                                      uint64_t expected_leader_epoch,
+                                      const std::vector<uint64_t>&
+                                          slice_checksums) {
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
         error != ErrorCode::OK) {
         return error;
@@ -289,8 +291,16 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
         return ErrorCode::INVALID_PARAMS;
     }
     auto durable = record;
-    for (auto& slice : durable.slices) {
+    if (!slice_checksums.empty() &&
+        slice_checksums.size() != durable.slices.size()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    for (size_t i = 0; i < durable.slices.size(); ++i) {
+        auto& slice = durable.slices[i];
         slice.status = VCSliceStatus::COMPLETED;
+        if (!slice_checksums.empty()) {
+            slice.content_checksum = slice_checksums[i];
+        }
     }
     durable.status = VChunkStatus::ACTIVE;
     durable.last_updated_at_ms = now_ms;

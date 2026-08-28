@@ -598,7 +598,9 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterService::VChunkPutStart(
 ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
                                       const std::string& key,
                                       const std::string& vchunk_id,
-                                      int64_t now_ms, uint64_t leader_epoch) {
+                                      int64_t now_ms, uint64_t leader_epoch,
+                                      const std::vector<uint64_t>&
+                                          slice_checksums) {
     if (!vchunk_enabled_) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
@@ -606,7 +608,7 @@ ErrorCode MasterService::VChunkPutEnd(const TenantId& tenant_id,
         return ErrorCode::SLOT_NOT_OWNED;
     }
     return vchunk_manager_.PutEnd(tenant_id, key, vchunk_id, now_ms,
-                                  leader_epoch);
+                                  leader_epoch, slice_checksums);
 }
 
 ErrorCode MasterService::VChunkPutRevoke(const TenantId& tenant_id,

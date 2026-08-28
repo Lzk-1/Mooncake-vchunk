@@ -42,7 +42,8 @@ VChunkRecoveryManager::FindAllocator(const AllocatorManager& allocators,
 tl::expected<VChunkRecoveryView, ErrorCode>
 VChunkRecoveryManager::BuildIsolatedView(
     std::vector<VChunkMetadataRecord> records,
-    const AllocatorManager& allocators, uint64_t leader_epoch) {
+    const AllocatorManager& allocators, uint64_t leader_epoch,
+    VerifyFn verify) {
     phase_ = VChunkRecoveryPhase::METADATA_REPLAY;
     failure_reason_.clear();
     if (leader_epoch == 0 || config_.Validate() != ErrorCode::OK) {
@@ -124,6 +125,23 @@ VChunkRecoveryManager::BuildIsolatedView(
 
     phase_ = VChunkRecoveryPhase::DATA_VERIFYING;
     for (auto& entry : view.entries) {
+        if (config_.verify_recovered_data &&
+            entry.record.status == VChunkStatus::ACTIVE) {
+            if (!verify) {
+                return Fail(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+                            "recovery checksum verifier is unavailable");
+            }
+            for (const auto& slice : entry.record.slices) {
+                if (slice.content_checksum == 0) {
+                    return Fail(ErrorCode::CHECKSUM_MISMATCH,
+                                "recovery checksum is missing");
+                }
+                if (const auto error = verify(entry.record, slice);
+                    error != ErrorCode::OK) {
+                    return Fail(error, "recovery checksum verification failed");
+                }
+            }
+        }
         entry.record.leader_epoch = leader_epoch;
         ++entry.record.metadata_version;
         if (entry.record.status == VChunkStatus::ACTIVE) continue;

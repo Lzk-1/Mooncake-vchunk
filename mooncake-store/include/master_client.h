@@ -295,7 +295,8 @@ class MasterClient {
         uint64_t total_size, int64_t now_ms);
     [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutEnd(
         const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch);
+        const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch,
+        const std::vector<uint64_t>& slice_checksums);
     [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
         const std::string& tenant_id, const std::string& key,
         const std::string& vchunk_id, uint64_t leader_epoch);

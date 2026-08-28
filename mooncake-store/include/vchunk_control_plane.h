@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -31,7 +32,8 @@ class VChunkControlPlane {
         int64_t now_ms) = 0;
     virtual ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
                              const std::string& vchunk_id,
-                             int64_t now_ms, uint64_t leader_epoch) = 0;
+                             int64_t now_ms, uint64_t leader_epoch,
+                             const std::vector<uint64_t>& slice_checksums) = 0;
     virtual ErrorCode PutRevoke(const TenantId& tenant_id,
                                 const std::string& key,
                                 const std::string& vchunk_id,
@@ -50,7 +52,8 @@ class LocalVChunkControlPlane final : public VChunkControlPlane {
     tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
         const TenantId&, const std::string&, uint64_t, int64_t) override;
     ErrorCode PutEnd(const TenantId&, const std::string&, const std::string&,
-                     int64_t, uint64_t) override;
+                     int64_t, uint64_t,
+                     const std::vector<uint64_t>&) override;
     ErrorCode PutRevoke(const TenantId&, const std::string&,
                         const std::string&, uint64_t) override;
     tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
@@ -69,7 +72,8 @@ class RpcVChunkControlPlane final : public VChunkControlPlane {
     tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
         const TenantId&, const std::string&, uint64_t, int64_t) override;
     ErrorCode PutEnd(const TenantId&, const std::string&, const std::string&,
-                     int64_t, uint64_t) override;
+                     int64_t, uint64_t,
+                     const std::vector<uint64_t>&) override;
     ErrorCode PutRevoke(const TenantId&, const std::string&,
                         const std::string&, uint64_t) override;
     tl::expected<VChunkControlPlaneRead, ErrorCode> Get(

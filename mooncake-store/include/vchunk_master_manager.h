@@ -64,7 +64,8 @@ class VChunkMasterManager {
 
     ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
                      const std::string& vchunk_id, int64_t now_ms,
-                     uint64_t expected_leader_epoch = 0);
+                     uint64_t expected_leader_epoch = 0,
+                     const std::vector<uint64_t>& slice_checksums = {});
     ErrorCode PutRevoke(const TenantId& tenant_id, const std::string& key,
                         const std::string& vchunk_id,
                         uint64_t expected_leader_epoch = 0);

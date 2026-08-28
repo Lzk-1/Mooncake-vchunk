@@ -99,11 +99,15 @@ class MemoryDataPlane final : public VChunkDataPlane {
                         it->second[i].data(), it->second[i].size());
             offset += it->second[i].size();
         }
+        if (corrupt_read && offset != 0) {
+            *static_cast<uint8_t*>(destination) ^= 0xFF;
+        }
         return offset == length ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
     }
 
     bool fail_write{false};
     bool fail_read{false};
+    bool corrupt_read{false};
     int write_failures_remaining{0};
     int read_failures_remaining{0};
     int write_attempts{0};
@@ -250,6 +254,20 @@ TEST_F(ClientFixture, FailedReadDoesNotReturnPartialSuccess) {
     EXPECT_EQ(client.Get(TenantId("tenant"), "key", destination.data(),
                          destination.size()),
               ErrorCode::TRANSFER_FAIL);
+}
+
+TEST_F(ClientFixture, DetectsCorruptedReadWithPersistedSliceChecksum) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; });
+    std::vector<uint8_t> source(8192, 7);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "checksummed", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+    data.corrupt_read = true;
+    std::vector<uint8_t> destination(source.size());
+    EXPECT_EQ(client.Get(TenantId("tenant"), "checksummed",
+                         destination.data(), destination.size()),
+              ErrorCode::CHECKSUM_MISMATCH);
 }
 
 TEST_F(ClientFixture, DisabledVChunkUsesOnlyLegacyPath) {

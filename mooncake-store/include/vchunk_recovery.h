@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -52,12 +53,15 @@ class VChunkRecoveryView {
 
 class VChunkRecoveryManager {
    public:
+    using VerifyFn = std::function<ErrorCode(
+        const VChunkMetadataRecord&, const VCSliceDescriptor&)>;
     explicit VChunkRecoveryManager(VChunkConfig config)
         : config_(std::move(config)) {}
 
     tl::expected<VChunkRecoveryView, ErrorCode> BuildIsolatedView(
         std::vector<VChunkMetadataRecord> records,
-        const AllocatorManager& allocators, uint64_t leader_epoch);
+        const AllocatorManager& allocators, uint64_t leader_epoch,
+        VerifyFn verify = {});
 
     VChunkRecoveryPhase Phase() const { return phase_; }
     const std::string& FailureReason() const { return failure_reason_; }

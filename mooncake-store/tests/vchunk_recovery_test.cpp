@@ -29,6 +29,7 @@ VChunkMetadataRecord MakeRecoveryRecord(uintptr_t address,
     slice.logical_length = 4096;
     slice.allocated_length = 4096;
     slice.allocation_generation = 1;
+    slice.content_checksum = 123;
     slice.status = VCSliceStatus::COMPLETED;
     record.slices.push_back(std::move(slice));
     return record;
@@ -44,7 +45,8 @@ TEST(VChunkRecoveryTest, ClaimsIntoIsolatedViewAndAdvancesEpoch) {
     VChunkRecoveryManager recovery(VChunkConfig{});
 
     auto view = recovery.BuildIsolatedView(
-        {MakeRecoveryRecord(kBase, "instance-1")}, allocators, 5);
+        {MakeRecoveryRecord(kBase, "instance-1")}, allocators, 5,
+        [](const auto&, const auto&) { return ErrorCode::OK; });
     ASSERT_TRUE(view.has_value());
     ASSERT_EQ(view->entries.size(), 1U);
     ASSERT_EQ(view->entries[0].claims.size(), 1U);
@@ -65,7 +67,8 @@ TEST(VChunkRecoveryTest, RejectsRestartedSegmentWithoutAllocating) {
     VChunkRecoveryManager recovery(VChunkConfig{});
 
     auto view = recovery.BuildIsolatedView(
-        {MakeRecoveryRecord(kBase, "old-instance")}, allocators, 5);
+        {MakeRecoveryRecord(kBase, "old-instance")}, allocators, 5,
+        [](const auto&, const auto&) { return ErrorCode::OK; });
     ASSERT_FALSE(view.has_value());
     EXPECT_EQ(view.error(), ErrorCode::REPLICA_IS_GONE);
     EXPECT_EQ(recovery.Phase(), VChunkRecoveryPhase::FAILED);
@@ -81,7 +84,8 @@ TEST(VChunkRecoveryTest, PublishesRecoveredViewAtomically) {
     allocators.addAllocator("segment", allocator);
     VChunkRecoveryManager recovery(VChunkConfig{});
     auto view = recovery.BuildIsolatedView(
-        {MakeRecoveryRecord(kBase, "instance-1")}, allocators, 5);
+        {MakeRecoveryRecord(kBase, "instance-1")}, allocators, 5,
+        [](const auto&, const auto&) { return ErrorCode::OK; });
     ASSERT_TRUE(view.has_value());
 
     VChunkConfig config;

@@ -1161,19 +1161,20 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
 
 tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch) {
+    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch,
+    const std::vector<uint64_t>& slice_checksums) {
     std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
     auto result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-        tenant_id, key, vchunk_id, now_ms, leader_epoch);
+        tenant_id, key, vchunk_id, now_ms, leader_epoch, slice_checksums);
     if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
         RefreshSubmasterRouting() == ErrorCode::OK &&
         SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
         result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-            tenant_id, key, vchunk_id, now_ms, leader_epoch);
+            tenant_id, key, vchunk_id, now_ms, leader_epoch, slice_checksums);
     }
     return result;
 }

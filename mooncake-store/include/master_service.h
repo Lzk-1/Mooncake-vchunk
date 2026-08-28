@@ -250,7 +250,8 @@ class MasterService {
         const std::set<std::string>& excluded_segments = {});
     ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
                            const std::string& vchunk_id, int64_t now_ms,
-                           uint64_t leader_epoch = 0);
+                           uint64_t leader_epoch = 0,
+                           const std::vector<uint64_t>& slice_checksums = {});
     ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
                               const std::string& key,
                               const std::string& vchunk_id,

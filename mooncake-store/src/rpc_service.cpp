@@ -561,12 +561,14 @@ WrappedMasterService::VChunkPutStart(const std::string& tenant_id,
 
 tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
     const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch) {
+    const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch,
+    const std::vector<uint64_t>& slice_checksums) {
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id) {
             const auto error = master_service_.VChunkPutEnd(
-                resolved_tenant_id, key, vchunk_id, now_ms, leader_epoch);
+                resolved_tenant_id, key, vchunk_id, now_ms, leader_epoch,
+                slice_checksums);
             return error == ErrorCode::OK
                        ? tl::expected<void, ErrorCode>{}
                        : tl::expected<void, ErrorCode>{tl::unexpected(error)};

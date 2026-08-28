@@ -1,6 +1,7 @@
 #include "vchunk_client.h"
 
 #include <glog/logging.h>
+#include <xxhash.h>
 
 #include "master_service.h"
 
@@ -16,6 +17,39 @@ bool CountsForCircuitBreaker(ErrorCode error) {
            error == ErrorCode::TRANSFER_FAIL || error == ErrorCode::RPC_TIMEOUT ||
            error == ErrorCode::ETCD_OPERATION_ERROR ||
            error == ErrorCode::RPC_FAIL;
+}
+
+std::vector<uint64_t> ComputeSliceChecksums(
+    const VChunkMetadataRecord& record, const void* data, size_t length) {
+    std::vector<uint64_t> checksums;
+    checksums.reserve(record.slices.size());
+    const auto slice_size = SliceSizeLevelToBytes(record.slice_size_level);
+    const auto* bytes = static_cast<const char*>(data);
+    for (const auto& slice : record.slices) {
+        const uint64_t offset =
+            static_cast<uint64_t>(slice.slice_index) * slice_size;
+        if (offset > length || slice.logical_length > length - offset) {
+            return {};
+        }
+        checksums.push_back(
+            XXH64(bytes + offset, slice.logical_length, 0));
+    }
+    return checksums;
+}
+
+ErrorCode VerifySliceChecksums(const VChunkMetadataRecord& record,
+                               const void* data, size_t length) {
+    auto actual = ComputeSliceChecksums(record, data, length);
+    if (actual.size() != record.slices.size()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const auto expected = record.slices[i].content_checksum;
+        if (expected != 0 && expected != actual[i]) {
+            return ErrorCode::CHECKSUM_MISMATCH;
+        }
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace
@@ -157,8 +191,15 @@ ErrorCode VChunkClient::Put(const TenantId& tenant_id, const std::string& key,
                 .count());
         return ErrorCode::RPC_TIMEOUT;
     }
+    auto checksums = ComputeSliceChecksums(*created, source, length);
+    if (checksums.size() != created->slices.size()) {
+        control_plane_->PutRevoke(tenant_id, key, created->vchunk_id,
+                                  created->leader_epoch);
+        return ErrorCode::INVALID_PARAMS;
+    }
     auto end = control_plane_->PutEnd(tenant_id, key, created->vchunk_id,
-                                      now_ms_(), created->leader_epoch);
+                                      now_ms_(), created->leader_epoch,
+                                      checksums);
     // PutEnd may have committed durably while its RPC response was lost. Read
     // back before revoking so an ambiguous timeout cannot leave a successful
     // object reported as failed (or turn it into an orphan).
@@ -236,6 +277,9 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         metrics_->AddTimeout();
     } else if (result == ErrorCode::TRANSFER_FAIL) {
         metrics_->AddTransferFailure();
+    }
+    if (result == ErrorCode::OK) {
+        result = VerifySliceChecksums(read->record, destination, length);
     }
     if (result != ErrorCode::OK) {
         if (!read->record.slices.empty()) {

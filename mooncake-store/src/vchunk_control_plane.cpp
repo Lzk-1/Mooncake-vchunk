@@ -40,9 +40,11 @@ ErrorCode LocalVChunkControlPlane::PutEnd(const TenantId& tenant_id,
                                           const std::string& key,
                                           const std::string& vchunk_id,
                                           int64_t now_ms,
-                                          uint64_t leader_epoch) {
+                                          uint64_t leader_epoch,
+                                          const std::vector<uint64_t>&
+                                              slice_checksums) {
     return master_.VChunkPutEnd(tenant_id, key, vchunk_id, now_ms,
-                                leader_epoch);
+                                leader_epoch, slice_checksums);
 }
 
 ErrorCode LocalVChunkControlPlane::PutRevoke(const TenantId& tenant_id,
@@ -79,9 +81,11 @@ ErrorCode RpcVChunkControlPlane::PutEnd(const TenantId& tenant_id,
                                         const std::string& key,
                                         const std::string& vchunk_id,
                                         int64_t now_ms,
-                                        uint64_t leader_epoch) {
+                                        uint64_t leader_epoch,
+                                        const std::vector<uint64_t>&
+                                            slice_checksums) {
     auto result = master_.VChunkPutEnd(tenant_id.value(), key, vchunk_id,
-                                       now_ms, leader_epoch);
+                                       now_ms, leader_epoch, slice_checksums);
     return result ? ErrorCode::OK : result.error();
 }
 
