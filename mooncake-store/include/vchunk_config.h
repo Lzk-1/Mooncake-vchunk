@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -57,6 +58,10 @@ struct VChunkConfig {
     VChunkHAMode ha_mode{VChunkHAMode::ACTIVE_ONLY};
     uint64_t allocator_claim_timeout_ms{30'000};
     bool verify_recovered_data{true};
+    std::string submaster_id;
+    uint64_t route_version{0};
+    uint64_t owner_epoch{0};
+    std::vector<std::string> static_slot_owners;
 
     ErrorCode Validate() const;
 
@@ -68,7 +73,8 @@ struct VChunkConfig {
              reaper_max_scan, enable_recovery, enable_read_merge,
              enable_replica_fallback, max_concurrent_reads, read_timeout_ms,
              etcd_incremental_update, enable_ha_recovery,
-             ha_mode, allocator_claim_timeout_ms, verify_recovered_data);
+             ha_mode, allocator_claim_timeout_ms, verify_recovered_data,
+             submaster_id, route_version, owner_epoch, static_slot_owners);
 };
 
 }  // namespace mooncake

@@ -35,6 +35,18 @@ ErrorCode VChunkConfig::Validate() const {
         read_timeout_ms == 0 || allocator_claim_timeout_ms == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
+    const bool routing_disabled = submaster_id.empty() && route_version == 0 &&
+                                  owner_epoch == 0 &&
+                                  static_slot_owners.empty();
+    if (!routing_disabled) {
+        if (submaster_id.empty() || route_version == 0 || owner_epoch == 0 ||
+            static_slot_owners.empty()) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        for (const auto& owner : static_slot_owners) {
+            if (owner.empty()) return ErrorCode::INVALID_PARAMS;
+        }
+    }
     switch (ha_mode) {
         case VChunkHAMode::DISABLED:
         case VChunkHAMode::ACTIVE_ONLY:

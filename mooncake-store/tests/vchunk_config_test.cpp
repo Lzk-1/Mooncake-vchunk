@@ -61,6 +61,10 @@ TEST(VChunkConfigTest, RejectsInvalidLimits) {
     config = VChunkConfig{};
     config.read_timeout_ms = 0;
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.submaster_id = "submaster-a";
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {

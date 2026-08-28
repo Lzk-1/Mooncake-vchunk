@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,8 @@
 #include "vchunk_metadata.h"
 #include "vchunk_metadata_store.h"
 #include "vchunk_metrics.h"
+#include "vchunk_recovery.h"
+#include "vchunk_routing.h"
 
 namespace mooncake {
 
@@ -75,6 +78,7 @@ class VChunkMasterManager {
     ErrorCode ActivateLeaderEpoch(uint64_t leader_epoch);
     void DeactivateLeader();
     uint64_t LeaderEpoch() const { return leader_epoch_.load(); }
+    ErrorCode PublishRecoveryView(VChunkRecoveryView view);
 
     ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
@@ -96,12 +100,15 @@ class VChunkMasterManager {
     void RefreshStateMetricsLocked();
     void ReleasePendingPut(const std::string& scoped_key);
     ErrorCode CheckLeaderEpoch(uint64_t expected_leader_epoch) const;
+    ErrorCode CheckStaticOwner(const TenantId& tenant_id,
+                               const std::string& key) const;
 
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
     const std::shared_ptr<VChunkMetrics> metrics_;
     std::atomic<uint64_t> leader_epoch_{1};
     std::atomic<bool> accepts_mutations_{true};
+    std::optional<VChunkStaticRouteTable> static_routes_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;

@@ -132,6 +132,22 @@ TEST(VChunkMasterManagerTest, FencesRequestsFromObsoleteLeaderEpoch) {
               ErrorCode::NOT_LEADER);
 }
 
+TEST(VChunkMasterManagerTest, RejectsKeysOwnedByAnotherStaticSubmaster) {
+    ManagerFixture fixture;
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-b"};
+    VChunkMasterManager manager(config);
+
+    auto created = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "remote-key", 4096, false, 100);
+    ASSERT_FALSE(created.has_value());
+    EXPECT_EQ(created.error(), ErrorCode::NOT_OWNER);
+    EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
+}
+
 TEST(VChunkMasterManagerTest, ConcurrentPutStartPublishesOneObject) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());

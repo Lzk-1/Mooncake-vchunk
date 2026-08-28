@@ -54,6 +54,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::NOT_LEADER, "NOT_LEADER"},
         {ErrorCode::STALE_EPOCH, "STALE_EPOCH"},
         {ErrorCode::RECOVERY_IN_PROGRESS, "RECOVERY_IN_PROGRESS"},
+        {ErrorCode::NOT_OWNER, "NOT_OWNER"},
+        {ErrorCode::ROUTE_CHANGED, "ROUTE_CHANGED"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},

@@ -17,7 +17,13 @@ VChunkMasterManager::VChunkMasterManager(
                                      : std::make_shared<
                                            InMemoryVChunkMetadataStore>()),
       metrics_(metrics ? std::move(metrics)
-                       : std::make_shared<VChunkMetrics>()) {}
+                       : std::make_shared<VChunkMetrics>()) {
+    if (!config_.static_slot_owners.empty()) {
+        static_routes_.emplace(config_.route_version,
+                               config_.static_slot_owners,
+                               config_.owner_epoch);
+    }
+}
 
 std::string VChunkMasterManager::ScopedKey(const TenantId& tenant_id,
                                            const std::string& key) {
@@ -32,6 +38,16 @@ ErrorCode VChunkMasterManager::CheckLeaderEpoch(
         return ErrorCode::STALE_EPOCH;
     }
     return ErrorCode::OK;
+}
+
+ErrorCode VChunkMasterManager::CheckStaticOwner(
+    const TenantId& tenant_id, const std::string& key) const {
+    if (!static_routes_) return ErrorCode::OK;
+    auto route = static_routes_->Resolve(tenant_id.value(), key);
+    if (!route) return route.error();
+    return route->owner_submaster_id == config_.submaster_id
+               ? ErrorCode::OK
+               : ErrorCode::NOT_OWNER;
 }
 
 ErrorCode VChunkMasterManager::ActivateLeaderEpoch(uint64_t leader_epoch) {
@@ -50,12 +66,49 @@ void VChunkMasterManager::DeactivateLeader() {
     accepts_mutations_.store(false);
 }
 
+ErrorCode VChunkMasterManager::PublishRecoveryView(VChunkRecoveryView view) {
+    if (view.leader_epoch == 0) return ErrorCode::INVALID_PARAMS;
+    std::unordered_map<std::string, std::shared_ptr<Entry>> recovered;
+    recovered.reserve(view.entries.size());
+    for (auto& source : view.entries) {
+        if (source.record.leader_epoch != view.leader_epoch ||
+            ValidateVChunkMetadata(source.record, config_) != ErrorCode::OK ||
+            source.claims.size() != source.record.slices.size()) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        auto entry = std::make_shared<Entry>();
+        entry->record = std::move(source.record);
+        entry->buffers = std::move(source.claims);
+        const auto key = ScopedKey(TenantId(entry->record.tenant_id),
+                                   entry->record.key);
+        if (!recovered.emplace(key, std::move(entry)).second) {
+            return ErrorCode::OBJECT_ALREADY_EXISTS;
+        }
+    }
+
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (view.leader_epoch < leader_epoch_.load()) {
+        return ErrorCode::STALE_EPOCH;
+    }
+    leader_epoch_.store(view.leader_epoch);
+    entries_.swap(recovered);
+    pending_puts_.clear();
+    reaper_cursor_key_.clear();
+    accepts_mutations_.store(true);
+    RefreshStateMetricsLocked();
+    return ErrorCode::OK;
+}
+
 tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     const AllocatorManager& allocator_manager, const TenantId& tenant_id,
     const std::string& key, uint64_t total_size, bool is_ssd_segment,
     int64_t now_ms, const std::set<std::string>& excluded_segments,
     uint64_t expected_leader_epoch) {
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
+    if (const auto error = CheckStaticOwner(tenant_id, key);
         error != ErrorCode::OK) {
         return tl::make_unexpected(error);
     }
@@ -174,6 +227,10 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
         error != ErrorCode::OK) {
         return error;
     }
+    if (const auto error = CheckStaticOwner(tenant_id, key);
+        error != ErrorCode::OK) {
+        return error;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -218,6 +275,10 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
         error != ErrorCode::OK) {
         return error;
     }
+    if (const auto error = CheckStaticOwner(tenant_id, key);
+        error != ErrorCode::OK) {
+        return error;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -258,6 +319,10 @@ VChunkMasterManager::AcquireRead(const TenantId& tenant_id,
     if (!accepts_mutations_.load()) {
         return tl::make_unexpected(ErrorCode::NOT_LEADER);
     }
+    if (const auto error = CheckStaticOwner(tenant_id, key);
+        error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     const auto it = entries_.find(ScopedKey(tenant_id, key));
     if (it == entries_.end()) {
@@ -277,6 +342,10 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
                                       int64_t now_ms,
                                       uint64_t expected_leader_epoch) {
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
+        error != ErrorCode::OK) {
+        return error;
+    }
+    if (const auto error = CheckStaticOwner(tenant_id, key);
         error != ErrorCode::OK) {
         return error;
     }
