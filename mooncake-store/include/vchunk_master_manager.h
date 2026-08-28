@@ -109,6 +109,7 @@ class VChunkMasterManager {
     ErrorCode PublishRecoveryView(VChunkRecoveryView view);
     ErrorCode ApplyRouteSnapshot(VChunkRouteSnapshot snapshot);
     void SetDurabilitySink(DurabilitySink sink);
+    void SetMembershipCheck(std::function<bool()> check);
 
     ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
@@ -147,6 +148,7 @@ class VChunkMasterManager {
     std::optional<VChunkStaticRouteTable> static_routes_;
     VChunkDynamicRouteTable dynamic_routes_;
     DurabilitySink durability_sink_;
+    std::function<bool()> membership_check_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;

@@ -220,6 +220,21 @@ TEST(VChunkMasterManagerTest, PersistentRouteFailureIsFailClosed) {
         std::runtime_error);
 }
 
+TEST(VChunkMasterManagerTest, MembershipLossFencesMutations) {
+    ManagerFixture fixture;
+    VChunkMasterManager manager(EnabledConfig());
+    std::atomic<bool> healthy{true};
+    manager.SetMembershipCheck([&] { return healthy.load(); });
+    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "before-loss", 4096, false, 100)
+                    .has_value());
+    healthy.store(false);
+    auto rejected = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                     "after-loss", 4096, false, 101);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::NOT_LEADER);
+}
+
 TEST(VChunkMasterManagerTest, RequiresDurabilityBeforePublishingState) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());

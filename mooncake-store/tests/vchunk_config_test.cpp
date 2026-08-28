@@ -83,6 +83,20 @@ TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {
               VCSliceSizeLevel::k1M);
 }
 
+TEST(VChunkConfigTest, DynamicMembershipRequiresRoutingAndLeaseBudget) {
+    VChunkConfig config;
+    config.enable_dynamic_membership = true;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    EXPECT_EQ(config.Validate(), ErrorCode::OK);
+    config.membership_lease_ttl_sec = 2;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VChunkConfigTest, SsdAlwaysUsesFourKiB) {
     EXPECT_EQ(SelectVChunkSliceSize(8U * 1024U * 1024U, true),
               VCSliceSizeLevel::k4K);

@@ -32,7 +32,8 @@ ErrorCode VChunkConfig::Validate() const {
         max_replica_count == 0 || max_slice_count == 0 ||
         max_metadata_bytes == 0 || max_creating_objects == 0 ||
         reaper_interval_ms == 0 || reaper_max_scan == 0 ||
-        read_timeout_ms == 0 || allocator_claim_timeout_ms == 0) {
+        read_timeout_ms == 0 || allocator_claim_timeout_ms == 0 ||
+        membership_lease_ttl_sec < 3) {
         return ErrorCode::INVALID_PARAMS;
     }
     const bool routing_disabled = submaster_id.empty() && route_version == 0 &&
@@ -46,6 +47,9 @@ ErrorCode VChunkConfig::Validate() const {
         for (const auto& owner : static_slot_owners) {
             if (owner.empty()) return ErrorCode::INVALID_PARAMS;
         }
+    }
+    if (enable_dynamic_membership && routing_disabled) {
+        return ErrorCode::INVALID_PARAMS;
     }
     switch (ha_mode) {
         case VChunkHAMode::DISABLED:

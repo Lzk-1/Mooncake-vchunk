@@ -87,6 +87,7 @@ set(MOONCAKE_STORE_SOURCES
     vchunk_ha_codec.cpp
     vchunk_recovery.cpp
     vchunk_routing.cpp
+    vchunk_membership.cpp
     vchunk_allocation_strategy.cpp
     vchunk_master_manager.cpp
     vchunk_client.cpp

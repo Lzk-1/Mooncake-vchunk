@@ -313,6 +313,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks();
     [[nodiscard]] tl::expected<VChunkPromotionStatus, ErrorCode>
     GetVChunkPromotionStatus();
+    [[nodiscard]]
+    tl::expected<std::vector<VChunkSubMasterMember>, ErrorCode>
+    ListVChunkSubMasters();
 
     /**
      * @brief Revokes a put operation for a batch of objects

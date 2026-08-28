@@ -72,7 +72,15 @@ std::string VChunkMasterManager::ScopedKey(const TenantId& tenant_id,
 
 ErrorCode VChunkMasterManager::CheckLeaderEpoch(
     uint64_t expected_leader_epoch) const {
-    if (!accepts_mutations_.load()) return ErrorCode::NOT_LEADER;
+    std::function<bool()> membership_check;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        membership_check = membership_check_;
+    }
+    if (!accepts_mutations_.load() ||
+        (membership_check && !membership_check())) {
+        return ErrorCode::NOT_LEADER;
+    }
     const auto current = leader_epoch_.load();
     if (expected_leader_epoch != 0 && expected_leader_epoch != current) {
         return ErrorCode::STALE_EPOCH;
@@ -126,6 +134,11 @@ ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
 void VChunkMasterManager::SetDurabilitySink(DurabilitySink sink) {
     std::lock_guard<std::mutex> guard(mutex_);
     durability_sink_ = std::move(sink);
+}
+
+void VChunkMasterManager::SetMembershipCheck(std::function<bool()> check) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    membership_check_ = std::move(check);
 }
 
 ErrorCode VChunkMasterManager::PersistEvent(

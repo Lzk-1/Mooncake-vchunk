@@ -262,6 +262,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument(
             "recoverable vchunk HA requires recovery capabilities");
     }
+    if (config.vchunk_config.enabled &&
+        config.vchunk_config.enable_dynamic_membership) {
+        if (config.vchunk_etcd_endpoints.empty()) {
+            throw std::invalid_argument(
+                "dynamic vchunk membership requires ETCD endpoints");
+        }
+        vchunk_membership_ = std::make_unique<EtcdVChunkMembership>(
+            config.vchunk_etcd_endpoints, config.cluster_id);
+        const auto membership_error = vchunk_membership_->Start(
+            config.vchunk_config.submaster_id,
+            config.vchunk_config.membership_lease_ttl_sec);
+        if (membership_error != ErrorCode::OK) {
+            throw std::runtime_error(
+                "failed to register vchunk SubMaster membership");
+        }
+        vchunk_manager_.SetMembershipCheck(
+            [this] { return vchunk_membership_->Healthy(); });
+    }
     if (config.vchunk_config.enabled && config.vchunk_metadata_store) {
         if (partitioned_vchunk) {
             vchunk_recovery_pending_ = true;
@@ -752,6 +770,14 @@ VChunkPromotionStatus MasterService::GetVChunkPromotionStatus() const {
             static_cast<bool>(vchunk_recovery_verifier_),
             vchunk_recovery_last_error_,
             vchunk_recovery_failure_reason_};
+}
+
+tl::expected<std::vector<VChunkSubMasterMember>, ErrorCode>
+MasterService::ListVChunkSubMasters() const {
+    if (!vchunk_membership_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return vchunk_membership_->List();
 }
 
 void MasterService::VChunkReaperThreadFunc() {

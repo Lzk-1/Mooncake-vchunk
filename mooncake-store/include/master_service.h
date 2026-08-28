@@ -38,6 +38,7 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "vchunk_master_manager.h"
+#include "vchunk_membership.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -272,6 +273,8 @@ class MasterService {
     VChunkMetricsSnapshot GetVChunkMetrics() const;
     tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks() const;
     VChunkPromotionStatus GetVChunkPromotionStatus() const;
+    tl::expected<std::vector<VChunkSubMasterMember>, ErrorCode>
+    ListVChunkSubMasters() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -2378,6 +2381,7 @@ class MasterService {
     bool vchunk_enabled_{false};
     VChunkHAMode vchunk_ha_mode_{VChunkHAMode::ACTIVE_ONLY};
     VChunkConfig vchunk_config_{};
+    std::unique_ptr<EtcdVChunkMembership> vchunk_membership_;
     uint64_t vchunk_reaper_interval_ms_{1000};
     size_t vchunk_reaper_max_scan_{128};
     std::atomic<bool> vchunk_reaper_running_{false};

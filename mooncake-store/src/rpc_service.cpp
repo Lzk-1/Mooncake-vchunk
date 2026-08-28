@@ -634,6 +634,11 @@ VChunkPromotionStatus WrappedMasterService::GetVChunkPromotionStatus() {
     return master_service_.GetVChunkPromotionStatus();
 }
 
+tl::expected<std::vector<VChunkSubMasterMember>, ErrorCode>
+WrappedMasterService::ListVChunkSubMasters() {
+    return master_service_.ListVChunkSubMasters();
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
@@ -2105,6 +2110,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetVChunkPromotionStatus>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ListVChunkSubMasters>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);

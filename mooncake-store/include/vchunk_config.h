@@ -62,6 +62,8 @@ struct VChunkConfig {
     uint64_t route_version{0};
     uint64_t owner_epoch{0};
     std::vector<std::string> static_slot_owners;
+    bool enable_dynamic_membership{false};
+    uint32_t membership_lease_ttl_sec{15};
 
     ErrorCode Validate() const;
 
@@ -74,7 +76,8 @@ struct VChunkConfig {
              enable_replica_fallback, max_concurrent_reads, read_timeout_ms,
              etcd_incremental_update, enable_ha_recovery,
              ha_mode, allocator_claim_timeout_ms, verify_recovered_data,
-             submaster_id, route_version, owner_epoch, static_slot_owners);
+             submaster_id, route_version, owner_epoch, static_slot_owners,
+             enable_dynamic_membership, membership_lease_ttl_sec);
 };
 
 }  // namespace mooncake
