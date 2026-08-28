@@ -89,6 +89,39 @@ TEST(VChunkMetadataStoreTest, PutStartIsNotVisibleWhenDurableWriteFails) {
                     .has_value());
 }
 
+TEST(VChunkMetadataStoreTest, ScrubReportsPersistentVersionDrift) {
+    StoreFixture fixture;
+    VChunkMasterManager manager(fixture.config, fixture.store);
+    auto created = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "key", 4096, false, 10);
+    ASSERT_TRUE(created.has_value());
+
+    auto clean = manager.Scrub();
+    ASSERT_TRUE(clean.has_value());
+    EXPECT_TRUE(clean->clean());
+    EXPECT_EQ(clean->runtime_records, 1U);
+    EXPECT_EQ(clean->persistent_records, 1U);
+
+    ++fixture.store->records[0].metadata_version;
+    auto stale = manager.Scrub();
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_FALSE(stale->clean());
+    EXPECT_EQ(stale->stale_persistent_records, 1U);
+    const auto metrics = manager.MetricsSnapshot();
+    EXPECT_EQ(metrics.scrub_runs, 2U);
+    EXPECT_EQ(metrics.scrub_issues, 1U);
+}
+
+TEST(VChunkMetadataStoreTest, ScrubPropagatesPersistentReadFailure) {
+    StoreFixture fixture;
+    VChunkMasterManager manager(fixture.config, fixture.store);
+    fixture.store->fail_list = true;
+    auto report = manager.Scrub();
+    ASSERT_FALSE(report.has_value());
+    EXPECT_EQ(report.error(), ErrorCode::ETCD_OPERATION_ERROR);
+    EXPECT_EQ(manager.MetricsSnapshot().scrub_failures, 1U);
+}
+
 TEST(VChunkMetadataStoreTest, PersistsCreatingThenActiveBeforeVisibility) {
     StoreFixture fixture;
     VChunkMasterManager manager(fixture.config, fixture.store);

@@ -310,6 +310,7 @@ class MasterClient {
         uint64_t leader_epoch);
     [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
     GetVChunkRuntimeInfo();
+    [[nodiscard]] tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks();
 
     /**
      * @brief Revokes a put operation for a batch of objects

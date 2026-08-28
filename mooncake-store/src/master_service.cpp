@@ -723,6 +723,11 @@ VChunkMetricsSnapshot MasterService::GetVChunkMetrics() const {
     return vchunk_manager_.MetricsSnapshot();
 }
 
+tl::expected<VChunkScrubReport, ErrorCode> MasterService::ScrubVChunks()
+    const {
+    return vchunk_manager_.Scrub();
+}
+
 void MasterService::VChunkReaperThreadFunc() {
     std::unique_lock<std::mutex> lock(vchunk_reaper_mutex_);
     while (vchunk_reaper_running_) {

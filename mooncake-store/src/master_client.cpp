@@ -120,6 +120,10 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::GetVChunkRuntimeInfo> {
     static constexpr const char* value = "GetVChunkRuntimeInfo";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::ScrubVChunks> {
+    static constexpr const char* value = "ScrubVChunks";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
@@ -1250,6 +1254,11 @@ tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
 tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
     return invoke_rpc<&WrappedMasterService::GetVChunkRuntimeInfo,
                       VChunkRuntimeInfo>();
+}
+
+tl::expected<VChunkScrubReport, ErrorCode> MasterClient::ScrubVChunks() {
+    return invoke_rpc<&WrappedMasterService::ScrubVChunks,
+                      VChunkScrubReport>();
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(

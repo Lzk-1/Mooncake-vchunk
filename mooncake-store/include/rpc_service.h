@@ -112,6 +112,7 @@ class WrappedMasterService {
                                                int64_t now_ms,
                                                uint64_t leader_epoch);
     VChunkRuntimeInfo GetVChunkRuntimeInfo();
+    tl::expected<VChunkScrubReport, ErrorCode> ScrubVChunks();
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,

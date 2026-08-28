@@ -28,6 +28,29 @@
 
 namespace mooncake {
 
+struct VChunkScrubReport {
+    uint64_t runtime_records{0};
+    uint64_t persistent_records{0};
+    uint64_t invalid_records{0};
+    uint64_t missing_persistent_records{0};
+    uint64_t stale_persistent_records{0};
+    uint64_t unexpected_persistent_records{0};
+    uint64_t ownership_mismatches{0};
+    uint64_t overlapping_ranges{0};
+
+    bool clean() const {
+        return invalid_records == 0 && missing_persistent_records == 0 &&
+               stale_persistent_records == 0 &&
+               unexpected_persistent_records == 0 &&
+               ownership_mismatches == 0 && overlapping_ranges == 0;
+    }
+
+    YLT_REFL(VChunkScrubReport, runtime_records, persistent_records,
+             invalid_records, missing_persistent_records,
+             stale_persistent_records, unexpected_persistent_records,
+             ownership_mismatches, overlapping_ranges);
+};
+
 // In-memory master-side vchunk lifecycle manager. The caller must hold the
 // SegmentManager allocator access guard while PutStart uses AllocatorManager.
 class VChunkMasterManager {
@@ -90,6 +113,7 @@ class VChunkMasterManager {
                                                 size_t max_scan,
                                                 OwnershipPredicate owns = {});
     VChunkMetricsSnapshot MetricsSnapshot() const;
+    tl::expected<VChunkScrubReport, ErrorCode> Scrub() const;
 
     size_t SizeForTesting() const;
     bool HasPersistentMetadata() const { return metadata_store_->IsPersistent(); }

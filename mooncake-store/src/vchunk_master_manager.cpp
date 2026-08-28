@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #include "types.h"
@@ -598,6 +600,97 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
 
 VChunkMetricsSnapshot VChunkMasterManager::MetricsSnapshot() const {
     return metrics_->Snapshot();
+}
+
+tl::expected<VChunkScrubReport, ErrorCode> VChunkMasterManager::Scrub() const {
+    std::unordered_map<std::string, VChunkMetadataRecord> runtime;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        runtime.reserve(entries_.size());
+        for (const auto& [key, entry] : entries_) {
+            runtime.emplace(key, entry->record);
+        }
+    }
+
+    VChunkScrubReport report;
+    report.runtime_records = runtime.size();
+    struct Range {
+        std::string segment;
+        uint64_t offset;
+        uint64_t length;
+    };
+    std::vector<Range> ranges;
+    for (const auto& [_, record] : runtime) {
+        if (ValidateVChunkMetadata(record, config_) != ErrorCode::OK) {
+            ++report.invalid_records;
+            continue;
+        }
+        if (record.route_version != 0 && !config_.submaster_id.empty() &&
+            record.owner_submaster_id != config_.submaster_id) {
+            ++report.ownership_mismatches;
+        }
+        for (const auto& slice : record.slices) {
+            ranges.push_back({slice.target_segment_name, slice.target_offset,
+                              slice.allocated_length});
+        }
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const auto& lhs,
+                                                const auto& rhs) {
+        return std::tie(lhs.segment, lhs.offset) <
+               std::tie(rhs.segment, rhs.offset);
+    });
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        const auto& previous = ranges[i - 1];
+        const auto& current = ranges[i];
+        if (previous.segment == current.segment &&
+            previous.offset <=
+                std::numeric_limits<uint64_t>::max() - previous.length &&
+            previous.offset + previous.length > current.offset) {
+            ++report.overlapping_ranges;
+        }
+    }
+
+    const auto observe = [&] {
+        metrics_->ObserveScrub(
+            report.invalid_records + report.missing_persistent_records +
+            report.stale_persistent_records +
+            report.unexpected_persistent_records +
+            report.ownership_mismatches + report.overlapping_ranges);
+    };
+    if (!metadata_store_->IsPersistent()) {
+        observe();
+        return report;
+    }
+    auto stored = metadata_store_->List();
+    if (!stored) {
+        metrics_->AddScrubFailure();
+        return tl::make_unexpected(stored.error());
+    }
+    report.persistent_records = stored->size();
+    std::unordered_map<std::string, VChunkMetadataRecord> persistent;
+    persistent.reserve(stored->size());
+    for (auto& record : *stored) {
+        const auto key = ScopedKey(TenantId(record.tenant_id), record.key);
+        if (!persistent.emplace(key, std::move(record)).second) {
+            ++report.invalid_records;
+        }
+    }
+    for (const auto& [key, record] : runtime) {
+        const auto found = persistent.find(key);
+        if (found == persistent.end()) {
+            ++report.missing_persistent_records;
+            continue;
+        }
+        if (found->second.vchunk_id != record.vchunk_id ||
+            found->second.metadata_version != record.metadata_version ||
+            found->second.leader_epoch != record.leader_epoch) {
+            ++report.stale_persistent_records;
+        }
+        persistent.erase(found);
+    }
+    report.unexpected_persistent_records = persistent.size();
+    observe();
+    return report;
 }
 
 void VChunkMasterManager::RefreshStateMetricsLocked() {

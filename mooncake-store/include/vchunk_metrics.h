@@ -25,6 +25,9 @@ struct VChunkMetricsSnapshot {
     uint64_t rollbacks{0};
     uint64_t metadata_bytes{0};
     uint64_t allocated_bytes{0};
+    uint64_t scrub_runs{0};
+    uint64_t scrub_issues{0};
+    uint64_t scrub_failures{0};
     std::array<uint64_t, 7> states{};
 };
 
@@ -41,6 +44,11 @@ class VChunkMetrics {
     void AddMetadataBytes(uint64_t bytes) { metadata_bytes_.fetch_add(bytes); }
     void SetStateCount(VChunkStatus state, uint64_t count);
     void SetAllocatedBytes(uint64_t bytes) { allocated_bytes_.store(bytes); }
+    void ObserveScrub(uint64_t issues) {
+        ++scrub_runs_;
+        scrub_issues_.fetch_add(issues);
+    }
+    void AddScrubFailure() { ++scrub_failures_; }
     VChunkMetricsSnapshot Snapshot() const;
 
    private:
@@ -57,6 +65,9 @@ class VChunkMetrics {
     std::atomic<uint64_t> rollbacks_{0};
     std::atomic<uint64_t> metadata_bytes_{0};
     std::atomic<uint64_t> allocated_bytes_{0};
+    std::atomic<uint64_t> scrub_runs_{0};
+    std::atomic<uint64_t> scrub_issues_{0};
+    std::atomic<uint64_t> scrub_failures_{0};
     std::array<std::atomic<uint64_t>, 7> states_{};
 };
 
