@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -10,6 +13,7 @@
 #include "tenant_id.h"
 #include "types.h"
 #include "vchunk_metadata.h"
+#include "vchunk_routing.h"
 
 namespace mooncake {
 
@@ -83,6 +87,58 @@ class RpcVChunkControlPlane final : public VChunkControlPlane {
 
    private:
     MasterClient& master_;
+};
+
+class RefreshingVChunkControlPlane final : public VChunkControlPlane {
+   public:
+    using ResolveFn = std::function<tl::expected<VChunkControlPlane*, ErrorCode>(
+        const TenantId&, const std::string&)>;
+    using RefreshFn = std::function<ErrorCode()>;
+
+    RefreshingVChunkControlPlane(ResolveFn resolve, RefreshFn refresh,
+                                 uint32_t max_route_retries = 2)
+        : resolve_(std::move(resolve)),
+          refresh_(std::move(refresh)),
+          max_route_retries_(max_route_retries) {}
+
+    tl::expected<VChunkMetadataRecord, ErrorCode> PutStart(
+        const TenantId&, const std::string&, uint64_t, int64_t) override;
+    ErrorCode PutEnd(const TenantId&, const std::string&, const std::string&,
+                     int64_t, uint64_t,
+                     const std::vector<uint64_t>&) override;
+    ErrorCode PutRevoke(const TenantId&, const std::string&,
+                        const std::string&, uint64_t) override;
+    tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
+        const TenantId&, const std::string&) override;
+    ErrorCode Remove(const TenantId&, const std::string&, int64_t,
+                     uint64_t) override;
+
+   private:
+    static bool IsRouteError(ErrorCode error);
+    bool RefreshForRetry(uint32_t attempt, ErrorCode error) const;
+
+    ResolveFn resolve_;
+    RefreshFn refresh_;
+    uint32_t max_route_retries_;
+};
+
+class VChunkControlPlaneDirectory {
+   public:
+    explicit VChunkControlPlaneDirectory(
+        std::shared_ptr<VChunkRouteStore> route_store)
+        : route_store_(std::move(route_store)) {}
+
+    void SetTarget(std::string submaster_id, VChunkControlPlane* target);
+    ErrorCode Refresh();
+    tl::expected<VChunkControlPlane*, ErrorCode> Resolve(
+        const TenantId& tenant_id, const std::string& key) const;
+    uint64_t RouteVersion() const;
+
+   private:
+    std::shared_ptr<VChunkRouteStore> route_store_;
+    mutable std::mutex mutex_;
+    VChunkRouteSnapshot snapshot_;
+    std::unordered_map<std::string, VChunkControlPlane*> targets_;
 };
 
 }  // namespace mooncake

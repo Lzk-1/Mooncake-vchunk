@@ -9,6 +9,19 @@
 
 namespace mooncake {
 
+tl::expected<uint32_t, ErrorCode> ComputeVChunkSlot(
+    std::string_view tenant_id, std::string_view key, size_t slot_count) {
+    if (tenant_id.empty() || key.empty() || slot_count == 0 ||
+        slot_count > std::numeric_limits<uint32_t>::max()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::string scoped(tenant_id);
+    scoped.push_back('\0');
+    scoped.append(key);
+    return static_cast<uint32_t>(
+        XXH64(scoped.data(), scoped.size(), 0) % slot_count);
+}
+
 VChunkStaticRouteTable::VChunkStaticRouteTable(
     uint64_t route_version, std::vector<std::string> slot_owners,
     uint64_t owner_epoch)
@@ -32,12 +45,10 @@ tl::expected<VChunkRoute, ErrorCode> VChunkStaticRouteTable::Resolve(
     if (Validate() != ErrorCode::OK || tenant_id.empty() || key.empty()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::string scoped(tenant_id);
-    scoped.push_back('\0');
-    scoped.append(key);
-    const auto slot = static_cast<uint32_t>(
-        XXH64(scoped.data(), scoped.size(), 0) % slot_owners_.size());
-    return VChunkRoute{slot, slot_owners_[slot], owner_epoch_, route_version_};
+    auto slot = ComputeVChunkSlot(tenant_id, key, slot_owners_.size());
+    if (!slot) return tl::make_unexpected(slot.error());
+    return VChunkRoute{*slot, slot_owners_[*slot], owner_epoch_,
+                       route_version_};
 }
 
 ErrorCode VChunkStaticRouteTable::CheckOwner(

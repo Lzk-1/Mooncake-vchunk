@@ -14,6 +14,9 @@
 
 namespace mooncake {
 
+tl::expected<uint32_t, ErrorCode> ComputeVChunkSlot(
+    std::string_view tenant_id, std::string_view key, size_t slot_count);
+
 struct VChunkRoute {
     uint32_t slot{0};
     std::string owner_submaster_id;
