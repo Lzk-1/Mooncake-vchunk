@@ -5,6 +5,8 @@
 
 #include <xxhash.h>
 
+#include "etcd_helper.h"
+
 namespace mooncake {
 
 VChunkStaticRouteTable::VChunkStaticRouteTable(
@@ -157,6 +159,101 @@ tl::expected<VChunkSlotRoute, ErrorCode> VChunkDynamicRouteTable::Resolve(
 uint64_t VChunkDynamicRouteTable::Version() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return snapshot_.route_version;
+}
+
+tl::expected<VChunkRouteSnapshot, ErrorCode>
+InMemoryVChunkRouteStore::Load() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!snapshot_) return tl::make_unexpected(ErrorCode::ETCD_KEY_NOT_EXIST);
+    return *snapshot_;
+}
+
+ErrorCode InMemoryVChunkRouteStore::Publish(
+    uint64_t expected_version, const VChunkRouteSnapshot& snapshot) {
+    VChunkDynamicRouteTable validator;
+    if (validator.ApplySnapshot(snapshot) != ErrorCode::OK ||
+        snapshot.route_version <= expected_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    const uint64_t current = snapshot_ ? snapshot_->route_version : 0;
+    if (current != expected_version) return ErrorCode::ROUTE_CHANGED;
+    snapshot_ = snapshot;
+    return ErrorCode::OK;
+}
+
+EtcdVChunkRouteStore::EtcdVChunkRouteStore(std::string endpoints,
+                                           std::string cluster_id) {
+    if (endpoints.empty() || cluster_id.empty() ||
+        cluster_id.find('/') != std::string::npos) {
+        connection_error_ = ErrorCode::INVALID_PARAMS;
+        return;
+    }
+    route_key_ = "/mooncake/vchunk/v1/clusters/" + cluster_id +
+                 "/routes/current";
+#ifdef STORE_USE_ETCD
+    connection_error_ = EtcdHelper::ConnectToEtcdStoreClient(endpoints);
+#else
+    connection_error_ = ErrorCode::ETCD_OPERATION_ERROR;
+#endif
+}
+
+tl::expected<VChunkRouteSnapshot, ErrorCode> EtcdVChunkRouteStore::Load() {
+    if (connection_error_ != ErrorCode::OK) {
+        return tl::make_unexpected(connection_error_);
+    }
+    std::string value;
+    EtcdRevisionId revision = 0;
+    const auto error = EtcdHelper::Get(route_key_.data(), route_key_.size(),
+                                       value, revision);
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    VChunkRouteSnapshot snapshot;
+    if (struct_pack::deserialize_to(snapshot, value) != struct_pack::errc::ok) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    VChunkDynamicRouteTable validator;
+    if (validator.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    return snapshot;
+}
+
+ErrorCode EtcdVChunkRouteStore::Publish(
+    uint64_t expected_version, const VChunkRouteSnapshot& snapshot) {
+    if (connection_error_ != ErrorCode::OK) return connection_error_;
+    VChunkDynamicRouteTable validator;
+    if (validator.ApplySnapshot(snapshot) != ErrorCode::OK ||
+        snapshot.route_version <= expected_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto encoded = struct_pack::serialize(snapshot);
+    const std::string next(encoded.begin(), encoded.end());
+    if (expected_version == 0) {
+        const auto error = EtcdHelper::TxnCompareAndPut(
+            {{route_key_, EtcdHelper::TxnCompareKind::kKeyNotExists, {}}},
+            {{route_key_, next}});
+        return error == ErrorCode::ETCD_TRANSACTION_FAIL
+                   ? ErrorCode::ROUTE_CHANGED
+                   : error;
+    }
+
+    std::string current;
+    EtcdRevisionId revision = 0;
+    auto error = EtcdHelper::Get(route_key_.data(), route_key_.size(), current,
+                                 revision);
+    if (error != ErrorCode::OK) return error;
+    VChunkRouteSnapshot current_snapshot;
+    if (struct_pack::deserialize_to(current_snapshot, current) !=
+            struct_pack::errc::ok ||
+        current_snapshot.route_version != expected_version) {
+        return ErrorCode::ROUTE_CHANGED;
+    }
+    error = EtcdHelper::TxnCompareAndPut(
+        {{route_key_, EtcdHelper::TxnCompareKind::kValueEquals, current}},
+        {{route_key_, next}});
+    return error == ErrorCode::ETCD_TRANSACTION_FAIL
+               ? ErrorCode::ROUTE_CHANGED
+               : error;
 }
 
 }  // namespace mooncake

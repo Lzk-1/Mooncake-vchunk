@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <mutex>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -85,6 +87,41 @@ class VChunkDynamicRouteTable {
 
     mutable std::mutex mutex_;
     VChunkRouteSnapshot snapshot_;
+};
+
+class VChunkRouteStore {
+   public:
+    virtual ~VChunkRouteStore() = default;
+    virtual tl::expected<VChunkRouteSnapshot, ErrorCode> Load() = 0;
+    virtual ErrorCode Publish(uint64_t expected_version,
+                              const VChunkRouteSnapshot& snapshot) = 0;
+    virtual bool IsPersistent() const = 0;
+};
+
+class InMemoryVChunkRouteStore final : public VChunkRouteStore {
+   public:
+    tl::expected<VChunkRouteSnapshot, ErrorCode> Load() override;
+    ErrorCode Publish(uint64_t expected_version,
+                      const VChunkRouteSnapshot& snapshot) override;
+    bool IsPersistent() const override { return false; }
+
+   private:
+    std::mutex mutex_;
+    std::optional<VChunkRouteSnapshot> snapshot_;
+};
+
+class EtcdVChunkRouteStore final : public VChunkRouteStore {
+   public:
+    EtcdVChunkRouteStore(std::string endpoints, std::string cluster_id);
+    tl::expected<VChunkRouteSnapshot, ErrorCode> Load() override;
+    ErrorCode Publish(uint64_t expected_version,
+                      const VChunkRouteSnapshot& snapshot) override;
+    bool IsPersistent() const override { return true; }
+    ErrorCode connection_error() const { return connection_error_; }
+
+   private:
+    std::string route_key_;
+    ErrorCode connection_error_{ErrorCode::OK};
 };
 
 }  // namespace mooncake

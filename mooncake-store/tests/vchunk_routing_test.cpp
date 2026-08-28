@@ -48,5 +48,27 @@ TEST(VChunkRoutingTest, TransfersSlotWithMonotonicVersionAndEpoch) {
     EXPECT_EQ(routes.Version(), 4U);
 }
 
+TEST(VChunkRoutingTest, RouteStorePublishesWithVersionCas) {
+    InMemoryVChunkRouteStore store;
+    VChunkRouteSnapshot first;
+    first.route_version = 1;
+    first.slots.push_back(
+        {0, VChunkSlotState::OWNED, "submaster-a", "", 5});
+    ASSERT_EQ(store.Publish(0, first), ErrorCode::OK);
+
+    auto loaded = store.Load();
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->route_version, 1U);
+    EXPECT_EQ(loaded->slots[0].owner_submaster_id, "submaster-a");
+
+    auto second = first;
+    second.route_version = 2;
+    second.slots[0].state = VChunkSlotState::DRAINING;
+    second.slots[0].target_submaster_id = "submaster-b";
+    EXPECT_EQ(store.Publish(0, second), ErrorCode::ROUTE_CHANGED);
+    EXPECT_EQ(store.Publish(1, second), ErrorCode::OK);
+    EXPECT_EQ(store.Load()->route_version, 2U);
+}
+
 }  // namespace
 }  // namespace mooncake

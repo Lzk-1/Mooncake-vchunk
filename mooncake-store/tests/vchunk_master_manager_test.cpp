@@ -171,6 +171,30 @@ TEST(VChunkMasterManagerTest, AppliesNewSubmasterOwnershipAtomically) {
     EXPECT_EQ(rejected.error(), ErrorCode::NOT_OWNER);
 }
 
+TEST(VChunkMasterManagerTest, PersistsRouteBeforeApplyingOwnership) {
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    auto routes = std::make_shared<InMemoryVChunkRouteStore>();
+    VChunkMasterManager manager(config, nullptr, nullptr, routes);
+    ASSERT_EQ(routes->Load()->route_version, 1U);
+
+    VChunkRouteSnapshot snapshot;
+    snapshot.route_version = 2;
+    snapshot.slots.push_back(
+        {0, VChunkSlotState::DRAINING, "submaster-a", "submaster-b", 1});
+    ASSERT_EQ(manager.ApplyRouteSnapshot(snapshot), ErrorCode::OK);
+    auto persisted = routes->Load();
+    ASSERT_TRUE(persisted.has_value());
+    EXPECT_EQ(persisted->route_version, 2U);
+    EXPECT_EQ(persisted->slots[0].state, VChunkSlotState::DRAINING);
+
+    EXPECT_EQ(manager.ApplyRouteSnapshot(std::move(snapshot)),
+              ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VChunkMasterManagerTest, RequiresDurabilityBeforePublishingState) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());

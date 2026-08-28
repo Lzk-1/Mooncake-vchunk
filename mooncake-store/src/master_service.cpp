@@ -213,7 +213,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
       tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
-      vchunk_manager_(config.vchunk_config, config.vchunk_metadata_store),
+      vchunk_manager_(
+          config.vchunk_config, config.vchunk_metadata_store, nullptr,
+          config.vchunk_config.enabled &&
+                  !config.vchunk_etcd_endpoints.empty() &&
+                  !config.vchunk_config.static_slot_owners.empty()
+              ? std::make_shared<EtcdVChunkRouteStore>(
+                    config.vchunk_etcd_endpoints, config.cluster_id)
+              : nullptr),
       vchunk_enabled_(config.vchunk_config.enabled),
       vchunk_ha_mode_(config.vchunk_config.ha_mode),
       vchunk_config_(config.vchunk_config),

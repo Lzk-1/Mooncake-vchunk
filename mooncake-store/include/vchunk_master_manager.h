@@ -73,7 +73,8 @@ class VChunkMasterManager {
     explicit VChunkMasterManager(
         VChunkConfig config,
         std::shared_ptr<VChunkMetadataStore> metadata_store = nullptr,
-        std::shared_ptr<VChunkMetrics> metrics = nullptr);
+        std::shared_ptr<VChunkMetrics> metrics = nullptr,
+        std::shared_ptr<VChunkRouteStore> route_store = nullptr);
 
     VChunkMasterManager(const VChunkMasterManager&) = delete;
     VChunkMasterManager& operator=(const VChunkMasterManager&) = delete;
@@ -140,6 +141,7 @@ class VChunkMasterManager {
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
     const std::shared_ptr<VChunkMetrics> metrics_;
+    const std::shared_ptr<VChunkRouteStore> route_store_;
     std::atomic<uint64_t> leader_epoch_{1};
     std::atomic<bool> accepts_mutations_{true};
     std::optional<VChunkStaticRouteTable> static_routes_;

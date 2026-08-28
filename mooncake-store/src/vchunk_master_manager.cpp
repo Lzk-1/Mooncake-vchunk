@@ -13,13 +13,15 @@ namespace mooncake {
 
 VChunkMasterManager::VChunkMasterManager(
     VChunkConfig config, std::shared_ptr<VChunkMetadataStore> metadata_store,
-    std::shared_ptr<VChunkMetrics> metrics)
+    std::shared_ptr<VChunkMetrics> metrics,
+    std::shared_ptr<VChunkRouteStore> route_store)
     : config_(std::move(config)),
       metadata_store_(metadata_store ? std::move(metadata_store)
                                      : std::make_shared<
                                            InMemoryVChunkMetadataStore>()),
       metrics_(metrics ? std::move(metrics)
-                       : std::make_shared<VChunkMetrics>()) {
+                       : std::make_shared<VChunkMetrics>()),
+      route_store_(std::move(route_store)) {
     if (!config_.static_slot_owners.empty()) {
         static_routes_.emplace(config_.route_version,
                                config_.static_slot_owners,
@@ -32,7 +34,20 @@ VChunkMasterManager::VChunkMasterManager(
                 {static_cast<uint32_t>(slot), VChunkSlotState::OWNED,
                  config_.static_slot_owners[slot], {}, config_.owner_epoch});
         }
+        if (route_store_) {
+            auto persisted = route_store_->Load();
+            if (persisted) {
+                if (persisted->slots.size() == static_routes_->SlotCount() &&
+                    persisted->route_version >= snapshot.route_version) {
+                    snapshot = std::move(*persisted);
+                }
+            } else if (persisted.error() == ErrorCode::ETCD_KEY_NOT_EXIST) {
+                (void)route_store_->Publish(0, snapshot);
+            }
+        }
         dynamic_routes_.ApplySnapshot(std::move(snapshot));
+    } else if (route_store_) {
+        LOG(WARNING) << "vchunk route store ignored without static slots";
     }
 }
 
@@ -81,6 +96,15 @@ ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
     VChunkRouteSnapshot snapshot) {
     if (!static_routes_ || snapshot.slots.size() != static_routes_->SlotCount()) {
         return ErrorCode::INVALID_PARAMS;
+    }
+    VChunkDynamicRouteTable validator;
+    if (validator.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (route_store_) {
+        const auto error =
+            route_store_->Publish(dynamic_routes_.Version(), snapshot);
+        if (error != ErrorCode::OK) return error;
     }
     return dynamic_routes_.ApplySnapshot(std::move(snapshot));
 }
