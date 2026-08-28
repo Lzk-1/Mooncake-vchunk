@@ -1904,9 +1904,10 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
 void WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<VChunkMetadataRecord>& vchunks, uint64_t leader_epoch) {
     master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments);
+        objects, initial_oplog_sequence_id, segments, vchunks, leader_epoch);
 }
 
 void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {

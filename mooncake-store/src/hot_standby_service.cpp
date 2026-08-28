@@ -746,6 +746,16 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         out.objects.clear();
     }
     CollectSegmentsLocked(out.segments);
+    out.vchunks.clear();
+    for (const auto& source : sources_) {
+        const auto& replica = source.second;
+        if (!replica.applier) continue;
+        const auto& recovered = replica.applier->GetVChunkRecoveryEntries();
+        out.vchunks.reserve(out.vchunks.size() + recovered.size());
+        for (const auto& entry : recovered) {
+            out.vchunks.push_back(entry.second);
+        }
+    }
 
     lock.unlock();
     Stop();

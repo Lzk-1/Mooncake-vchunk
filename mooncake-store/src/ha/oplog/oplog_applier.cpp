@@ -230,6 +230,9 @@ bool OpLogApplier::LoadVChunkSnapshot(const VChunkSnapshot& snapshot) {
 bool OpLogApplier::ApplyVChunkEvent(const OpLogEntry& entry) {
     std::vector<char> bytes(entry.payload.begin(), entry.payload.end());
     auto event = DeserializeVChunkHAEvent(bytes, vchunk_config_);
+    if (event && event->sequence_id == 0) {
+        event->sequence_id = entry.sequence_id;
+    }
     if (!event || event->sequence_id != entry.sequence_id ||
         event->record.tenant_id != entry.tenant_id ||
         event->record.key != entry.object_key) {

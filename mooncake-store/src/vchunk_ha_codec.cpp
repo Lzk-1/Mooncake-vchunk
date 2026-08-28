@@ -31,7 +31,7 @@ size_t SnapshotLimit(const VChunkConfig& config) {
 tl::expected<std::vector<char>, ErrorCode> SerializeVChunkHAEvent(
     const VChunkHAEvent& event, const VChunkConfig& config) {
     if (event.schema_version != kVChunkHAEventSchemaVersion ||
-        !IsKnownEventType(event.type) || event.sequence_id == 0 ||
+        !IsKnownEventType(event.type) ||
         ValidateVChunkMetadata(event.record, config) != ErrorCode::OK ||
         event.leader_epoch != event.record.leader_epoch) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -96,6 +96,7 @@ ErrorCode ApplyVChunkHAEvent(const VChunkHAEvent& event,
                              uint64_t& applied_sequence_id,
                              const VChunkConfig& config,
                              bool allow_global_sequence_gaps) {
+    if (event.sequence_id == 0) return ErrorCode::INVALID_PARAMS;
     auto encoded = SerializeVChunkHAEvent(event, config);
     if (!encoded) return encoded.error();
     if (event.sequence_id <= applied_sequence_id) return ErrorCode::OK;

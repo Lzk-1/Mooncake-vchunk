@@ -215,6 +215,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_segment_manager_(config.memory_allocator),
       vchunk_manager_(config.vchunk_config, config.vchunk_metadata_store),
       vchunk_enabled_(config.vchunk_config.enabled),
+      vchunk_ha_mode_(config.vchunk_config.ha_mode),
+      vchunk_config_(config.vchunk_config),
       vchunk_reaper_interval_ms_(config.vchunk_config.reaper_interval_ms),
       vchunk_reaper_max_scan_(config.vchunk_config.reaper_max_scan),
       memory_allocator_type_(config.memory_allocator),
@@ -3694,9 +3696,34 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 void MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<VChunkMetadataRecord>& vchunks, uint64_t leader_epoch) {
     // The ordered writer initializes its sequence from durable_prefix.
     (void)initial_oplog_sequence_id;
+    if (!vchunks.empty() && vchunk_enabled_) {
+        // active_only deliberately starts with an empty vchunk view. A
+        // recoverable promotion may publish only after real Segment allocators
+        // have remounted and all historical ranges can be claimed.
+        vchunk_manager_.DeactivateLeader();
+        if (vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE && leader_epoch != 0) {
+            auto allocator_access = segment_manager_.getAllocatorAccess();
+            VChunkRecoveryManager recovery(vchunk_config_);
+            auto view = recovery.BuildIsolatedView(
+                vchunks, allocator_access.getAllocatorManager(), leader_epoch);
+            if (view) {
+                const auto published =
+                    vchunk_manager_.PublishRecoveryView(std::move(*view));
+                if (published != ErrorCode::OK) {
+                    LOG(ERROR) << "vchunk promotion publish failed: "
+                               << toString(published);
+                }
+            } else {
+                LOG(WARNING) << "vchunk promotion remains unavailable: "
+                             << toString(view.error()) << ", reason="
+                             << recovery.FailureReason();
+            }
+        }
+    }
 
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
@@ -12631,6 +12658,36 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     batch_oplog_kv_backend_ = std::move(backend);
     batch_oplog_storage_ = std::move(storage);
     ordered_oplog_writer_ = std::move(writer);
+    if (vchunk_enabled_ && vchunk_ha_mode_ != VChunkHAMode::DISABLED) {
+        vchunk_manager_.SetDurabilitySink(
+            [this](VChunkHAEventType type,
+                   const VChunkMetadataRecord& record) {
+                return PersistVChunkEventForHA(type, record);
+            });
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::PersistVChunkEventForHA(
+    VChunkHAEventType type, const VChunkMetadataRecord& record) {
+    VChunkHAEvent event;
+    event.type = type;
+    // The ordered writer assigns the global sequence. Standby replaces this
+    // sentinel with the outer OpLog sequence before applying the event.
+    event.sequence_id = 0;
+    event.leader_epoch = record.leader_epoch;
+    event.record = record;
+    auto encoded = SerializeVChunkHAEvent(event, vchunk_config_);
+    if (!encoded) return encoded.error();
+
+    auto durable = std::make_shared<std::promise<void>>();
+    auto completion = durable->get_future();
+    auto appended = AppendOpLogWithDurableFinalize(
+        OpType::VCHUNK_EVENT, record.tenant_id, record.key,
+        std::string(encoded->begin(), encoded->end()),
+        [durable](const OpLogEntry&) { durable->set_value(); });
+    if (!appended) return appended.error();
+    completion.wait();
     return ErrorCode::OK;
 }
 

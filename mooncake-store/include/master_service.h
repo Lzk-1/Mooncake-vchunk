@@ -940,7 +940,9 @@ class MasterService {
     void RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<VChunkMetadataRecord>& vchunks = {},
+        uint64_t leader_epoch = 0);
 
     /**
      * @brief Query the status of a task
@@ -2370,6 +2372,8 @@ class MasterService {
     NoFSegmentManager nof_segment_manager_;
     VChunkMasterManager vchunk_manager_;
     bool vchunk_enabled_{false};
+    VChunkHAMode vchunk_ha_mode_{VChunkHAMode::ACTIVE_ONLY};
+    VChunkConfig vchunk_config_{};
     uint64_t vchunk_reaper_interval_ms_{1000};
     size_t vchunk_reaper_max_scan_{128};
     std::atomic<bool> vchunk_reaper_running_{false};
@@ -2554,6 +2558,8 @@ class MasterService {
         const std::string& payload, DurableFinalizeCallback callback);
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchOpLogSlot();
+    ErrorCode PersistVChunkEventForHA(VChunkHAEventType type,
+                                      const VChunkMetadataRecord& record);
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,

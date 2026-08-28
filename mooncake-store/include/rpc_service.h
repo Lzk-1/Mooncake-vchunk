@@ -284,7 +284,9 @@ class WrappedMasterService {
     // endpoint.
     void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
                             uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+                            const std::vector<StandbySegmentInfo>& segments,
+                            const std::vector<VChunkMetadataRecord>& vchunks,
+                            uint64_t leader_epoch);
 
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).

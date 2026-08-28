@@ -171,6 +171,26 @@ TEST(VChunkMasterManagerTest, AppliesNewSubmasterOwnershipAtomically) {
     EXPECT_EQ(rejected.error(), ErrorCode::NOT_OWNER);
 }
 
+TEST(VChunkMasterManagerTest, RequiresDurabilityBeforePublishingState) {
+    ManagerFixture fixture;
+    VChunkMasterManager manager(EnabledConfig());
+    std::vector<VChunkHAEventType> events;
+    manager.SetDurabilitySink(
+        [&](VChunkHAEventType type, const VChunkMetadataRecord&) {
+            events.push_back(type);
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        });
+
+    auto failed = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                   "key", 4096, false, 100);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::ETCD_OPERATION_ERROR);
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0], VChunkHAEventType::CREATE);
+    EXPECT_EQ(manager.SizeForTesting(), 0U);
+    EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
+}
+
 TEST(VChunkMasterManagerTest, ConcurrentPutStartPublishesOneObject) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());

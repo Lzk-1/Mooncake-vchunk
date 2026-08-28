@@ -10,6 +10,7 @@
 
 #include "replica.h"
 #include "types.h"
+#include "vchunk_metadata.h"
 
 namespace mooncake {
 
@@ -102,8 +103,9 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<std::vector<VChunkMetadataRecord>, 1> vchunks;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects, vchunks);
 };
 
 /**

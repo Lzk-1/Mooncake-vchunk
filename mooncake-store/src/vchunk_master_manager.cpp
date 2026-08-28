@@ -72,6 +72,16 @@ ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
     return dynamic_routes_.ApplySnapshot(std::move(snapshot));
 }
 
+void VChunkMasterManager::SetDurabilitySink(DurabilitySink sink) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    durability_sink_ = std::move(sink);
+}
+
+ErrorCode VChunkMasterManager::PersistEvent(
+    VChunkHAEventType type, const VChunkMetadataRecord& record) const {
+    return durability_sink_ ? durability_sink_(type, record) : ErrorCode::OK;
+}
+
 ErrorCode VChunkMasterManager::ActivateLeaderEpoch(uint64_t leader_epoch) {
     if (leader_epoch == 0) return ErrorCode::INVALID_PARAMS;
     std::lock_guard<std::mutex> guard(mutex_);
@@ -223,6 +233,11 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
         ReleasePendingPut(scoped_key);
         return tl::make_unexpected(error);
     }
+    if (const auto error = PersistEvent(VChunkHAEventType::CREATE, record);
+        error != ErrorCode::OK) {
+        ReleasePendingPut(scoped_key);
+        return tl::make_unexpected(error);
+    }
     if (const auto error = metadata_store_->Put(record);
         error != ErrorCode::OK) {
         ReleasePendingPut(scoped_key);
@@ -280,6 +295,10 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
     durable.status = VChunkStatus::ACTIVE;
     durable.last_updated_at_ms = now_ms;
     ++durable.metadata_version;
+    if (const auto error = PersistEvent(VChunkHAEventType::ACTIVATE, durable);
+        error != ErrorCode::OK) {
+        return error;
+    }
     if (const auto error = metadata_store_->Put(durable);
         error != ErrorCode::OK) {
         return error;
@@ -315,6 +334,11 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
     if (it->second->record.status != VChunkStatus::CREATING &&
         it->second->record.status != VChunkStatus::FAILED) {
         return ErrorCode::INVALID_PARAMS;
+    }
+    if (const auto error =
+            PersistEvent(VChunkHAEventType::REVOKE, it->second->record);
+        error != ErrorCode::OK) {
+        return error;
     }
     if (const auto error = metadata_store_->Remove(it->second->record);
         error != ErrorCode::OK) {
@@ -391,11 +415,23 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
         releasing.status = VChunkStatus::RELEASING;
         releasing.last_updated_at_ms = now_ms;
         ++releasing.metadata_version;
+        if (const auto error =
+                PersistEvent(VChunkHAEventType::BEGIN_RELEASE, releasing);
+            error != ErrorCode::OK) {
+            return error;
+        }
         if (const auto error = metadata_store_->Put(releasing);
             error != ErrorCode::OK) {
             return error;
         }
         record = std::move(releasing);
+    }
+    auto released = record;
+    released.status = VChunkStatus::RELEASED;
+    ++released.metadata_version;
+    if (const auto error = PersistEvent(VChunkHAEventType::RELEASED, released);
+        error != ErrorCode::OK) {
+        return error;
     }
     if (const auto error = metadata_store_->Remove(record);
         error != ErrorCode::OK) {
@@ -502,6 +538,18 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
         if (!expired) {
             it = next;
             continue;
+        }
+        auto cleanup = record;
+        const auto event_type = record.status == VChunkStatus::CREATING
+                                    ? VChunkHAEventType::REVOKE
+                                    : VChunkHAEventType::RELEASED;
+        if (event_type == VChunkHAEventType::RELEASED) {
+            cleanup.status = VChunkStatus::RELEASED;
+            ++cleanup.metadata_version;
+        }
+        if (const auto error = PersistEvent(event_type, cleanup);
+            error != ErrorCode::OK) {
+            return tl::make_unexpected(error);
         }
         if (const auto error = metadata_store_->Remove(record);
             error != ErrorCode::OK) {

@@ -99,5 +99,22 @@ TEST(VChunkHACodecTest, ReleasedEventRemovesEntry) {
     EXPECT_TRUE(entries.empty());
 }
 
+TEST(VChunkHACodecTest, AllowsOuterOpLogToAssignEventSequence) {
+    VChunkHAEvent event;
+    event.sequence_id = 0;
+    event.leader_epoch = 7;
+    event.record = MakeRecord();
+    auto encoded = SerializeVChunkHAEvent(event, VChunkConfig{});
+    ASSERT_TRUE(encoded.has_value());
+    auto decoded = DeserializeVChunkHAEvent(*encoded, VChunkConfig{});
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->sequence_id, 0U);
+
+    VChunkRecoveryEntries entries;
+    uint64_t applied = 0;
+    EXPECT_EQ(ApplyVChunkHAEvent(*decoded, entries, applied, VChunkConfig{}),
+              ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace
 }  // namespace mooncake

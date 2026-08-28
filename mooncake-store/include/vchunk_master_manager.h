@@ -19,6 +19,7 @@
 #include "tenant_id.h"
 #include "vchunk_allocation_strategy.h"
 #include "vchunk_config.h"
+#include "vchunk_ha_codec.h"
 #include "vchunk_metadata.h"
 #include "vchunk_metadata_store.h"
 #include "vchunk_metrics.h"
@@ -31,9 +32,10 @@ namespace mooncake {
 // SegmentManager allocator access guard while PutStart uses AllocatorManager.
 class VChunkMasterManager {
    public:
+    using DurabilitySink = std::function<ErrorCode(
+        VChunkHAEventType, const VChunkMetadataRecord&)>;
     using OwnershipPredicate =
         std::function<bool(const VChunkMetadataRecord&)>;
-
     class ReadHandle {
        public:
         ReadHandle() = default;
@@ -80,6 +82,7 @@ class VChunkMasterManager {
     uint64_t LeaderEpoch() const { return leader_epoch_.load(); }
     ErrorCode PublishRecoveryView(VChunkRecoveryView view);
     ErrorCode ApplyRouteSnapshot(VChunkRouteSnapshot snapshot);
+    void SetDurabilitySink(DurabilitySink sink);
 
     ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
@@ -103,6 +106,8 @@ class VChunkMasterManager {
     ErrorCode CheckLeaderEpoch(uint64_t expected_leader_epoch) const;
     ErrorCode CheckStaticOwner(const TenantId& tenant_id,
                                const std::string& key) const;
+    ErrorCode PersistEvent(VChunkHAEventType type,
+                           const VChunkMetadataRecord& record) const;
 
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
@@ -111,6 +116,7 @@ class VChunkMasterManager {
     std::atomic<bool> accepts_mutations_{true};
     std::optional<VChunkStaticRouteTable> static_routes_;
     VChunkDynamicRouteTable dynamic_routes_;
+    DurabilitySink durability_sink_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;
