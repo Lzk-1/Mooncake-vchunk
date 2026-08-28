@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +16,17 @@ namespace mooncake {
 namespace {
 
 using test::VChunkTestAllocator;
+
+class FailingPersistentRouteStore final : public VChunkRouteStore {
+   public:
+    tl::expected<VChunkRouteSnapshot, ErrorCode> Load() override {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    ErrorCode Publish(uint64_t, const VChunkRouteSnapshot&) override {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    bool IsPersistent() const override { return true; }
+};
 
 struct ManagerFixture {
     AllocatorManager allocators;
@@ -193,6 +205,19 @@ TEST(VChunkMasterManagerTest, PersistsRouteBeforeApplyingOwnership) {
 
     EXPECT_EQ(manager.ApplyRouteSnapshot(std::move(snapshot)),
               ErrorCode::INVALID_PARAMS);
+}
+
+TEST(VChunkMasterManagerTest, PersistentRouteFailureIsFailClosed) {
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    EXPECT_THROW(
+        VChunkMasterManager(
+            config, nullptr, nullptr,
+            std::make_shared<FailingPersistentRouteStore>()),
+        std::runtime_error);
 }
 
 TEST(VChunkMasterManagerTest, RequiresDurabilityBeforePublishingState) {

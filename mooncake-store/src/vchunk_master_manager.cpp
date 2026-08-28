@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -37,12 +38,25 @@ VChunkMasterManager::VChunkMasterManager(
         if (route_store_) {
             auto persisted = route_store_->Load();
             if (persisted) {
-                if (persisted->slots.size() == static_routes_->SlotCount() &&
-                    persisted->route_version >= snapshot.route_version) {
+                if (persisted->slots.size() != static_routes_->SlotCount() ||
+                    persisted->route_version < snapshot.route_version) {
+                    if (route_store_->IsPersistent()) {
+                        throw std::runtime_error(
+                            "persistent vchunk route is incompatible");
+                    }
+                } else {
                     snapshot = std::move(*persisted);
                 }
             } else if (persisted.error() == ErrorCode::ETCD_KEY_NOT_EXIST) {
-                (void)route_store_->Publish(0, snapshot);
+                const auto initialized = route_store_->Publish(0, snapshot);
+                if (initialized != ErrorCode::OK &&
+                    route_store_->IsPersistent()) {
+                    throw std::runtime_error(
+                        "failed to initialize persistent vchunk route");
+                }
+            } else if (route_store_->IsPersistent()) {
+                throw std::runtime_error(
+                    "failed to load persistent vchunk route");
             }
         }
         dynamic_routes_.ApplySnapshot(std::move(snapshot));
