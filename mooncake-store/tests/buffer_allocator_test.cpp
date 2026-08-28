@@ -136,6 +136,20 @@ TEST_F(BufferAllocatorTest, ReserveAtClaimsOnlyTheRequestedAddress) {
     EXPECT_EQ(allocator->reserveAt(claim).error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_F(BufferAllocatorTest, ReportsRecoveryCapabilityByStorageType) {
+    auto memory = std::make_shared<OffsetBufferAllocator>(
+        "memory", 0x171000000ULL, 4096, "memory-endpoint",
+        ReplicaType::MEMORY, "memory-instance");
+    EXPECT_TRUE(memory->capabilities().exact_claim);
+    EXPECT_FALSE(memory->capabilities().persistent_data);
+
+    auto nof = std::make_shared<OffsetBufferAllocator>(
+        "nof", 0x172000000ULL, 4096, "nof-endpoint", ReplicaType::NOF_SSD,
+        "nof-instance");
+    EXPECT_FALSE(nof->capabilities().exact_claim);
+    EXPECT_TRUE(nof->capabilities().persistent_data);
+}
+
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;

@@ -22,6 +22,15 @@ VChunkMasterManager::VChunkMasterManager(
         static_routes_.emplace(config_.route_version,
                                config_.static_slot_owners,
                                config_.owner_epoch);
+        VChunkRouteSnapshot snapshot;
+        snapshot.route_version = config_.route_version;
+        snapshot.slots.reserve(config_.static_slot_owners.size());
+        for (size_t slot = 0; slot < config_.static_slot_owners.size(); ++slot) {
+            snapshot.slots.push_back(
+                {static_cast<uint32_t>(slot), VChunkSlotState::OWNED,
+                 config_.static_slot_owners[slot], {}, config_.owner_epoch});
+        }
+        dynamic_routes_.ApplySnapshot(std::move(snapshot));
     }
 }
 
@@ -45,9 +54,22 @@ ErrorCode VChunkMasterManager::CheckStaticOwner(
     if (!static_routes_) return ErrorCode::OK;
     auto route = static_routes_->Resolve(tenant_id.value(), key);
     if (!route) return route.error();
-    return route->owner_submaster_id == config_.submaster_id
+    auto dynamic = dynamic_routes_.Resolve(route->slot);
+    if (!dynamic) return dynamic.error();
+    if (dynamic->state != VChunkSlotState::OWNED) {
+        return ErrorCode::ROUTE_CHANGED;
+    }
+    return dynamic->owner_submaster_id == config_.submaster_id
                ? ErrorCode::OK
                : ErrorCode::NOT_OWNER;
+}
+
+ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
+    VChunkRouteSnapshot snapshot) {
+    if (!static_routes_ || snapshot.slots.size() != static_routes_->SlotCount()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return dynamic_routes_.ApplySnapshot(std::move(snapshot));
 }
 
 ErrorCode VChunkMasterManager::ActivateLeaderEpoch(uint64_t leader_epoch) {

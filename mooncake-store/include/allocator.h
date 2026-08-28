@@ -47,6 +47,17 @@ struct AllocationClaim {
              allocated_length, owner_vchunk_id, leader_epoch, generation);
 };
 
+struct AllocatorCapabilities {
+    ReplicaType storage_type{ReplicaType::MEMORY};
+    bool allocate{true};
+    bool exact_claim{false};
+    bool persistent_data{false};
+    bool checksum_verification{true};
+
+    YLT_REFL(AllocatorCapabilities, storage_type, allocate, exact_claim,
+             persistent_data, checksum_verification);
+};
+
 class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
@@ -132,6 +143,9 @@ class BufferAllocatorBase {
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
     virtual std::string getSegmentInstanceId() const { return {}; }
+    virtual AllocatorCapabilities capabilities() const {
+        return AllocatorCapabilities{};
+    }
 
     /**
      * Returns the largest free region available in this allocator.
@@ -237,7 +251,13 @@ class CachelibBufferAllocator
         return kAllocatorUnknownFreeSpace;
     }
     bool supportsExactClaim() const override {
-        return !segment_instance_id_.empty();
+        return capabilities().exact_claim;
+    }
+    AllocatorCapabilities capabilities() const override {
+        return {replica_type_, true,
+                replica_type_ == ReplicaType::MEMORY &&
+                    !segment_instance_id_.empty(),
+                false, true};
     }
     tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
         const AllocationClaim& claim) override;
@@ -318,7 +338,13 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
     bool supportsExactClaim() const override {
-        return !segment_instance_id_.empty();
+        return capabilities().exact_claim;
+    }
+    AllocatorCapabilities capabilities() const override {
+        return {replica_type_, true,
+                replica_type_ == ReplicaType::MEMORY &&
+                    !segment_instance_id_.empty(),
+                replica_type_ == ReplicaType::NOF_SSD, true};
     }
     tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
         const AllocationClaim& claim) override;

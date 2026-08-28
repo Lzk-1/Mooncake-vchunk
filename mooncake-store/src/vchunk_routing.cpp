@@ -56,4 +56,107 @@ ErrorCode VChunkStaticRouteTable::CheckOwner(
     return ErrorCode::OK;
 }
 
+ErrorCode VChunkDynamicRouteTable::ValidateSnapshot(
+    const VChunkRouteSnapshot& snapshot) {
+    if (snapshot.route_version == 0 || snapshot.slots.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    for (size_t i = 0; i < snapshot.slots.size(); ++i) {
+        const auto& route = snapshot.slots[i];
+        if (route.slot != i || route.owner_submaster_id.empty() ||
+            route.owner_epoch == 0 ||
+            (route.state == VChunkSlotState::OWNED &&
+             !route.target_submaster_id.empty()) ||
+            (route.state != VChunkSlotState::OWNED &&
+             route.target_submaster_id.empty()) ||
+            static_cast<uint8_t>(route.state) >
+                static_cast<uint8_t>(VChunkSlotState::TRANSFERRING)) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode VChunkDynamicRouteTable::ApplySnapshot(
+    VChunkRouteSnapshot snapshot) {
+    if (const auto error = ValidateSnapshot(snapshot); error != ErrorCode::OK) {
+        return error;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (snapshot.route_version <= snapshot_.route_version) {
+        return ErrorCode::ROUTE_CHANGED;
+    }
+    snapshot_ = std::move(snapshot);
+    return ErrorCode::OK;
+}
+
+ErrorCode VChunkDynamicRouteTable::BeginTransfer(
+    uint32_t slot, std::string target_submaster_id,
+    uint64_t next_route_version) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (slot >= snapshot_.slots.size() || target_submaster_id.empty() ||
+        next_route_version <= snapshot_.route_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto& route = snapshot_.slots[slot];
+    if (route.state != VChunkSlotState::OWNED ||
+        route.owner_submaster_id == target_submaster_id) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    route.state = VChunkSlotState::DRAINING;
+    route.target_submaster_id = std::move(target_submaster_id);
+    snapshot_.route_version = next_route_version;
+    return ErrorCode::OK;
+}
+
+ErrorCode VChunkDynamicRouteTable::MarkTransferring(
+    uint32_t slot, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (slot >= snapshot_.slots.size() ||
+        next_route_version <= snapshot_.route_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto& route = snapshot_.slots[slot];
+    if (route.state != VChunkSlotState::DRAINING) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    route.state = VChunkSlotState::TRANSFERRING;
+    snapshot_.route_version = next_route_version;
+    return ErrorCode::OK;
+}
+
+ErrorCode VChunkDynamicRouteTable::CompleteTransfer(
+    uint32_t slot, uint64_t next_owner_epoch, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (slot >= snapshot_.slots.size() || next_owner_epoch == 0 ||
+        next_route_version <= snapshot_.route_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto& route = snapshot_.slots[slot];
+    if (route.state != VChunkSlotState::TRANSFERRING ||
+        next_owner_epoch <= route.owner_epoch) {
+        return ErrorCode::STALE_EPOCH;
+    }
+    route.owner_submaster_id = std::move(route.target_submaster_id);
+    route.target_submaster_id.clear();
+    route.owner_epoch = next_owner_epoch;
+    route.state = VChunkSlotState::OWNED;
+    snapshot_.route_version = next_route_version;
+    return ErrorCode::OK;
+}
+
+tl::expected<VChunkSlotRoute, ErrorCode> VChunkDynamicRouteTable::Resolve(
+    uint32_t slot) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (slot >= snapshot_.slots.size()) {
+        return tl::unexpected(ErrorCode::SHARD_INDEX_OUT_OF_RANGE);
+    }
+    return snapshot_.slots[slot];
+}
+
+uint64_t VChunkDynamicRouteTable::Version() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return snapshot_.route_version;
+}
+
 }  // namespace mooncake

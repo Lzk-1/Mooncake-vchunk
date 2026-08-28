@@ -79,6 +79,7 @@ class VChunkMasterManager {
     void DeactivateLeader();
     uint64_t LeaderEpoch() const { return leader_epoch_.load(); }
     ErrorCode PublishRecoveryView(VChunkRecoveryView view);
+    ErrorCode ApplyRouteSnapshot(VChunkRouteSnapshot snapshot);
 
     ErrorCode Recover(int64_t now_ms, OwnershipPredicate owns = {});
     tl::expected<size_t, ErrorCode> ReapExpired(int64_t now_ms,
@@ -109,6 +110,7 @@ class VChunkMasterManager {
     std::atomic<uint64_t> leader_epoch_{1};
     std::atomic<bool> accepts_mutations_{true};
     std::optional<VChunkStaticRouteTable> static_routes_;
+    VChunkDynamicRouteTable dynamic_routes_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;

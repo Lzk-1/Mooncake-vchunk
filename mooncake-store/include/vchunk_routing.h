@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,6 +43,48 @@ class VChunkStaticRouteTable {
     uint64_t route_version_;
     std::vector<std::string> slot_owners_;
     uint64_t owner_epoch_;
+};
+
+enum class VChunkSlotState : uint8_t {
+    OWNED = 0,
+    DRAINING = 1,
+    TRANSFERRING = 2,
+};
+
+struct VChunkSlotRoute {
+    uint32_t slot{0};
+    VChunkSlotState state{VChunkSlotState::OWNED};
+    std::string owner_submaster_id;
+    std::string target_submaster_id;
+    uint64_t owner_epoch{0};
+
+    YLT_REFL(VChunkSlotRoute, slot, state, owner_submaster_id,
+             target_submaster_id, owner_epoch);
+};
+
+struct VChunkRouteSnapshot {
+    uint64_t route_version{0};
+    std::vector<VChunkSlotRoute> slots;
+
+    YLT_REFL(VChunkRouteSnapshot, route_version, slots);
+};
+
+class VChunkDynamicRouteTable {
+   public:
+    ErrorCode ApplySnapshot(VChunkRouteSnapshot snapshot);
+    ErrorCode BeginTransfer(uint32_t slot, std::string target_submaster_id,
+                            uint64_t next_route_version);
+    ErrorCode MarkTransferring(uint32_t slot, uint64_t next_route_version);
+    ErrorCode CompleteTransfer(uint32_t slot, uint64_t next_owner_epoch,
+                               uint64_t next_route_version);
+    tl::expected<VChunkSlotRoute, ErrorCode> Resolve(uint32_t slot) const;
+    uint64_t Version() const;
+
+   private:
+    static ErrorCode ValidateSnapshot(const VChunkRouteSnapshot& snapshot);
+
+    mutable std::mutex mutex_;
+    VChunkRouteSnapshot snapshot_;
 };
 
 }  // namespace mooncake
