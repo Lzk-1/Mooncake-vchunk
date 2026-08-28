@@ -1,6 +1,7 @@
 #include "vchunk_recovery.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <tuple>
 
@@ -49,6 +50,12 @@ VChunkRecoveryManager::BuildIsolatedView(
     if (leader_epoch == 0 || config_.Validate() != ErrorCode::OK) {
         return Fail(ErrorCode::INVALID_PARAMS, "invalid recovery parameters");
     }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(
+                              config_.allocator_claim_timeout_ms);
+    const auto deadline_exceeded = [&] {
+        return std::chrono::steady_clock::now() >= deadline;
+    };
 
     std::vector<ClaimTask> tasks;
     for (size_t record_index = 0; record_index < records.size();
@@ -100,6 +107,10 @@ VChunkRecoveryManager::BuildIsolatedView(
 
     phase_ = VChunkRecoveryPhase::RESOURCE_CLAIMING;
     for (const auto& task : tasks) {
+        if (deadline_exceeded()) {
+            return Fail(ErrorCode::RPC_TIMEOUT,
+                        "allocator claim deadline exceeded");
+        }
         auto& entry = view.entries[task.record_index];
         const auto& slice = entry.record.slices[task.slice_index];
         auto allocator = FindAllocator(allocators, slice);
@@ -132,6 +143,10 @@ VChunkRecoveryManager::BuildIsolatedView(
                             "recovery checksum verifier is unavailable");
             }
             for (const auto& slice : entry.record.slices) {
+                if (deadline_exceeded()) {
+                    return Fail(ErrorCode::RPC_TIMEOUT,
+                                "recovery verification deadline exceeded");
+                }
                 if (slice.content_checksum == 0) {
                     return Fail(ErrorCode::CHECKSUM_MISMATCH,
                                 "recovery checksum is missing");
@@ -139,6 +154,10 @@ VChunkRecoveryManager::BuildIsolatedView(
                 if (const auto error = verify(entry.record, slice);
                     error != ErrorCode::OK) {
                     return Fail(error, "recovery checksum verification failed");
+                }
+                if (deadline_exceeded()) {
+                    return Fail(ErrorCode::RPC_TIMEOUT,
+                                "recovery verification deadline exceeded");
                 }
             }
         }

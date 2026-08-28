@@ -56,6 +56,27 @@ const uint32 bin_sizes[] = {
     2684354560, 2952790016, 3221225472, 3489660928, 3758096384, 4026531840,
 };
 
+TEST(OffsetAllocatorExactClaimTest, ClaimsArbitraryFreeRangeAndMergesOnFree) {
+    constexpr uint64_t kBase = 0x190000000ULL;
+    constexpr size_t kCapacity = 4096;
+    auto allocator = OffsetAllocator::create(kBase, kCapacity, 8, 16);
+    ASSERT_NE(allocator, nullptr);
+
+    {
+        auto middle = allocator->allocateAt(kBase + 2048, 128);
+        ASSERT_TRUE(middle.has_value());
+        EXPECT_EQ(middle->address(), kBase + 2048);
+        EXPECT_FALSE(allocator->allocateAt(kBase + 2048, 128).has_value());
+
+        auto prefix = allocator->allocate(128);
+        ASSERT_TRUE(prefix.has_value());
+        EXPECT_EQ(prefix->address(), kBase);
+    }
+    const auto report = allocator->storageReport();
+    EXPECT_EQ(report.totalFreeSpace, kCapacity);
+    EXPECT_EQ(report.largestFreeRegion, kCapacity);
+}
+
 // Forward declaration
 class AllocatorWrapper;
 

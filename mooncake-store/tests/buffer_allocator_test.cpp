@@ -122,11 +122,15 @@ TEST_F(BufferAllocatorTest, ReserveAtClaimsOnlyTheRequestedAddress) {
     AllocationClaim claim;
     claim.segment_name = "claim-segment";
     claim.segment_instance_id = "instance-1";
-    claim.offset = kBase;
+    claim.offset = kBase + 2048;
     claim.allocated_length = 128;
     auto claimed = allocator->reserveAt(claim);
     ASSERT_TRUE(claimed.has_value());
-    EXPECT_EQ(reinterpret_cast<uintptr_t>((*claimed)->data()), kBase);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>((*claimed)->data()), kBase + 2048);
+
+    auto ordinary = allocator->allocate(128);
+    ASSERT_NE(ordinary, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ordinary->data()), kBase);
 
     auto duplicate = allocator->reserveAt(claim);
     EXPECT_FALSE(duplicate.has_value());

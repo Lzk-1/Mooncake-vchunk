@@ -284,6 +284,91 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     return OffsetAllocation(node.dataOffset, nodeIndex);
 }
 
+OffsetAllocation __Allocator::allocateAt(uint32 offset, uint32 size) {
+    if (size == 0 || offset > m_size || size > m_size - offset) {
+        return {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    }
+    const uint32 rounded_size = SmallFloat::floatToUint(
+        SmallFloat::uintToFloatRoundUp(size));
+    if (rounded_size > m_size - offset) {
+        return {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    }
+
+    NodeIndex source_index = Node::unused;
+    for (uint32 bin = 0; bin < NUM_LEAF_BINS && source_index == Node::unused;
+         ++bin) {
+        for (NodeIndex i = m_binIndices[bin]; i != Node::unused;
+             i = m_nodes[i].binListNext) {
+            const auto& candidate = m_nodes[i];
+            if (offset >= candidate.dataOffset &&
+                offset - candidate.dataOffset <= candidate.dataSize &&
+                rounded_size <=
+                    candidate.dataSize - (offset - candidate.dataOffset)) {
+                source_index = i;
+                break;
+            }
+        }
+    }
+    if (source_index == Node::unused) {
+        return {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+    }
+
+    const Node source = m_nodes[source_index];
+    const uint32 prefix_size = offset - source.dataOffset;
+    const uint32 suffix_offset = offset + rounded_size;
+    const uint32 suffix_size =
+        source.dataOffset + source.dataSize - suffix_offset;
+    const uint32 resulting_nodes = 1 + (prefix_size != 0) + (suffix_size != 0);
+    while (m_freeOffset + resulting_nodes - 1 > m_current_capacity) {
+        if (m_current_capacity == m_max_capacity) {
+            return {OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE};
+        }
+        m_freeNodes.push_back(m_current_capacity);
+        m_nodes.emplace_back();
+        ++m_current_capacity;
+    }
+
+    removeNodeFromBin(source_index);
+    const NodeIndex used_index = m_freeNodes[m_freeOffset++];
+    m_nodes[used_index] = {.dataOffset = offset,
+                           .dataSize = rounded_size,
+                           .used = true};
+    NodeIndex prefix_index = Node::unused;
+    NodeIndex suffix_index = Node::unused;
+    if (prefix_size != 0) {
+        prefix_index = insertNodeIntoBin(prefix_size, source.dataOffset);
+    }
+    if (suffix_size != 0) {
+        suffix_index = insertNodeIntoBin(suffix_size, suffix_offset);
+    }
+
+    const NodeIndex first =
+        prefix_index == Node::unused ? used_index : prefix_index;
+    const NodeIndex last =
+        suffix_index == Node::unused ? used_index : suffix_index;
+    m_nodes[first].neighborPrev = source.neighborPrev;
+    if (source.neighborPrev != Node::unused) {
+        m_nodes[source.neighborPrev].neighborNext = first;
+    }
+    if (prefix_index != Node::unused) {
+        m_nodes[prefix_index].neighborNext = used_index;
+        m_nodes[used_index].neighborPrev = prefix_index;
+    } else {
+        m_nodes[used_index].neighborPrev = source.neighborPrev;
+    }
+    if (suffix_index != Node::unused) {
+        m_nodes[used_index].neighborNext = suffix_index;
+        m_nodes[suffix_index].neighborPrev = used_index;
+    } else {
+        m_nodes[used_index].neighborNext = source.neighborNext;
+    }
+    m_nodes[last].neighborNext = source.neighborNext;
+    if (source.neighborNext != Node::unused) {
+        m_nodes[source.neighborNext].neighborPrev = last;
+    }
+    return {offset, used_index};
+}
+
 void __Allocator::free(OffsetAllocation allocation) {
     ASSERT(allocation.metadata != OffsetAllocation::NO_SPACE);
     if (m_nodes.empty()) return;
@@ -603,6 +688,36 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     return OffsetAllocationHandle(
         shared_from_this(), allocation,
         m_base + (allocation.getOffset() << m_multiplier_bits), size);
+}
+
+std::optional<OffsetAllocationHandle> OffsetAllocator::allocateAt(
+    uint64_t address, size_t size) {
+    if (size == 0 || address < m_base || address - m_base >= m_capacity) {
+        return std::nullopt;
+    }
+    const uint64_t quantum = uint64_t{1} << m_multiplier_bits;
+    const uint64_t relative = address - m_base;
+    if (relative % quantum != 0 ||
+        size > m_capacity - relative ||
+        size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+        return std::nullopt;
+    }
+    const uint64_t fake_size = (size + quantum - 1) >> m_multiplier_bits;
+    const uint64_t fake_offset = relative >> m_multiplier_bits;
+    if (fake_size > SmallFloat::MAX_BIN_SIZE ||
+        fake_offset > std::numeric_limits<uint32>::max()) {
+        return std::nullopt;
+    }
+
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) return std::nullopt;
+    auto allocation = m_allocator->allocateAt(
+        static_cast<uint32>(fake_offset), static_cast<uint32>(fake_size));
+    if (allocation.isNoSpace()) return std::nullopt;
+    m_allocated_size += size;
+    ++m_allocated_num;
+    return OffsetAllocationHandle(shared_from_this(), allocation, address,
+                                  size);
 }
 
 uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {

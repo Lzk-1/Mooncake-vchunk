@@ -158,6 +158,11 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
 
+    // Claims a specific address range when it is fully free. The occupied
+    // size follows the same bin rounding rules as allocate().
+    [[nodiscard]] std::optional<OffsetAllocationHandle> allocateAt(
+        uint64_t address, size_t size);
+
     // ===== Recovery helpers =====
 
     template <typename Func>
@@ -239,6 +244,7 @@ class __Allocator {
     void reset();
 
     OffsetAllocation allocate(uint32 size);
+    OffsetAllocation allocateAt(uint32 offset, uint32 size);
     void free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;

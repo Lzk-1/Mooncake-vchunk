@@ -254,10 +254,7 @@ class CachelibBufferAllocator
         return capabilities().exact_claim;
     }
     AllocatorCapabilities capabilities() const override {
-        return {replica_type_, true,
-                replica_type_ == ReplicaType::MEMORY &&
-                    !segment_instance_id_.empty(),
-                false, true};
+        return {replica_type_, true, false, false, true};
     }
     tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode> reserveAt(
         const AllocationClaim& claim) override;

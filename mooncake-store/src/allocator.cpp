@@ -175,19 +175,8 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
 }
 
 tl::expected<std::unique_ptr<AllocatedBuffer>, ErrorCode>
-CachelibBufferAllocator::reserveAt(const AllocationClaim& claim) {
-    if (!supportsExactClaim() || claim.segment_name != segment_name_ ||
-        claim.segment_instance_id != segment_instance_id_ ||
-        claim.allocated_length == 0 ||
-        claim.offset < base_ || claim.offset - base_ >= total_size_ ||
-        claim.allocated_length > total_size_ - (claim.offset - base_)) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto buffer = allocate(claim.allocated_length);
-    if (!buffer || reinterpret_cast<uintptr_t>(buffer->data()) != claim.offset) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-    return buffer;
+CachelibBufferAllocator::reserveAt(const AllocationClaim&) {
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -385,10 +374,17 @@ OffsetBufferAllocator::reserveAt(const AllocationClaim& claim) {
         claim.allocated_length > total_size_ - (claim.offset - base_)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto buffer = allocate(claim.allocated_length);
-    if (!buffer || reinterpret_cast<uintptr_t>(buffer->data()) != claim.offset) {
+    auto allocation =
+        offset_allocator_->allocateAt(claim.offset, claim.allocated_length);
+    if (!allocation) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
+    auto buffer = std::make_unique<AllocatedBuffer>(
+        shared_from_this(), allocation->ptr(), claim.allocated_length,
+        std::move(allocation));
+    cur_size_.fetch_add(claim.allocated_length);
+    MasterMetricManager::instance().inc_allocated_mem_size(
+        segment_name_, claim.allocated_length);
     return buffer;
 }
 

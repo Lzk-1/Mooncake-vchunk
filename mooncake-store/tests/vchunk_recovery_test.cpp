@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
+
 #include "allocation_strategy.h"
 #include "vchunk_master_manager.h"
 
@@ -96,6 +99,29 @@ TEST(VChunkRecoveryTest, PublishesRecoveredViewAtomically) {
     auto record = manager.Get(TenantId("tenant"), "key");
     ASSERT_TRUE(record.has_value());
     EXPECT_EQ(record->leader_epoch, 5U);
+}
+
+TEST(VChunkRecoveryTest, RejectsVerificationPastRecoveryDeadline) {
+    constexpr uintptr_t kBase = 0x1E0000000ULL;
+    AllocatorManager allocators;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "segment", kBase, 64 * 1024, "endpoint", ReplicaType::MEMORY,
+        "instance-1");
+    allocators.addAllocator("segment", allocator);
+    VChunkConfig config;
+    config.allocator_claim_timeout_ms = 10;
+    VChunkRecoveryManager recovery(config);
+
+    auto view = recovery.BuildIsolatedView(
+        {MakeRecoveryRecord(kBase, "instance-1")}, allocators, 5,
+        [](const auto&, const auto&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            return ErrorCode::OK;
+        });
+    ASSERT_FALSE(view.has_value());
+    EXPECT_EQ(view.error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(recovery.Phase(), VChunkRecoveryPhase::FAILED);
+    EXPECT_EQ(allocator->size(), 0U);
 }
 
 }  // namespace
