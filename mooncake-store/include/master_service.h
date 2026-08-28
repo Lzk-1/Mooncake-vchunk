@@ -2391,6 +2391,10 @@ class MasterService {
     std::condition_variable vchunk_reaper_cv_;
     void StartVChunkReaper();
     void VChunkReaperThreadFunc();
+    void TryRecoverPendingVChunks();
+    std::mutex pending_vchunk_recovery_mutex_;
+    std::vector<VChunkMetadataRecord> pending_vchunk_recovery_;
+    uint64_t pending_vchunk_leader_epoch_{0};
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

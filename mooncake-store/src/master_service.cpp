@@ -1894,6 +1894,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         RecomputeTenantEffectiveQuotas();
     }
     PublishSegmentOwnerForCvm(segment);
+    TryRecoverPendingVChunks();
     return {};
 }
 
@@ -2272,6 +2273,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
     }
     RecomputeTenantEffectiveQuotas();
+    TryRecoverPendingVChunks();
 
     for (const auto& seg : segments) {
         PublishSegmentOwnerForCvm(seg);
@@ -3702,30 +3704,28 @@ void MasterService::RestoreFromStandbySnapshot(
     const std::vector<VChunkMetadataRecord>& vchunks, uint64_t leader_epoch) {
     // The ordered writer initializes its sequence from durable_prefix.
     (void)initial_oplog_sequence_id;
-    if (!vchunks.empty() && vchunk_enabled_) {
-        // active_only deliberately starts with an empty vchunk view. A
-        // recoverable promotion may publish only after real Segment allocators
-        // have remounted and all historical ranges can be claimed.
+    if (vchunk_enabled_) {
         vchunk_manager_.DeactivateLeader();
-        if (vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE && leader_epoch != 0) {
-            auto allocator_access = segment_manager_.getAllocatorAccess();
-            VChunkRecoveryManager recovery(vchunk_config_);
-            auto view = recovery.BuildIsolatedView(
-                vchunks, allocator_access.getAllocatorManager(), leader_epoch);
-            if (view) {
-                const auto published =
-                    vchunk_manager_.PublishRecoveryView(std::move(*view));
-                if (published != ErrorCode::OK) {
-                    LOG(ERROR) << "vchunk promotion publish failed: "
-                               << toString(published);
-                }
-            } else {
-                LOG(WARNING) << "vchunk promotion remains unavailable: "
-                             << toString(view.error()) << ", reason="
-                             << recovery.FailureReason();
+        std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
+        pending_vchunk_recovery_.clear();
+        pending_vchunk_leader_epoch_ = 0;
+        if (leader_epoch != 0 &&
+            vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE) {
+            pending_vchunk_recovery_ = vchunks;
+            pending_vchunk_leader_epoch_ = leader_epoch;
+        } else if (leader_epoch != 0 &&
+                   vchunk_ha_mode_ == VChunkHAMode::ACTIVE_ONLY) {
+            VChunkRecoveryView empty_view;
+            empty_view.leader_epoch = leader_epoch;
+            const auto published =
+                vchunk_manager_.PublishRecoveryView(std::move(empty_view));
+            if (published != ErrorCode::OK) {
+                LOG(ERROR) << "failed to publish empty vchunk promotion view: "
+                           << toString(published);
             }
         }
     }
+    TryRecoverPendingVChunks();
 
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
@@ -12667,7 +12667,35 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
                 return PersistVChunkEventForHA(type, record);
             });
     }
+
+    TryRecoverPendingVChunks();
     return ErrorCode::OK;
+}
+
+void MasterService::TryRecoverPendingVChunks() {
+    std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
+    if (pending_vchunk_leader_epoch_ == 0) return;
+
+    auto allocator_access = segment_manager_.getAllocatorAccess();
+    VChunkRecoveryManager recovery(vchunk_config_);
+    auto view = recovery.BuildIsolatedView(
+        pending_vchunk_recovery_, allocator_access.getAllocatorManager(),
+        pending_vchunk_leader_epoch_);
+    if (!view) {
+        VLOG(1) << "vchunk promotion remains pending: "
+                << toString(view.error())
+                << ", reason=" << recovery.FailureReason();
+        return;
+    }
+    const auto published =
+        vchunk_manager_.PublishRecoveryView(std::move(*view));
+    if (published != ErrorCode::OK) {
+        LOG(ERROR) << "vchunk promotion publish failed: "
+                   << toString(published);
+        return;
+    }
+    pending_vchunk_recovery_.clear();
+    pending_vchunk_leader_epoch_ = 0;
 }
 
 ErrorCode MasterService::PersistVChunkEventForHA(

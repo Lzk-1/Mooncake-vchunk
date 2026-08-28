@@ -107,6 +107,8 @@ class VChunkMasterManager {
     ErrorCode CheckLeaderEpoch(uint64_t expected_leader_epoch) const;
     ErrorCode CheckStaticOwner(const TenantId& tenant_id,
                                const std::string& key) const;
+    tl::expected<VChunkRoute, ErrorCode> ResolveRoute(
+        const TenantId& tenant_id, const std::string& key) const;
     ErrorCode PersistEvent(VChunkHAEventType type,
                            const VChunkMetadataRecord& record) const;
 

@@ -12,7 +12,7 @@
 
 namespace mooncake {
 
-inline constexpr uint32_t kVChunkMetadataSchemaVersion = 2;
+inline constexpr uint32_t kVChunkMetadataSchemaVersion = 3;
 
 enum class VCSliceStatus : uint8_t {
     PENDING = 0,
@@ -74,12 +74,17 @@ struct VChunkMetadataIndex {
     uint8_t replica_num{1};
     uint64_t leader_epoch{0};
     uint64_t metadata_version{0};
+    uint32_t owner_slot{0};
+    std::string owner_submaster_id;
+    uint64_t owner_epoch{0};
+    uint64_t route_version{0};
     std::vector<SliceGroup> slice_groups;
 
     YLT_REFL(VChunkMetadataIndex, schema_version, vchunk_id, tenant_id, key,
              total_size, slice_count, slice_size_level, row_size, status,
              created_at_ms, last_updated_at_ms, replica_num, leader_epoch,
-             metadata_version, slice_groups);
+             metadata_version, owner_slot, owner_submaster_id, owner_epoch,
+             route_version, slice_groups);
 };
 
 struct VCSlicePartition {
@@ -107,12 +112,17 @@ struct VChunkMetadataRecord {
     uint8_t replica_num{1};
     uint64_t leader_epoch{0};
     uint64_t metadata_version{0};
+    uint32_t owner_slot{0};
+    std::string owner_submaster_id;
+    uint64_t owner_epoch{0};
+    uint64_t route_version{0};
     std::vector<SliceGroup> slice_groups;
 
     YLT_REFL(VChunkMetadataRecord, schema_version, vchunk_id, tenant_id, key,
              total_size, slice_count, slice_size_level, slices, row_size,
              status, created_at_ms, last_updated_at_ms, replica_num,
-             leader_epoch, metadata_version, slice_groups);
+             leader_epoch, metadata_version, owner_slot, owner_submaster_id,
+             owner_epoch, route_version, slice_groups);
 };
 
 struct VChunkRuntimeInfo {

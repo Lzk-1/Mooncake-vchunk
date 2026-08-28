@@ -40,6 +40,51 @@ struct LegacyRecord {
              status, created_at_ms, last_updated_at_ms);
 };
 
+struct LegacyRecordV2 {
+    uint32_t schema_version{2};
+    std::string vchunk_id;
+    std::string tenant_id;
+    std::string key;
+    uint64_t total_size{0};
+    uint32_t slice_count{0};
+    VCSliceSizeLevel slice_size_level{VCSliceSizeLevel::k4K};
+    std::vector<VCSliceDescriptor> slices;
+    uint32_t row_size{0};
+    VChunkStatus status{VChunkStatus::CREATING};
+    int64_t created_at_ms{0};
+    int64_t last_updated_at_ms{0};
+    uint8_t replica_num{1};
+    uint64_t leader_epoch{0};
+    uint64_t metadata_version{0};
+    std::vector<SliceGroup> slice_groups;
+    YLT_REFL(LegacyRecordV2, schema_version, vchunk_id, tenant_id, key,
+             total_size, slice_count, slice_size_level, slices, row_size,
+             status, created_at_ms, last_updated_at_ms, replica_num,
+             leader_epoch, metadata_version, slice_groups);
+};
+
+struct LegacyIndexV2 {
+    uint32_t schema_version{2};
+    std::string vchunk_id;
+    std::string tenant_id;
+    std::string key;
+    uint64_t total_size{0};
+    uint32_t slice_count{0};
+    VCSliceSizeLevel slice_size_level{VCSliceSizeLevel::k4K};
+    uint32_t row_size{0};
+    VChunkStatus status{VChunkStatus::CREATING};
+    int64_t created_at_ms{0};
+    int64_t last_updated_at_ms{0};
+    uint8_t replica_num{1};
+    uint64_t leader_epoch{0};
+    uint64_t metadata_version{0};
+    std::vector<SliceGroup> slice_groups;
+    YLT_REFL(LegacyIndexV2, schema_version, vchunk_id, tenant_id, key,
+             total_size, slice_count, slice_size_level, row_size, status,
+             created_at_ms, last_updated_at_ms, replica_num, leader_epoch,
+             metadata_version, slice_groups);
+};
+
 VChunkMetadataRecord MakeValidRecord() {
     VChunkMetadataRecord record;
     record.vchunk_id = "vchunk-1";
@@ -72,6 +117,10 @@ TEST(VChunkMetadataTest, RoundTripsStableRecord) {
     auto original = MakeValidRecord();
     original.leader_epoch = 7;
     original.metadata_version = 11;
+    original.owner_slot = 3;
+    original.owner_submaster_id = "submaster-a";
+    original.owner_epoch = 8;
+    original.route_version = 9;
     original.slices[0].segment_instance_id = "instance-a";
     original.slices[0].allocation_generation = 5;
     original.slices[0].content_checksum = 1234;
@@ -93,10 +142,69 @@ TEST(VChunkMetadataTest, RoundTripsStableRecord) {
     EXPECT_EQ(restored->created_at_ms, 100);
     EXPECT_EQ(restored->leader_epoch, 7U);
     EXPECT_EQ(restored->metadata_version, 11U);
+    EXPECT_EQ(restored->owner_slot, 3U);
+    EXPECT_EQ(restored->owner_submaster_id, "submaster-a");
+    EXPECT_EQ(restored->owner_epoch, 8U);
+    EXPECT_EQ(restored->route_version, 9U);
     EXPECT_EQ(restored->slices[0].segment_instance_id, "instance-a");
     EXPECT_EQ(restored->slices[0].content_checksum, 1234U);
     ASSERT_EQ(restored->slice_groups.size(), 1U);
     EXPECT_EQ(restored->slice_groups[0].slice_indices.size(), 2U);
+}
+
+TEST(VChunkMetadataTest, UpgradesSchemaVersionTwoRecords) {
+    const auto current = MakeValidRecord();
+    LegacyRecordV2 legacy;
+    legacy.vchunk_id = current.vchunk_id;
+    legacy.tenant_id = current.tenant_id;
+    legacy.key = current.key;
+    legacy.total_size = current.total_size;
+    legacy.slice_count = current.slice_count;
+    legacy.slice_size_level = current.slice_size_level;
+    legacy.slices = current.slices;
+    legacy.row_size = current.row_size;
+    legacy.status = current.status;
+    legacy.created_at_ms = current.created_at_ms;
+    legacy.last_updated_at_ms = current.last_updated_at_ms;
+    legacy.metadata_version = 4;
+
+    auto restored = DeserializeVChunkMetadata(struct_pack::serialize(legacy),
+                                               VChunkConfig{});
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->schema_version, kVChunkMetadataSchemaVersion);
+    EXPECT_EQ(restored->metadata_version, 4U);
+    EXPECT_EQ(restored->route_version, 0U);
+    EXPECT_TRUE(restored->owner_submaster_id.empty());
+}
+
+TEST(VChunkMetadataTest, UpgradesSchemaVersionTwoIndexes) {
+    LegacyIndexV2 legacy;
+    legacy.vchunk_id = "legacy-vchunk";
+    legacy.tenant_id = "tenant";
+    legacy.key = "key";
+    legacy.total_size = 4096;
+    legacy.slice_count = 1;
+    legacy.row_size = 1;
+    legacy.created_at_ms = 10;
+    legacy.last_updated_at_ms = 20;
+
+    auto restored = DeserializeVChunkMetadataIndex(
+        struct_pack::serialize(legacy), VChunkConfig{});
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->schema_version, kVChunkMetadataSchemaVersion);
+    EXPECT_EQ(restored->vchunk_id, "legacy-vchunk");
+    EXPECT_EQ(restored->route_version, 0U);
+}
+
+TEST(VChunkMetadataTest, RejectsIncompleteOwnershipSnapshot) {
+    auto record = MakeValidRecord();
+    record.route_version = 2;
+    record.owner_epoch = 3;
+    EXPECT_EQ(ValidateVChunkMetadata(record, VChunkConfig{}),
+              ErrorCode::INVALID_PARAMS);
+
+    record.owner_submaster_id = "submaster-a";
+    EXPECT_EQ(ValidateVChunkMetadata(record, VChunkConfig{}), ErrorCode::OK);
 }
 
 TEST(VChunkMetadataTest, UpgradesSchemaVersionOneRecords) {

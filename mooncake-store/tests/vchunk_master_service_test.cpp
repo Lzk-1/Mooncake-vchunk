@@ -147,5 +147,66 @@ TEST(VChunkMasterServiceTest, ExposesIsolatedVChunkControlPlane) {
               ErrorCode::OBJECT_NOT_FOUND);
 }
 
+TEST(VChunkMasterServiceTest, ActiveOnlyPromotionPublishesEmptyLeaderView) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.vchunk_config.enabled = true;
+    config.vchunk_config.ha_mode = VChunkHAMode::ACTIVE_ONLY;
+    MasterService service(config);
+
+    service.RestoreFromStandbySnapshot({}, 1, {}, {}, 7);
+    ASSERT_TRUE(service
+                    .MountSegment(
+                        MakeVChunkSegment("active-only", 0xB00000000ULL),
+                        generate_uuid())
+                    .has_value());
+    auto created = service.VChunkPutStart(TenantId("tenant"), "new-key",
+                                          4096, false, 100);
+    ASSERT_TRUE(created.has_value());
+    EXPECT_EQ(created->leader_epoch, 7U);
+}
+
+TEST(VChunkMasterServiceTest, RecoverablePromotionRetriesAfterSegmentMount) {
+    MasterServiceConfig config;
+    config.memory_allocator = BufferAllocatorType::OFFSET;
+    config.vchunk_config.enabled = true;
+    config.vchunk_config.ha_mode = VChunkHAMode::RECOVERABLE;
+    config.vchunk_config.enable_ha_recovery = true;
+    config.vchunk_config.verify_recovered_data = false;
+    MasterService service(config);
+
+    auto segment = MakeVChunkSegment("recovery-segment", 0xC00000000ULL);
+    VChunkMetadataRecord record;
+    record.vchunk_id = "recovered-vchunk";
+    record.tenant_id = "tenant";
+    record.key = "recovered-key";
+    record.total_size = 4096;
+    record.slice_count = 1;
+    record.row_size = 1;
+    record.status = VChunkStatus::CREATING;
+    record.created_at_ms = 10;
+    record.last_updated_at_ms = 10;
+    record.leader_epoch = 3;
+    record.metadata_version = 1;
+    VCSliceDescriptor slice;
+    slice.target_segment_name = segment.name;
+    slice.logical_length = 4096;
+    slice.allocated_length = 4096;
+    slice.segment_instance_id = UuidToString(segment.id);
+    slice.allocation_generation = 1;
+    record.slices.push_back(std::move(slice));
+
+    service.RestoreFromStandbySnapshot({}, 1, {}, {record}, 7);
+    EXPECT_EQ(service.GetVChunk(TenantId("tenant"), "recovered-key").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(service.MountSegment(segment, generate_uuid()).has_value());
+    auto recovered =
+        service.GetVChunk(TenantId("tenant"), "recovered-key");
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->status, VChunkStatus::RECOVERING);
+    EXPECT_EQ(recovered->leader_epoch, 7U);
+}
+
 }  // namespace
 }  // namespace mooncake

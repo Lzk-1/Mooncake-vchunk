@@ -51,17 +51,28 @@ ErrorCode VChunkMasterManager::CheckLeaderEpoch(
 
 ErrorCode VChunkMasterManager::CheckStaticOwner(
     const TenantId& tenant_id, const std::string& key) const {
-    if (!static_routes_) return ErrorCode::OK;
+    auto route = ResolveRoute(tenant_id, key);
+    if (!route) return route.error();
+    return route->owner_submaster_id.empty() ||
+                   route->owner_submaster_id == config_.submaster_id
+               ? ErrorCode::OK
+               : ErrorCode::NOT_OWNER;
+}
+
+tl::expected<VChunkRoute, ErrorCode> VChunkMasterManager::ResolveRoute(
+    const TenantId& tenant_id, const std::string& key) const {
+    if (!static_routes_) return VChunkRoute{};
     auto route = static_routes_->Resolve(tenant_id.value(), key);
     if (!route) return route.error();
     auto dynamic = dynamic_routes_.Resolve(route->slot);
     if (!dynamic) return dynamic.error();
     if (dynamic->state != VChunkSlotState::OWNED) {
-        return ErrorCode::ROUTE_CHANGED;
+        return tl::make_unexpected(ErrorCode::ROUTE_CHANGED);
     }
-    return dynamic->owner_submaster_id == config_.submaster_id
-               ? ErrorCode::OK
-               : ErrorCode::NOT_OWNER;
+    route->owner_submaster_id = dynamic->owner_submaster_id;
+    route->owner_epoch = dynamic->owner_epoch;
+    route->route_version = dynamic_routes_.Version();
+    return route;
 }
 
 ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
@@ -206,6 +217,15 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.last_updated_at_ms = now_ms;
     record.metadata_version = 1;
     record.leader_epoch = operation_epoch;
+    auto route = ResolveRoute(tenant_id, key);
+    if (!route) {
+        ReleasePendingPut(scoped_key);
+        return tl::make_unexpected(route.error());
+    }
+    record.owner_slot = route->slot;
+    record.owner_submaster_id = std::move(route->owner_submaster_id);
+    record.owner_epoch = route->owner_epoch;
+    record.route_version = route->route_version;
     record.slices.reserve(record.slice_count);
     entry->buffers.reserve(record.slice_count);
     for (auto& allocated : allocation->allocations) {

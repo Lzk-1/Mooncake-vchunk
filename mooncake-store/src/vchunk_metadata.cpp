@@ -44,6 +44,92 @@ struct VChunkMetadataRecordV1 {
              status, created_at_ms, last_updated_at_ms);
 };
 
+struct VChunkMetadataIndexV2 {
+    uint32_t schema_version{2};
+    std::string vchunk_id;
+    std::string tenant_id;
+    std::string key;
+    uint64_t total_size{0};
+    uint32_t slice_count{0};
+    VCSliceSizeLevel slice_size_level{VCSliceSizeLevel::k4K};
+    uint32_t row_size{0};
+    VChunkStatus status{VChunkStatus::CREATING};
+    int64_t created_at_ms{0};
+    int64_t last_updated_at_ms{0};
+    uint8_t replica_num{1};
+    uint64_t leader_epoch{0};
+    uint64_t metadata_version{0};
+    std::vector<SliceGroup> slice_groups;
+
+    YLT_REFL(VChunkMetadataIndexV2, schema_version, vchunk_id, tenant_id, key,
+             total_size, slice_count, slice_size_level, row_size, status,
+             created_at_ms, last_updated_at_ms, replica_num, leader_epoch,
+             metadata_version, slice_groups);
+};
+
+struct VChunkMetadataRecordV2 {
+    uint32_t schema_version{2};
+    std::string vchunk_id;
+    std::string tenant_id;
+    std::string key;
+    uint64_t total_size{0};
+    uint32_t slice_count{0};
+    VCSliceSizeLevel slice_size_level{VCSliceSizeLevel::k4K};
+    std::vector<VCSliceDescriptor> slices;
+    uint32_t row_size{0};
+    VChunkStatus status{VChunkStatus::CREATING};
+    int64_t created_at_ms{0};
+    int64_t last_updated_at_ms{0};
+    uint8_t replica_num{1};
+    uint64_t leader_epoch{0};
+    uint64_t metadata_version{0};
+    std::vector<SliceGroup> slice_groups;
+
+    YLT_REFL(VChunkMetadataRecordV2, schema_version, vchunk_id, tenant_id, key,
+             total_size, slice_count, slice_size_level, slices, row_size,
+             status, created_at_ms, last_updated_at_ms, replica_num,
+             leader_epoch, metadata_version, slice_groups);
+};
+
+VChunkMetadataIndex UpgradeV2(VChunkMetadataIndexV2 legacy) {
+    VChunkMetadataIndex index;
+    index.vchunk_id = std::move(legacy.vchunk_id);
+    index.tenant_id = std::move(legacy.tenant_id);
+    index.key = std::move(legacy.key);
+    index.total_size = legacy.total_size;
+    index.slice_count = legacy.slice_count;
+    index.slice_size_level = legacy.slice_size_level;
+    index.row_size = legacy.row_size;
+    index.status = legacy.status;
+    index.created_at_ms = legacy.created_at_ms;
+    index.last_updated_at_ms = legacy.last_updated_at_ms;
+    index.replica_num = legacy.replica_num;
+    index.leader_epoch = legacy.leader_epoch;
+    index.metadata_version = legacy.metadata_version;
+    index.slice_groups = std::move(legacy.slice_groups);
+    return index;
+}
+
+VChunkMetadataRecord UpgradeV2(VChunkMetadataRecordV2 legacy) {
+    VChunkMetadataRecord record;
+    record.vchunk_id = std::move(legacy.vchunk_id);
+    record.tenant_id = std::move(legacy.tenant_id);
+    record.key = std::move(legacy.key);
+    record.total_size = legacy.total_size;
+    record.slice_count = legacy.slice_count;
+    record.slice_size_level = legacy.slice_size_level;
+    record.slices = std::move(legacy.slices);
+    record.row_size = legacy.row_size;
+    record.status = legacy.status;
+    record.created_at_ms = legacy.created_at_ms;
+    record.last_updated_at_ms = legacy.last_updated_at_ms;
+    record.replica_num = legacy.replica_num;
+    record.leader_epoch = legacy.leader_epoch;
+    record.metadata_version = legacy.metadata_version;
+    record.slice_groups = std::move(legacy.slice_groups);
+    return record;
+}
+
 VChunkMetadataRecord UpgradeV1(VChunkMetadataRecordV1 legacy) {
     VChunkMetadataRecord record;
     record.vchunk_id = std::move(legacy.vchunk_id);
@@ -131,6 +217,10 @@ ErrorCode ValidateVChunkMetadata(const VChunkMetadataRecord& record,
         record.replica_num > config.max_replica_count ||
         record.created_at_ms < 0 ||
         record.last_updated_at_ms < record.created_at_ms) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (record.route_version > 0 &&
+        (record.owner_submaster_id.empty() || record.owner_epoch == 0)) {
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -254,6 +344,10 @@ VChunkMetadataIndex BuildVChunkMetadataIndex(
     index.replica_num = record.replica_num;
     index.leader_epoch = record.leader_epoch;
     index.metadata_version = record.metadata_version;
+    index.owner_slot = record.owner_slot;
+    index.owner_submaster_id = record.owner_submaster_id;
+    index.owner_epoch = record.owner_epoch;
+    index.route_version = record.route_version;
     index.slice_groups = record.slice_groups;
     return index;
 }
@@ -295,8 +389,19 @@ tl::expected<VChunkMetadataIndex, ErrorCode> DeserializeVChunkMetadataIndex(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     VChunkMetadataIndex index;
-    if (struct_pack::deserialize_to(index, bytes) != struct_pack::errc::ok) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto current_result = struct_pack::deserialize_to(index, bytes);
+    if (current_result != struct_pack::errc::ok ||
+        index.schema_version != kVChunkMetadataSchemaVersion) {
+        VChunkMetadataIndexV2 legacy;
+        if (struct_pack::deserialize_to(legacy, bytes) !=
+                struct_pack::errc::ok ||
+            legacy.schema_version != 2) {
+            return tl::make_unexpected(
+                current_result == struct_pack::errc::ok
+                    ? ErrorCode::INVALID_VERSION
+                    : ErrorCode::INVALID_PARAMS);
+        }
+        index = UpgradeV2(std::move(legacy));
     }
     auto encoded = SerializeVChunkMetadataIndex(index, config);
     if (!encoded) return tl::make_unexpected(encoded.error());
@@ -354,6 +459,10 @@ tl::expected<VChunkMetadataRecord, ErrorCode> AssembleVChunkMetadata(
     record.replica_num = index.replica_num;
     record.leader_epoch = index.leader_epoch;
     record.metadata_version = index.metadata_version;
+    record.owner_slot = index.owner_slot;
+    record.owner_submaster_id = std::move(index.owner_submaster_id);
+    record.owner_epoch = index.owner_epoch;
+    record.route_version = index.route_version;
     record.slice_groups = std::move(index.slice_groups);
     for (auto& partition : partitions) {
         record.slices.insert(record.slices.end(),
@@ -397,16 +506,23 @@ tl::expected<VChunkMetadataRecord, ErrorCode> DeserializeVChunkMetadata(
     const auto current_result = struct_pack::deserialize_to(record, bytes);
     if (current_result != struct_pack::errc::ok ||
         record.schema_version != kVChunkMetadataSchemaVersion) {
-        VChunkMetadataRecordV1 legacy;
-        if (struct_pack::deserialize_to(legacy, bytes) !=
-                struct_pack::errc::ok ||
-            legacy.schema_version != 1) {
-            return tl::make_unexpected(
-                current_result == struct_pack::errc::ok
-                    ? ErrorCode::INVALID_VERSION
-                    : ErrorCode::INVALID_PARAMS);
+        VChunkMetadataRecordV2 previous;
+        if (struct_pack::deserialize_to(previous, bytes) ==
+                struct_pack::errc::ok &&
+            previous.schema_version == 2) {
+            record = UpgradeV2(std::move(previous));
+        } else {
+            VChunkMetadataRecordV1 legacy;
+            if (struct_pack::deserialize_to(legacy, bytes) !=
+                    struct_pack::errc::ok ||
+                legacy.schema_version != 1) {
+                return tl::make_unexpected(
+                    current_result == struct_pack::errc::ok
+                        ? ErrorCode::INVALID_VERSION
+                        : ErrorCode::INVALID_PARAMS);
+            }
+            record = UpgradeV1(std::move(legacy));
         }
-        record = UpgradeV1(std::move(legacy));
     }
     const auto validation = ValidateVChunkMetadata(record, config);
     if (validation != ErrorCode::OK) {
