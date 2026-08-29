@@ -117,6 +117,16 @@ tl::expected<VChunkRoute, ErrorCode> VChunkMasterManager::ResolveRoute(
 ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
     VChunkRouteSnapshot snapshot) {
     std::lock_guard<std::mutex> route_guard(route_mutex_);
+    const auto current = dynamic_routes_.Snapshot();
+    if (snapshot.slots.size() == current.slots.size()) {
+        for (size_t slot = 0; slot < snapshot.slots.size(); ++slot) {
+            if (snapshot.slots[slot].owner_submaster_id !=
+                    current.slots[slot].owner_submaster_id &&
+                SlotHasEntries(static_cast<uint32_t>(slot))) {
+                return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
+        }
+    }
     return PublishRouteSnapshot(std::move(snapshot));
 }
 
@@ -279,6 +289,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     const std::string& key, uint64_t total_size, bool is_ssd_segment,
     int64_t now_ms, const std::set<std::string>& excluded_segments,
     uint64_t expected_leader_epoch) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
         error != ErrorCode::OK) {
         return tl::make_unexpected(error);
@@ -414,6 +425,7 @@ ErrorCode VChunkMasterManager::PutEnd(const TenantId& tenant_id,
                                       uint64_t expected_leader_epoch,
                                       const std::vector<uint64_t>&
                                           slice_checksums) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
         error != ErrorCode::OK) {
         return error;
@@ -474,6 +486,7 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
                                          const std::string& key,
                                          const std::string& vchunk_id,
                                          uint64_t expected_leader_epoch) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
         error != ErrorCode::OK) {
         return error;
@@ -524,6 +537,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::Get(
 tl::expected<VChunkMasterManager::ReadHandle, ErrorCode>
 VChunkMasterManager::AcquireRead(const TenantId& tenant_id,
                                  const std::string& key) const {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
     if (!accepts_mutations_.load()) {
         return tl::make_unexpected(ErrorCode::NOT_LEADER);
     }
@@ -549,6 +563,7 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
                                       const std::string& key,
                                       int64_t now_ms,
                                       uint64_t expected_leader_epoch) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
     if (const auto error = CheckLeaderEpoch(expected_leader_epoch);
         error != ErrorCode::OK) {
         return error;

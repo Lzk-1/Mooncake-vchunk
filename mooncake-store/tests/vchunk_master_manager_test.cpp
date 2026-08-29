@@ -160,7 +160,7 @@ TEST(VChunkMasterManagerTest, RejectsKeysOwnedByAnotherStaticSubmaster) {
     EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
 }
 
-TEST(VChunkMasterManagerTest, AppliesNewSubmasterOwnershipAtomically) {
+TEST(VChunkMasterManagerTest, RejectsOwnershipChangeForPopulatedSlot) {
     ManagerFixture fixture;
     auto config = EnabledConfig();
     config.submaster_id = "submaster-a";
@@ -168,14 +168,19 @@ TEST(VChunkMasterManagerTest, AppliesNewSubmasterOwnershipAtomically) {
     config.owner_epoch = 1;
     config.static_slot_owners = {"submaster-a"};
     VChunkMasterManager manager(config);
-    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
-                                 "before-move", 4096, false, 100)
-                    .has_value());
+    auto created = manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                    "before-move", 4096, false, 100);
+    ASSERT_TRUE(created.has_value());
 
     VChunkRouteSnapshot snapshot;
     snapshot.route_version = 2;
     snapshot.slots.push_back(
         {0, VChunkSlotState::OWNED, "submaster-b", "", 2});
+    ASSERT_EQ(manager.ApplyRouteSnapshot(snapshot),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(manager.PutRevoke(TenantId("tenant"), "before-move",
+                                created->vchunk_id),
+              ErrorCode::OK);
     ASSERT_EQ(manager.ApplyRouteSnapshot(std::move(snapshot)), ErrorCode::OK);
     auto rejected = manager.PutStart(fixture.allocators, TenantId("tenant"),
                                      "after-move", 4096, false, 101);
