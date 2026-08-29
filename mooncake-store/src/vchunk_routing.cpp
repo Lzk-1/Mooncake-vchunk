@@ -82,6 +82,8 @@ ErrorCode VChunkDynamicRouteTable::ValidateSnapshot(
              !route.target_submaster_id.empty()) ||
             (route.state != VChunkSlotState::OWNED &&
              route.target_submaster_id.empty()) ||
+            (route.state != VChunkSlotState::OWNED &&
+             route.target_submaster_id == route.owner_submaster_id) ||
             static_cast<uint8_t>(route.state) >
                 static_cast<uint8_t>(VChunkSlotState::TRANSFERRING)) {
             return ErrorCode::INVALID_PARAMS;
@@ -158,6 +160,25 @@ ErrorCode VChunkDynamicRouteTable::CompleteTransfer(
     return ErrorCode::OK;
 }
 
+ErrorCode VChunkDynamicRouteTable::AbortTransfer(
+    uint32_t slot, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (slot >= snapshot_.slots.size() ||
+        next_route_version <= snapshot_.route_version) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto& route = snapshot_.slots[slot];
+    // Once TRANSFERRING is durable, ownership/resource side effects may have
+    // happened. Only DRAINING is guaranteed to be safe to roll back.
+    if (route.state != VChunkSlotState::DRAINING) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    route.state = VChunkSlotState::OWNED;
+    route.target_submaster_id.clear();
+    snapshot_.route_version = next_route_version;
+    return ErrorCode::OK;
+}
+
 tl::expected<VChunkSlotRoute, ErrorCode> VChunkDynamicRouteTable::Resolve(
     uint32_t slot) const {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -165,6 +186,11 @@ tl::expected<VChunkSlotRoute, ErrorCode> VChunkDynamicRouteTable::Resolve(
         return tl::unexpected(ErrorCode::SHARD_INDEX_OUT_OF_RANGE);
     }
     return snapshot_.slots[slot];
+}
+
+VChunkRouteSnapshot VChunkDynamicRouteTable::Snapshot() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return snapshot_;
 }
 
 uint64_t VChunkDynamicRouteTable::Version() const {

@@ -70,5 +70,26 @@ TEST(VChunkRoutingTest, RouteStorePublishesWithVersionCas) {
     EXPECT_EQ(store.Load()->route_version, 2U);
 }
 
+TEST(VChunkRoutingTest, AbortsOnlyBeforeOwnershipSideEffects) {
+    VChunkDynamicRouteTable routes;
+    VChunkRouteSnapshot snapshot;
+    snapshot.route_version = 1;
+    snapshot.slots.push_back(
+        {0, VChunkSlotState::OWNED, "submaster-a", "", 5});
+    ASSERT_EQ(routes.ApplySnapshot(std::move(snapshot)), ErrorCode::OK);
+    ASSERT_EQ(routes.BeginTransfer(0, "submaster-b", 2), ErrorCode::OK);
+    ASSERT_EQ(routes.AbortTransfer(0, 3), ErrorCode::OK);
+    auto restored = routes.Resolve(0);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->state, VChunkSlotState::OWNED);
+    EXPECT_TRUE(restored->target_submaster_id.empty());
+    EXPECT_EQ(routes.Version(), 3U);
+
+    ASSERT_EQ(routes.BeginTransfer(0, "submaster-b", 4), ErrorCode::OK);
+    ASSERT_EQ(routes.MarkTransferring(0, 5), ErrorCode::OK);
+    EXPECT_EQ(routes.AbortTransfer(0, 6),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
 }  // namespace
 }  // namespace mooncake

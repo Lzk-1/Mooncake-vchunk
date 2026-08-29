@@ -82,7 +82,9 @@ class VChunkDynamicRouteTable {
     ErrorCode MarkTransferring(uint32_t slot, uint64_t next_route_version);
     ErrorCode CompleteTransfer(uint32_t slot, uint64_t next_owner_epoch,
                                uint64_t next_route_version);
+    ErrorCode AbortTransfer(uint32_t slot, uint64_t next_route_version);
     tl::expected<VChunkSlotRoute, ErrorCode> Resolve(uint32_t slot) const;
+    VChunkRouteSnapshot Snapshot() const;
     uint64_t Version() const;
 
    private:

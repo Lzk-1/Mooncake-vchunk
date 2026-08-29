@@ -108,6 +108,13 @@ class VChunkMasterManager {
     bool AcceptsMutations() const { return accepts_mutations_.load(); }
     ErrorCode PublishRecoveryView(VChunkRecoveryView view);
     ErrorCode ApplyRouteSnapshot(VChunkRouteSnapshot snapshot);
+    ErrorCode BeginSlotTransfer(uint32_t slot, std::string target_submaster_id,
+                                uint64_t next_route_version);
+    ErrorCode MarkSlotTransferring(uint32_t slot,
+                                   uint64_t next_route_version);
+    ErrorCode CompleteSlotTransfer(uint32_t slot, uint64_t next_owner_epoch,
+                                   uint64_t next_route_version);
+    ErrorCode AbortSlotTransfer(uint32_t slot, uint64_t next_route_version);
     void SetDurabilitySink(DurabilitySink sink);
     void SetMembershipCheck(std::function<bool()> check);
 
@@ -138,6 +145,8 @@ class VChunkMasterManager {
         const TenantId& tenant_id, const std::string& key) const;
     ErrorCode PersistEvent(VChunkHAEventType type,
                            const VChunkMetadataRecord& record) const;
+    bool SlotHasEntries(uint32_t slot) const;
+    ErrorCode PublishRouteSnapshot(VChunkRouteSnapshot snapshot);
 
     const VChunkConfig config_;
     const std::shared_ptr<VChunkMetadataStore> metadata_store_;
@@ -149,6 +158,7 @@ class VChunkMasterManager {
     VChunkDynamicRouteTable dynamic_routes_;
     DurabilitySink durability_sink_;
     std::function<bool()> membership_check_;
+    mutable std::mutex route_mutex_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<Entry>> entries_;
     std::unordered_set<std::string> pending_puts_;

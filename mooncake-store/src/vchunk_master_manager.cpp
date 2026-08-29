@@ -116,6 +116,12 @@ tl::expected<VChunkRoute, ErrorCode> VChunkMasterManager::ResolveRoute(
 
 ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
     VChunkRouteSnapshot snapshot) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
+    return PublishRouteSnapshot(std::move(snapshot));
+}
+
+ErrorCode VChunkMasterManager::PublishRouteSnapshot(
+    VChunkRouteSnapshot snapshot) {
     if (!static_routes_ || snapshot.slots.size() != static_routes_->SlotCount()) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -129,6 +135,79 @@ ErrorCode VChunkMasterManager::ApplyRouteSnapshot(
         if (error != ErrorCode::OK) return error;
     }
     return dynamic_routes_.ApplySnapshot(std::move(snapshot));
+}
+
+bool VChunkMasterManager::SlotHasEntries(uint32_t slot) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (const auto& [_, entry] : entries_) {
+        auto route = static_routes_->Resolve(entry->record.tenant_id,
+                                             entry->record.key);
+        if (route && route->slot == slot) return true;
+    }
+    return false;
+}
+
+ErrorCode VChunkMasterManager::BeginSlotTransfer(
+    uint32_t slot, std::string target_submaster_id,
+    uint64_t next_route_version) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
+    auto snapshot = dynamic_routes_.Snapshot();
+    if (slot >= snapshot.slots.size()) return ErrorCode::INVALID_PARAMS;
+    if (snapshot.slots[slot].owner_submaster_id != config_.submaster_id) {
+        return ErrorCode::NOT_OWNER;
+    }
+    VChunkDynamicRouteTable next;
+    if (next.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto error = next.BeginTransfer(slot, std::move(target_submaster_id),
+                                          next_route_version);
+    if (error != ErrorCode::OK) return error;
+    return PublishRouteSnapshot(next.Snapshot());
+}
+
+ErrorCode VChunkMasterManager::MarkSlotTransferring(
+    uint32_t slot, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
+    // Until allocator ownership and object bytes can be moved atomically, only
+    // empty slots may cross the point where rollback is no longer safe.
+    if (SlotHasEntries(slot)) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    auto snapshot = dynamic_routes_.Snapshot();
+    VChunkDynamicRouteTable next;
+    if (next.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto error = next.MarkTransferring(slot, next_route_version);
+    if (error != ErrorCode::OK) return error;
+    return PublishRouteSnapshot(next.Snapshot());
+}
+
+ErrorCode VChunkMasterManager::CompleteSlotTransfer(
+    uint32_t slot, uint64_t next_owner_epoch, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
+    if (SlotHasEntries(slot)) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    auto snapshot = dynamic_routes_.Snapshot();
+    VChunkDynamicRouteTable next;
+    if (next.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto error =
+        next.CompleteTransfer(slot, next_owner_epoch, next_route_version);
+    if (error != ErrorCode::OK) return error;
+    return PublishRouteSnapshot(next.Snapshot());
+}
+
+ErrorCode VChunkMasterManager::AbortSlotTransfer(
+    uint32_t slot, uint64_t next_route_version) {
+    std::lock_guard<std::mutex> route_guard(route_mutex_);
+    auto snapshot = dynamic_routes_.Snapshot();
+    VChunkDynamicRouteTable next;
+    if (next.ApplySnapshot(snapshot) != ErrorCode::OK) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto error = next.AbortTransfer(slot, next_route_version);
+    if (error != ErrorCode::OK) return error;
+    return PublishRouteSnapshot(next.Snapshot());
 }
 
 void VChunkMasterManager::SetDurabilitySink(DurabilitySink sink) {

@@ -220,6 +220,69 @@ TEST(VChunkMasterManagerTest, PersistentRouteFailureIsFailClosed) {
         std::runtime_error);
 }
 
+TEST(VChunkMasterManagerTest, PersistsAbortableSlotDrain) {
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    auto routes = std::make_shared<InMemoryVChunkRouteStore>();
+    VChunkMasterManager manager(config, nullptr, nullptr, routes);
+
+    ASSERT_EQ(manager.BeginSlotTransfer(0, "submaster-b", 2), ErrorCode::OK);
+    auto draining = routes->Load();
+    ASSERT_TRUE(draining.has_value());
+    EXPECT_EQ(draining->slots[0].state, VChunkSlotState::DRAINING);
+    EXPECT_EQ(draining->slots[0].target_submaster_id, "submaster-b");
+
+    ASSERT_EQ(manager.AbortSlotTransfer(0, 3), ErrorCode::OK);
+    auto owned = routes->Load();
+    ASSERT_TRUE(owned.has_value());
+    EXPECT_EQ(owned->route_version, 3U);
+    EXPECT_EQ(owned->slots[0].state, VChunkSlotState::OWNED);
+    EXPECT_TRUE(owned->slots[0].target_submaster_id.empty());
+}
+
+TEST(VChunkMasterManagerTest, CompletesEmptySlotTransferPersistently) {
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    auto routes = std::make_shared<InMemoryVChunkRouteStore>();
+    VChunkMasterManager manager(config, nullptr, nullptr, routes);
+
+    ASSERT_EQ(manager.BeginSlotTransfer(0, "submaster-b", 2), ErrorCode::OK);
+    ASSERT_EQ(manager.MarkSlotTransferring(0, 3), ErrorCode::OK);
+    ASSERT_EQ(manager.CompleteSlotTransfer(0, 2, 4), ErrorCode::OK);
+
+    auto moved = routes->Load();
+    ASSERT_TRUE(moved.has_value());
+    EXPECT_EQ(moved->route_version, 4U);
+    EXPECT_EQ(moved->slots[0].state, VChunkSlotState::OWNED);
+    EXPECT_EQ(moved->slots[0].owner_submaster_id, "submaster-b");
+    EXPECT_EQ(moved->slots[0].owner_epoch, 2U);
+}
+
+TEST(VChunkMasterManagerTest, RefusesPopulatedSlotOwnershipSideEffects) {
+    ManagerFixture fixture;
+    auto config = EnabledConfig();
+    config.submaster_id = "submaster-a";
+    config.route_version = 1;
+    config.owner_epoch = 1;
+    config.static_slot_owners = {"submaster-a"};
+    auto routes = std::make_shared<InMemoryVChunkRouteStore>();
+    VChunkMasterManager manager(config, nullptr, nullptr, routes);
+    ASSERT_TRUE(manager.PutStart(fixture.allocators, TenantId("tenant"),
+                                 "resident", 4096, false, 100)
+                    .has_value());
+
+    ASSERT_EQ(manager.BeginSlotTransfer(0, "submaster-b", 2), ErrorCode::OK);
+    EXPECT_EQ(manager.MarkSlotTransferring(0, 3),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(manager.AbortSlotTransfer(0, 3), ErrorCode::OK);
+}
+
 TEST(VChunkMasterManagerTest, MembershipLossFencesMutations) {
     ManagerFixture fixture;
     VChunkMasterManager manager(EnabledConfig());
