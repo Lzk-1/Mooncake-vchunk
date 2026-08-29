@@ -155,13 +155,17 @@ class DelayingControlPlane final : public VChunkControlPlane {
     }
 
     ErrorCode PutEnd(const TenantId& tenant_id, const std::string& key,
-                     const std::string& vchunk_id, int64_t now_ms) override {
-        return delegate_.PutEnd(tenant_id, key, vchunk_id, now_ms);
+                     const std::string& vchunk_id, int64_t now_ms,
+                     uint64_t leader_epoch,
+                     const std::vector<uint64_t>& checksums) override {
+        return delegate_.PutEnd(tenant_id, key, vchunk_id, now_ms,
+                                leader_epoch, checksums);
     }
 
     ErrorCode PutRevoke(const TenantId& tenant_id, const std::string& key,
-                        const std::string& vchunk_id) override {
-        return delegate_.PutRevoke(tenant_id, key, vchunk_id);
+                        const std::string& vchunk_id,
+                        uint64_t leader_epoch) override {
+        return delegate_.PutRevoke(tenant_id, key, vchunk_id, leader_epoch);
     }
 
     tl::expected<VChunkControlPlaneRead, ErrorCode> Get(
@@ -171,8 +175,8 @@ class DelayingControlPlane final : public VChunkControlPlane {
     }
 
     ErrorCode Remove(const TenantId& tenant_id, const std::string& key,
-                     int64_t now_ms) override {
-        return delegate_.Remove(tenant_id, key, now_ms);
+                     int64_t now_ms, uint64_t leader_epoch) override {
+        return delegate_.Remove(tenant_id, key, now_ms, leader_epoch);
     }
 
    private:

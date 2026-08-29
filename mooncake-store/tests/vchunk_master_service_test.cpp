@@ -75,6 +75,17 @@ TEST(VChunkMasterServiceTest, PartitionedModeRejectsBeforeSlotViewIsReady) {
               ErrorCode::SLOT_NOT_OWNED);
 }
 
+TEST(VChunkMasterServiceTest, RejectsCompetingCvmAndVChunkSlotRouting) {
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    config.ha_backend_type = "etcd";
+    config.submaster_count = 2;
+    config.vchunk_config.enabled = true;
+    config.vchunk_config.static_slot_owners = {"submaster-a"};
+
+    EXPECT_THROW(MasterService service(config), std::invalid_argument);
+}
+
 TEST(VChunkMasterServiceTest, BackgroundReaperStopsAndCleansExpiredCreating) {
     MasterServiceConfig config;
     config.memory_allocator = BufferAllocatorType::OFFSET;

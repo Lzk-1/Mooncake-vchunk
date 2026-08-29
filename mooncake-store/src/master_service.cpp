@@ -251,6 +251,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
     const bool partitioned_vchunk =
         config.vchunk_config.enabled && config.enable_ha &&
         config.ha_backend_type == "etcd" && config.submaster_count > 1;
+    if (partitioned_vchunk &&
+        !config.vchunk_config.static_slot_owners.empty()) {
+        throw std::invalid_argument(
+            "CVM partitioning and vchunk static slot routing cannot be "
+            "enabled together");
+    }
     if (config.vchunk_config.enabled && config.enable_ha &&
         config.vchunk_config.ha_mode == VChunkHAMode::DISABLED) {
         throw std::invalid_argument(
@@ -3770,7 +3776,6 @@ void MasterService::RestoreFromStandbySnapshot(
         vchunk_recovery_failure_reason_.clear();
         if (leader_epoch != 0 &&
             vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE) {
-            pending_vchunk_recovery_ = vchunks;
             pending_vchunk_leader_epoch_ = leader_epoch;
         } else if (leader_epoch != 0 &&
                    vchunk_ha_mode_ == VChunkHAMode::ACTIVE_ONLY) {
@@ -3784,8 +3789,6 @@ void MasterService::RestoreFromStandbySnapshot(
             }
         }
     }
-    TryRecoverPendingVChunks();
-
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
@@ -3827,19 +3830,22 @@ void MasterService::RestoreFromStandbySnapshot(
         objects_by_shard;
 
     // P4：晋升时只物化「本机负责 slot」的对象元数据（数据字节留在 segment）。
-    // 仅在 etcd HA 动态分区下过滤；非 HA / 单机 / 测试路径 lookup 为空，退化
-    // 为恢复全部。ResolveOwnedSlotsForCvm 失败时 sticky 沿用上一轮结果
-    // （standby 晋升前为空 → 全量恢复），同样等价于不过滤。
+    // ETCD 多 SubMaster 模式下 ownership 查询失败必须按“无 owned slot”处理，
+    // 禁止退化为恢复全部；非 HA 和单机路径仍恢复完整快照。
     std::vector<bool> owned_slot_lookup;
+    bool partition_filter_enabled = false;
     {
         const bool kv_partition_enabled =
             enable_ha_ && ha_backend_type_ == "etcd" &&
             !master_id_.empty() && !cluster_id_.empty();
         if (kv_partition_enabled) {
+            partition_filter_enabled = true;
+            // An empty ownership result in multi-SubMaster mode means this
+            // node currently owns no slots; it must never mean "restore all".
+            owned_slot_lookup.assign(cvm::kSlotCount, false);
             const std::vector<uint16_t> owned_slots =
                 ResolveOwnedSlotsForCvm();
             if (!owned_slots.empty()) {
-                owned_slot_lookup.assign(cvm::kSlotCount, false);
                 for (uint16_t slot : owned_slots) {
                     owned_slot_lookup[slot] = true;
                 }
@@ -3850,6 +3856,21 @@ void MasterService::RestoreFromStandbySnapshot(
         }
     }
 
+    if (vchunk_enabled_ && leader_epoch != 0 &&
+        vchunk_ha_mode_ == VChunkHAMode::RECOVERABLE) {
+        std::lock_guard<std::mutex> guard(pending_vchunk_recovery_mutex_);
+        pending_vchunk_recovery_.reserve(vchunks.size());
+        for (const auto& record : vchunks) {
+            if (partition_filter_enabled &&
+                !owned_slot_lookup[cvm::KeySlot(TenantId(record.tenant_id),
+                                                record.key)]) {
+                continue;
+            }
+            pending_vchunk_recovery_.push_back(record);
+        }
+    }
+    TryRecoverPendingVChunks();
+
     for (const auto& entry : objects) {
         auto [tenant_id, user_key] = resolve_standby_object(entry);
         if (!tenant_id.IsValid()) {
@@ -3859,7 +3880,7 @@ void MasterService::RestoreFromStandbySnapshot(
             continue;
         }
         // slot 过滤：只物化本机负责 slot 的元数据（P4 元数据迁移）。
-        if (!owned_slot_lookup.empty()) {
+        if (partition_filter_enabled) {
             const uint16_t slot = cvm::KeySlot(tenant_id, user_key);
             if (!owned_slot_lookup[slot]) {
                 continue;

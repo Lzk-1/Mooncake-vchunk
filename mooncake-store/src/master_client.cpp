@@ -395,7 +395,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     const auto total_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
-    auto pool = client_accessor_.GetClientPool();
+    std::shared_ptr<RpcClientPool::ClientPool> pool;
+    {
+        std::lock_guard<std::recursive_mutex> target_lock(routed_rpc_mutex_);
+        pool = client_accessor_.GetClientPool();
+    }
     const auto pool_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -539,7 +543,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_to(
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
+    std::shared_ptr<RpcClientPool::ClientPool> pool;
+    {
+        std::lock_guard<std::recursive_mutex> target_lock(routed_rpc_mutex_);
+        pool = client_accessor_.GetClientPool();
+    }
 
     // Increment RPC counter
     if (metrics_) {
@@ -777,6 +785,7 @@ std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
 
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     const std::string& object_key) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
@@ -794,6 +803,7 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     const std::vector<std::string>& object_keys) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
@@ -895,6 +905,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key, const std::string& tenant_id) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
 
@@ -920,6 +931,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
                                   const std::string& tenant_id) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size(),
                      ", tenant_id=", tenant_id);
@@ -972,6 +984,7 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::PutStart(const std::string& key,
                        const std::vector<size_t>& slice_lengths,
                        const ReplicateConfig& config) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
@@ -999,6 +1012,7 @@ MasterClient::BatchPutStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -1062,6 +1076,7 @@ MasterClient::BatchPutStart(
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
 
@@ -1081,6 +1096,7 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
@@ -1135,6 +1151,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
 
 tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     const std::string& key, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
@@ -1153,7 +1170,7 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
 tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
     const std::string& tenant_id, const std::string& key, uint64_t total_size,
     int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1175,7 +1192,7 @@ tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
     const std::string& tenant_id, const std::string& key,
     const std::string& vchunk_id, int64_t now_ms, uint64_t leader_epoch,
     const std::vector<uint64_t>& slice_checksums) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1194,7 +1211,7 @@ tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
 tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
     const std::string& tenant_id, const std::string& key,
     const std::string& vchunk_id, uint64_t leader_epoch) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1212,7 +1229,7 @@ tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
 
 tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
     const std::string& tenant_id, const std::string& key) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1231,7 +1248,7 @@ tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
 tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
     const std::string& tenant_id, const std::string& key,
     const std::string& lease_id) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1243,7 +1260,7 @@ tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
 tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
     const std::string& tenant_id, const std::string& key, int64_t now_ms,
     uint64_t leader_epoch) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     const auto switch_err = SwitchToSubmaster(tenant_id, key);
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
@@ -1283,6 +1300,7 @@ MasterClient::ListVChunkSubMasters() {
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -1331,6 +1349,7 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::UpsertStart(const std::string& key,
                           const std::vector<size_t>& slice_lengths,
                           const ReplicateConfig& config) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::UpsertStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
@@ -1357,6 +1376,7 @@ MasterClient::BatchUpsertStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertStart");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -1418,6 +1438,7 @@ MasterClient::BatchUpsertStart(
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
 
@@ -1436,6 +1457,7 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
     const std::vector<ObjectMeta>& object_metas) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
@@ -1488,6 +1510,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
 
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
     const std::string& key, ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
 
@@ -1505,6 +1528,7 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
     const std::vector<std::string>& keys) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
@@ -1549,6 +1573,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
 
 tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
                                                    bool force) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::Remove");
     timer.LogRequest("key=", key, ", force=", force);
 
@@ -1587,6 +1612,7 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
     const std::vector<std::string>& keys, bool force) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchRemove");
     timer.LogRequest("keys_count=", keys.size(), ", force=", force);
 
@@ -2219,6 +2245,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     ReplicaType replica_type) {
+    std::lock_guard<std::recursive_mutex> routed_lock(routed_rpc_mutex_);
     ScopedVLogTimer timer(1, "MasterClient::BatchEvictDiskReplica");
     timer.LogRequest("keys_count=", keys.size(), ", tenant_id=", tenant_id,
                      ", replica_type=", replica_type);

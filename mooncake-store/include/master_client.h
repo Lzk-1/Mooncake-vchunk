@@ -898,9 +898,10 @@ class MasterClient {
     partition::PartitionRouter partition_router_;
     mutable std::mutex routing_config_mutex_;
     std::string routing_cluster_namespace_;
-    // Protects the target switch and the following vchunk RPC as one unit.
-    // RpcClientPool itself is thread-safe, but its selected target is shared.
-    mutable std::mutex vchunk_routed_rpc_mutex_;
+    // Serializes selection of the shared current target with the RPC that
+    // consumes it. Recursive because routed methods call invoke_rpc helpers,
+    // which also protect non-routed calls from observing a transient target.
+    mutable std::recursive_mutex routed_rpc_mutex_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
