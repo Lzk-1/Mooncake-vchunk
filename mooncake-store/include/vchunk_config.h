@@ -24,6 +24,11 @@ enum class VChunkHAMode : uint8_t {
     RECOVERABLE = 3,
 };
 
+enum class VChunkSlicePolicy : uint8_t {
+    AUTO = 0,
+    FIXED = 1,
+};
+
 tl::expected<VChunkHAMode, ErrorCode> ParseVChunkHAMode(
     const std::string& value);
 
@@ -64,6 +69,19 @@ struct VChunkConfig {
     std::vector<std::string> static_slot_owners;
     bool enable_dynamic_membership{false};
     uint32_t membership_lease_ttl_sec{15};
+    VChunkSlicePolicy slice_policy{VChunkSlicePolicy::AUTO};
+    VCSliceSizeLevel fixed_slice_size{VCSliceSizeLevel::k64K};
+    uint64_t slice_threshold_4k_to_64k{64U * 1024U};
+    uint64_t slice_threshold_64k_to_256k{256U * 1024U};
+    uint64_t slice_threshold_256k_to_1m{1024U * 1024U};
+    uint32_t min_segments_per_replica{1};
+    uint32_t max_segments_per_replica{0};
+    uint32_t max_segments_per_vchunk{0};
+    bool allow_segment_limit_fallback{true};
+    uint32_t min_stripe_slices{1};
+    uint32_t max_stripe_slices{256};
+    uint32_t cleanup_max_attempts{8};
+    uint64_t cleanup_retry_backoff_ms{100};
 
     ErrorCode Validate() const;
 
@@ -77,7 +95,13 @@ struct VChunkConfig {
              etcd_incremental_update, enable_ha_recovery,
              ha_mode, allocator_claim_timeout_ms, verify_recovered_data,
              submaster_id, route_version, owner_epoch, static_slot_owners,
-             enable_dynamic_membership, membership_lease_ttl_sec);
+             enable_dynamic_membership, membership_lease_ttl_sec,
+             slice_policy, fixed_slice_size, slice_threshold_4k_to_64k,
+             slice_threshold_64k_to_256k, slice_threshold_256k_to_1m,
+             min_segments_per_replica, max_segments_per_replica,
+             max_segments_per_vchunk, allow_segment_limit_fallback,
+             min_stripe_slices, max_stripe_slices, cleanup_max_attempts,
+             cleanup_retry_backoff_ms);
 };
 
 }  // namespace mooncake

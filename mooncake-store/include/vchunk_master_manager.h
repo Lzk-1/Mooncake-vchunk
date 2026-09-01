@@ -132,6 +132,9 @@ class VChunkMasterManager {
     struct Entry {
         VChunkMetadataRecord record;
         std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+        int64_t cleanup_deadline_ms{0};
+        uint32_t cleanup_attempts{0};
+        bool cleanup_pending{false};
     };
 
     static std::string ScopedKey(const TenantId& tenant_id,

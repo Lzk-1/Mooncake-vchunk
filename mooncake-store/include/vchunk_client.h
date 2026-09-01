@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -21,6 +22,11 @@ namespace mooncake {
 
 class VChunkDataPlane {
    public:
+    struct ReadAttemptResult {
+        ErrorCode error{ErrorCode::OK};
+        std::vector<std::string> failed_segments;
+    };
+
     virtual ~VChunkDataPlane() = default;
     virtual ErrorCode Write(const VChunkMetadataRecord& record,
                             const void* source, size_t length,
@@ -28,6 +34,13 @@ class VChunkDataPlane {
     virtual ErrorCode Read(const VChunkMetadataRecord& record, void* destination,
                            size_t length,
                            std::chrono::steady_clock::time_point deadline) = 0;
+    virtual ReadAttemptResult ReadAttempt(
+        const VChunkMetadataRecord& record, void* destination, size_t length,
+        std::chrono::steady_clock::time_point deadline,
+        const std::unordered_set<std::string>& excluded_segments) {
+        (void)excluded_segments;
+        return {Read(record, destination, length, deadline), {}};
+    }
 };
 
 class VChunkLegacyPath {

@@ -97,6 +97,10 @@ TEST(VChunkMasterManagerTest, RevokeIsIdempotentAndReleasesBuffers) {
     EXPECT_EQ(manager.PutRevoke(tenant, "key", created->vchunk_id),
               ErrorCode::OK);
     EXPECT_EQ(fixture.first->size() + fixture.second->size(), 0U);
+    const auto metrics = manager.MetricsSnapshot();
+    EXPECT_EQ(metrics.cleanup_attempts, 1U);
+    EXPECT_EQ(metrics.cleanup_failures, 0U);
+    EXPECT_EQ(metrics.pending_cleanup, 0U);
 }
 
 TEST(VChunkMasterManagerTest, PersistsConfiguredReplicaLayout) {

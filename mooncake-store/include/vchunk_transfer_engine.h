@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <functional>
+#include <unordered_set>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -26,7 +27,9 @@ tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
 BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
                            size_t length, TransferRequest::OpCode opcode,
                            const VChunkSegmentResolver& resolve_segment,
-                           bool merge_adjacent_reads = true);
+                           bool merge_adjacent_reads = true,
+                           const std::unordered_set<std::string>&
+                               excluded_segments = {});
 
 class TransferEngineVChunkDataPlane final : public VChunkDataPlane {
    public:
@@ -39,11 +42,17 @@ class TransferEngineVChunkDataPlane final : public VChunkDataPlane {
     ErrorCode Read(const VChunkMetadataRecord& record, void* destination,
                    size_t length,
                    std::chrono::steady_clock::time_point deadline) override;
+    ReadAttemptResult ReadAttempt(
+        const VChunkMetadataRecord& record, void* destination, size_t length,
+        std::chrono::steady_clock::time_point deadline,
+        const std::unordered_set<std::string>& excluded_segments) override;
 
    private:
     ErrorCode Transfer(const VChunkMetadataRecord& record, void* buffer,
                        size_t length, TransferRequest::OpCode opcode,
-                       std::chrono::steady_clock::time_point deadline);
+                       std::chrono::steady_clock::time_point deadline,
+                       const std::unordered_set<std::string>& excluded_segments,
+                       std::vector<std::string>* failed_segments);
 
     TransferEngine& engine_;
 };

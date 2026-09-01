@@ -67,6 +67,23 @@ TEST(VChunkConfigTest, RejectsInvalidLimits) {
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(VChunkConfigTest, ValidatesPlacementAndSlicePolicy) {
+    VChunkConfig config;
+    config.slice_policy = VChunkSlicePolicy::FIXED;
+    config.fixed_slice_size = VCSliceSizeLevel::k256K;
+    config.min_segments_per_replica = 2;
+    config.max_segments_per_replica = 4;
+    config.max_segments_per_vchunk = 4;
+    EXPECT_EQ(config.Validate(), ErrorCode::OK);
+
+    config.max_segments_per_replica = 1;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+    config.max_segments_per_replica = 4;
+    config.slice_threshold_64k_to_256k =
+        config.slice_threshold_4k_to_64k;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {
     EXPECT_EQ(SelectVChunkSliceSize(0, false), VCSliceSizeLevel::k4K);
     EXPECT_EQ(SelectVChunkSliceSize(64U * 1024U - 1, false),

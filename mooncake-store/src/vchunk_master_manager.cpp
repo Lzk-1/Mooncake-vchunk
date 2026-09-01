@@ -12,6 +12,18 @@
 
 namespace mooncake {
 
+namespace {
+
+int64_t CleanupDeadline(int64_t now_ms, uint64_t timeout_ms) {
+    if (timeout_ms > static_cast<uint64_t>(
+                         std::numeric_limits<int64_t>::max() - now_ms)) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return now_ms + static_cast<int64_t>(timeout_ms);
+}
+
+}  // namespace
+
 VChunkMasterManager::VChunkMasterManager(
     VChunkConfig config, std::shared_ptr<VChunkMetadataStore> metadata_store,
     std::shared_ptr<VChunkMetrics> metrics,
@@ -264,6 +276,14 @@ ErrorCode VChunkMasterManager::PublishRecoveryView(VChunkRecoveryView view) {
         auto entry = std::make_shared<Entry>();
         entry->record = std::move(source.record);
         entry->buffers = std::move(source.claims);
+        if (entry->record.status == VChunkStatus::CREATING) {
+            entry->cleanup_deadline_ms = CleanupDeadline(
+                entry->record.last_updated_at_ms, config_.creating_timeout_ms);
+        } else if (entry->record.status == VChunkStatus::RELEASING) {
+            entry->cleanup_deadline_ms = CleanupDeadline(
+                entry->record.last_updated_at_ms,
+                config_.releasing_timeout_ms);
+        }
         const auto key = ScopedKey(TenantId(entry->record.tenant_id),
                                    entry->record.key);
         if (!recovered.emplace(key, std::move(entry)).second) {
@@ -358,6 +378,8 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     record.status = VChunkStatus::CREATING;
     record.created_at_ms = now_ms;
     record.last_updated_at_ms = now_ms;
+    entry->cleanup_deadline_ms =
+        CleanupDeadline(now_ms, config_.creating_timeout_ms);
     record.metadata_version = 1;
     record.leader_epoch = operation_epoch;
     auto route = ResolveRoute(tenant_id, key);
@@ -515,8 +537,13 @@ ErrorCode VChunkMasterManager::PutRevoke(const TenantId& tenant_id,
         error != ErrorCode::OK) {
         return error;
     }
+    metrics_->AddCleanupAttempt();
+    ++it->second->cleanup_attempts;
     if (const auto error = metadata_store_->Remove(it->second->record);
         error != ErrorCode::OK) {
+        it->second->cleanup_pending = true;
+        metrics_->AddCleanupFailure();
+        RefreshStateMetricsLocked();
         return error;
     }
     entries_.erase(it);
@@ -602,6 +629,8 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
             return error;
         }
         record = std::move(releasing);
+        it->second->cleanup_deadline_ms =
+            CleanupDeadline(now_ms, config_.releasing_timeout_ms);
     }
     auto released = record;
     released.status = VChunkStatus::RELEASED;
@@ -610,8 +639,13 @@ ErrorCode VChunkMasterManager::Remove(const TenantId& tenant_id,
         error != ErrorCode::OK) {
         return error;
     }
+    metrics_->AddCleanupAttempt();
+    ++it->second->cleanup_attempts;
     if (const auto error = metadata_store_->Remove(record);
         error != ErrorCode::OK) {
+        it->second->cleanup_pending = true;
+        metrics_->AddCleanupFailure();
+        RefreshStateMetricsLocked();
         return error;
     }
     entries_.erase(it);
@@ -701,17 +735,10 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
             it = next;
             continue;
         }
-        const bool time_is_valid = now_ms >= record.last_updated_at_ms;
-        const auto age = time_is_valid
-                             ? static_cast<uint64_t>(now_ms -
-                                                     record.last_updated_at_ms)
-                             : 0;
-        const bool expired =
-            time_is_valid &&
-            ((record.status == VChunkStatus::CREATING &&
-              age >= config_.creating_timeout_ms) ||
-             (record.status == VChunkStatus::RELEASING &&
-              age >= config_.releasing_timeout_ms));
+        const bool expired = it->second->cleanup_deadline_ms > 0 &&
+                             now_ms >= it->second->cleanup_deadline_ms &&
+                             (record.status == VChunkStatus::CREATING ||
+                              record.status == VChunkStatus::RELEASING);
         if (!expired) {
             it = next;
             continue;
@@ -728,8 +755,19 @@ tl::expected<size_t, ErrorCode> VChunkMasterManager::ReapExpired(
             error != ErrorCode::OK) {
             return tl::make_unexpected(error);
         }
+        it->second->cleanup_pending = true;
+        metrics_->AddCleanupAttempt();
+        ++it->second->cleanup_attempts;
         if (const auto error = metadata_store_->Remove(record);
             error != ErrorCode::OK) {
+            metrics_->AddCleanupFailure();
+            if (it->second->cleanup_attempts < config_.cleanup_max_attempts) {
+                it->second->cleanup_deadline_ms =
+                    CleanupDeadline(now_ms, config_.cleanup_retry_backoff_ms);
+            } else {
+                it->second->cleanup_deadline_ms = 0;
+            }
+            RefreshStateMetricsLocked();
             return tl::make_unexpected(error);
         }
         entries_.erase(it);
@@ -841,16 +879,19 @@ tl::expected<VChunkScrubReport, ErrorCode> VChunkMasterManager::Scrub() const {
 void VChunkMasterManager::RefreshStateMetricsLocked() {
     std::array<uint64_t, 7> counts{};
     uint64_t allocated_bytes = 0;
+    uint64_t pending_cleanup = 0;
     for (const auto& [_, entry] : entries_) {
         ++counts[static_cast<size_t>(entry->record.status)];
         for (const auto& buffer : entry->buffers) {
             if (buffer) allocated_bytes += buffer->size();
         }
+        pending_cleanup += entry->cleanup_pending;
     }
     for (size_t i = 0; i < counts.size(); ++i) {
         metrics_->SetStateCount(static_cast<VChunkStatus>(i), counts[i]);
     }
     metrics_->SetAllocatedBytes(allocated_bytes);
+    metrics_->SetPendingCleanup(pending_cleanup);
 }
 
 size_t VChunkMasterManager::SizeForTesting() const {

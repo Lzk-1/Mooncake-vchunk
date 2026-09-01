@@ -50,7 +50,9 @@ tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
 BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
                            size_t length, TransferRequest::OpCode opcode,
                            const VChunkSegmentResolver& resolve_segment,
-                           bool merge_adjacent_reads) {
+                           bool merge_adjacent_reads,
+                           const std::unordered_set<std::string>&
+                               excluded_segments) {
     VChunkConfig validation_config;
     validation_config.enabled = true;
     if (!buffer || !resolve_segment || record.total_size != length ||
@@ -131,6 +133,9 @@ BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
                                       record.slice_count +
                                   slice_index];
                 if (slice.status == VCSliceStatus::FAILED) continue;
+                if (excluded_segments.contains(slice.target_segment_name)) {
+                    continue;
+                }
                 auto handle = resolve(slice);
                 if (!handle) {
                     last_error = handle.error();
@@ -163,20 +168,32 @@ ErrorCode TransferEngineVChunkDataPlane::Write(
     const VChunkMetadataRecord& record, const void* source, size_t length,
     std::chrono::steady_clock::time_point deadline) {
     return Transfer(record, const_cast<void*>(source), length,
-                    TransferRequest::WRITE, deadline);
+                    TransferRequest::WRITE, deadline, {}, nullptr);
 }
 
 ErrorCode TransferEngineVChunkDataPlane::Read(
     const VChunkMetadataRecord& record, void* destination, size_t length,
     std::chrono::steady_clock::time_point deadline) {
-    return Transfer(record, destination, length, TransferRequest::READ,
-                    deadline);
+    return ReadAttempt(record, destination, length, deadline, {}).error;
+}
+
+VChunkDataPlane::ReadAttemptResult TransferEngineVChunkDataPlane::ReadAttempt(
+    const VChunkMetadataRecord& record, void* destination, size_t length,
+    std::chrono::steady_clock::time_point deadline,
+    const std::unordered_set<std::string>& excluded_segments) {
+    ReadAttemptResult result;
+    result.error = Transfer(record, destination, length, TransferRequest::READ,
+                            deadline, excluded_segments,
+                            &result.failed_segments);
+    return result;
 }
 
 ErrorCode TransferEngineVChunkDataPlane::Transfer(
     const VChunkMetadataRecord& record, void* buffer, size_t length,
     TransferRequest::OpCode opcode,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline,
+    const std::unordered_set<std::string>& excluded_segments,
+    std::vector<std::string>* failed_segments) {
     auto batches = BuildVChunkTransferBatches(
         record, buffer, length, opcode, [this](const std::string& segment) {
             const auto handle = engine_.openSegment(segment);
@@ -185,12 +202,13 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
                     tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND));
             }
             return tl::expected<SegmentHandle, ErrorCode>(handle);
-        });
+        }, true, excluded_segments);
     if (!batches) {
         return batches.error();
     }
 
     struct ActiveBatch {
+        std::string segment_name;
         std::unique_ptr<BatchGuard> guard;
         size_t expected_bytes{0};
         bool finished{false};
@@ -215,8 +233,8 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
             failed = true;
             finished = guard->TryFree();
         }
-        active.push_back(ActiveBatch{std::move(guard), expected_bytes, finished,
-                                     failed});
+        active.push_back(ActiveBatch{batch.segment_name, std::move(guard),
+                                     expected_bytes, finished, failed});
     }
     bool deadline_exceeded = false;
     for (;;) {
@@ -255,6 +273,13 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
                             [](const ActiveBatch& batch) {
                                 return batch.failed;
                             });
+            if (failed_segments != nullptr) {
+                for (const auto& batch : active) {
+                    if (batch.failed) {
+                        failed_segments->push_back(batch.segment_name);
+                    }
+                }
+            }
             return transfer_failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

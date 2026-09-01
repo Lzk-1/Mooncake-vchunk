@@ -105,6 +105,19 @@ class MemoryDataPlane final : public VChunkDataPlane {
         return offset == length ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
     }
 
+    ReadAttemptResult ReadAttempt(
+        const VChunkMetadataRecord& record, void* destination, size_t length,
+        std::chrono::steady_clock::time_point deadline,
+        const std::unordered_set<std::string>& excluded_segments) override {
+        last_excluded_segments = excluded_segments;
+        auto error = Read(record, destination, length, deadline);
+        if (error == ErrorCode::TRANSFER_FAIL &&
+            !failed_segment_to_report.empty()) {
+            return {error, {failed_segment_to_report}};
+        }
+        return {error, {}};
+    }
+
     bool fail_write{false};
     bool fail_read{false};
     bool corrupt_read{false};
@@ -112,6 +125,8 @@ class MemoryDataPlane final : public VChunkDataPlane {
     int read_failures_remaining{0};
     int write_attempts{0};
     int read_attempts{0};
+    std::string failed_segment_to_report;
+    std::unordered_set<std::string> last_excluded_segments;
     bool block_reads{false};
     bool read_entered{false};
     bool release_read{false};
@@ -364,6 +379,25 @@ TEST_F(ClientFixture, RetriesRetryableTransfersWithinConfiguredLimit) {
     EXPECT_EQ(metrics.retries, 1U);
     EXPECT_EQ(metrics.requests[static_cast<size_t>(VChunkOperation::PUT)], 1U);
     EXPECT_EQ(metrics.successes[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+}
+
+TEST_F(ClientFixture, ReadRetryExcludesReportedFailedSegment) {
+    VChunkClient client(true, service, data, legacy,
+                        std::chrono::seconds(1), [this] { return ++now; }, 1);
+    std::vector<uint8_t> source(4096, 6);
+    ASSERT_EQ(client.Put(TenantId("tenant"), "key", source.data(),
+                         source.size()),
+              ErrorCode::OK);
+
+    data.read_failures_remaining = 1;
+    data.failed_segment_to_report = "segment-a";
+    std::vector<uint8_t> destination(source.size());
+    EXPECT_EQ(client.Get(TenantId("tenant"), "key", destination.data(),
+                         destination.size()),
+              ErrorCode::OK);
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(data.read_attempts, 2);
+    EXPECT_TRUE(data.last_excluded_segments.contains("segment-a"));
 }
 
 TEST_F(ClientFixture, CircuitBreakerStopsOnlyNewVChunkCreation) {

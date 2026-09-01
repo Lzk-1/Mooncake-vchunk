@@ -157,5 +157,31 @@ TEST(VChunkTransferEngineTest, FallsBackToHealthyReplicaPerSlice) {
     EXPECT_EQ((*batches)[1].segment_name, "b");
 }
 
+TEST(VChunkTransferEngineTest, ExcludesFailedSegmentOnReadRetry) {
+    auto record = MakeRecord();
+    record.replica_num = 2;
+    auto replica_a = record.slices[0];
+    replica_a.target_segment_name = "c";
+    replica_a.replica_index = 1;
+    auto replica_b = record.slices[1];
+    replica_b.target_segment_name = "d";
+    replica_b.replica_index = 1;
+    record.slices.push_back(replica_a);
+    record.slices.push_back(replica_b);
+    std::array<char, 4096 + 17> buffer{};
+
+    auto batches = BuildVChunkTransferBatches(
+        record, buffer.data(), buffer.size(), TransferRequest::READ,
+        [](const std::string& name)
+            -> tl::expected<SegmentHandle, ErrorCode> {
+            return name == "c" ? 33 : 44;
+        },
+        true, {"a", "b"});
+    ASSERT_TRUE(batches.has_value());
+    ASSERT_EQ(batches->size(), 2U);
+    EXPECT_EQ((*batches)[0].segment_name, "c");
+    EXPECT_EQ((*batches)[1].segment_name, "d");
+}
+
 }  // namespace
 }  // namespace mooncake

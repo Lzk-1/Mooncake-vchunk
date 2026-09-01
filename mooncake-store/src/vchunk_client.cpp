@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 #include <xxhash.h>
 
+#include <unordered_set>
+
 #include "master_service.h"
 
 namespace mooncake {
@@ -258,12 +260,17 @@ ErrorCode VChunkClient::Get(const TenantId& tenant_id, const std::string& key,
         return ErrorCode::RPC_TIMEOUT;
     }
     ErrorCode result = ErrorCode::TRANSFER_FAIL;
+    std::unordered_set<std::string> excluded_segments;
     for (uint32_t attempt = 0; attempt <= max_retries_; ++attempt) {
         if (Clock::now() >= deadline) {
             result = ErrorCode::RPC_TIMEOUT;
             break;
         }
-        result = data_plane_.Read(read->record, destination, length, deadline);
+        auto read_attempt = data_plane_.ReadAttempt(
+            read->record, destination, length, deadline, excluded_segments);
+        result = read_attempt.error;
+        excluded_segments.insert(read_attempt.failed_segments.begin(),
+                                 read_attempt.failed_segments.end());
         if (result == ErrorCode::OK ||
             (result != ErrorCode::TRANSFER_FAIL &&
              result != ErrorCode::RPC_TIMEOUT)) {

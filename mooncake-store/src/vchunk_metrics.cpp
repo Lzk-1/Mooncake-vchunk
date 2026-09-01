@@ -61,6 +61,9 @@ VChunkMetricsSnapshot VChunkMetrics::Snapshot() const {
     result.scrub_runs = scrub_runs_.load();
     result.scrub_issues = scrub_issues_.load();
     result.scrub_failures = scrub_failures_.load();
+    result.cleanup_attempts = cleanup_attempts_.load();
+    result.cleanup_failures = cleanup_failures_.load();
+    result.pending_cleanup = pending_cleanup_.load();
     for (size_t i = 0; i < slice_size_distribution_.size(); ++i) {
         result.slice_size_distribution[i] =
             slice_size_distribution_[i].load();

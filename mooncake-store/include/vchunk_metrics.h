@@ -28,6 +28,9 @@ struct VChunkMetricsSnapshot {
     uint64_t scrub_runs{0};
     uint64_t scrub_issues{0};
     uint64_t scrub_failures{0};
+    uint64_t cleanup_attempts{0};
+    uint64_t cleanup_failures{0};
+    uint64_t pending_cleanup{0};
     std::array<uint64_t, 7> states{};
 };
 
@@ -49,6 +52,9 @@ class VChunkMetrics {
         scrub_issues_.fetch_add(issues);
     }
     void AddScrubFailure() { ++scrub_failures_; }
+    void AddCleanupAttempt() { ++cleanup_attempts_; }
+    void AddCleanupFailure() { ++cleanup_failures_; }
+    void SetPendingCleanup(uint64_t count) { pending_cleanup_.store(count); }
     VChunkMetricsSnapshot Snapshot() const;
 
    private:
@@ -68,6 +74,9 @@ class VChunkMetrics {
     std::atomic<uint64_t> scrub_runs_{0};
     std::atomic<uint64_t> scrub_issues_{0};
     std::atomic<uint64_t> scrub_failures_{0};
+    std::atomic<uint64_t> cleanup_attempts_{0};
+    std::atomic<uint64_t> cleanup_failures_{0};
+    std::atomic<uint64_t> pending_cleanup_{0};
     std::array<std::atomic<uint64_t>, 7> states_{};
 };
 
