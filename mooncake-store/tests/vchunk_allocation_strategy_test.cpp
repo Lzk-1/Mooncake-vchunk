@@ -48,7 +48,7 @@ TEST(VChunkAllocationStrategyTest, AllocatesContiguousStripesAndRollsBack) {
                 EXPECT_EQ(allocation.slice_index, row * 3 + column);
                 EXPECT_EQ(allocation.logical_length, 4096U);
                 EXPECT_EQ(allocation.allocated_length, 4096U);
-                EXPECT_NE(allocation.buffer, nullptr);
+                EXPECT_EQ(allocation.buffer != nullptr, column == 0);
             }
         }
         for (const auto& allocator : allocators) {
@@ -228,6 +228,60 @@ TEST(VChunkAllocationStrategyTest, FallsBackWhenSegmentLimitIsTooStrict) {
                                  VCSliceSizeLevel::k4K, {}, 1, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->allocations.size(), 2U);
+}
+
+TEST(VChunkAllocationStrategyTest, BuildsAllocatorSegmentProfiles) {
+    AllocatorManager manager;
+    auto allocator = std::make_shared<VChunkTestAllocator>(
+        "segment-a", 0xD00000000ULL, 64U * 1024U,
+        "tcp://server-a:12345");
+    manager.addAllocator("segment-a", allocator);
+
+    const auto profiles = BuildVChunkSegmentProfiles(manager);
+    ASSERT_EQ(profiles.size(), 1U);
+    EXPECT_EQ(profiles[0].segment_name, "segment-a");
+    EXPECT_EQ(profiles[0].server_id, "server-a");
+    EXPECT_EQ(profiles[0].transport_protocol, "tcp");
+    EXPECT_EQ(profiles[0].available_bytes, 64U * 1024U);
+    EXPECT_EQ(profiles[0].largest_free_extent, 64U * 1024U);
+    EXPECT_TRUE(profiles[0].healthy);
+}
+
+TEST(VChunkAllocationStrategyTest, RejectsReplicasInSameServerDomain) {
+    AllocatorManager manager;
+    auto first = std::make_shared<VChunkTestAllocator>(
+        "segment-a", 0xE00000000ULL, 64U * 1024U,
+        "tcp://server-a:12345");
+    auto second = std::make_shared<VChunkTestAllocator>(
+        "segment-b", 0xF00000000ULL, 64U * 1024U,
+        "tcp://server-a:12346");
+    manager.addAllocator("segment-a", first);
+    manager.addAllocator("segment-b", second);
+
+    auto result = AllocateVChunk(manager, 4096, VCSliceSizeLevel::k4K, {}, 2);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(first->size() + second->size(), 0U);
+}
+
+TEST(VChunkAllocationStrategyTest, ScoresFreshTelemetryWithEwmaAndTtl) {
+    VChunkSegmentProfile profile;
+    profile.healthy = true;
+    profile.available_bytes = 100;
+    profile.largest_free_extent = 50;
+    ASSERT_EQ(UpdateVChunkSegmentTelemetry(profile, 2000, 100, 0.1, 1000,
+                                           0.5),
+              ErrorCode::OK);
+    ASSERT_EQ(UpdateVChunkSegmentTelemetry(profile, 1000, 300, 0.3, 1100,
+                                           0.5),
+              ErrorCode::OK);
+    EXPECT_DOUBLE_EQ(profile.bandwidth_ewma_mbps, 1500);
+    EXPECT_DOUBLE_EQ(profile.latency_ewma_us, 200);
+    EXPECT_DOUBLE_EQ(profile.load_ratio, 0.2);
+    EXPECT_GT(ScoreVChunkSegmentProfile(profile, 1200, 5000, 2), 0.5);
+    EXPECT_DOUBLE_EQ(ScoreVChunkSegmentProfile(profile, 7000, 5000, 2), 0.5);
+    EXPECT_EQ(UpdateVChunkSegmentTelemetry(profile, -1, 0, 0, 1200, 0.5),
+              ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace

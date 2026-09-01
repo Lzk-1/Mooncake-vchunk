@@ -15,10 +15,13 @@ class VChunkTestAllocator
       public std::enable_shared_from_this<VChunkTestAllocator> {
    public:
     VChunkTestAllocator(std::string segment_name, uintptr_t base,
-                        size_t capacity)
+                        size_t capacity, std::string transport_endpoint = {})
         : segment_name_(std::move(segment_name)),
           base_(base),
-          capacity_(capacity) {}
+          capacity_(capacity),
+          transport_endpoint_(transport_endpoint.empty()
+                                  ? segment_name_
+                                  : std::move(transport_endpoint)) {}
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         size_t current = used_.load();
@@ -41,7 +44,7 @@ class VChunkTestAllocator
     size_t size() const override { return used_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
-        return segment_name_;
+        return transport_endpoint_;
     }
     std::string getSegmentInstanceId() const override {
         return segment_name_ + "-instance";
@@ -55,6 +58,7 @@ class VChunkTestAllocator
     std::string segment_name_;
     uintptr_t base_;
     size_t capacity_;
+    std::string transport_endpoint_;
     std::atomic<size_t> used_{0};
     std::atomic<size_t> next_offset_{0};
 };

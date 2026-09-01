@@ -2,8 +2,6 @@
 
 #include <chrono>
 #include <functional>
-#include <mutex>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -37,7 +35,6 @@ class TransferEngineVChunkDataPlane final : public VChunkDataPlane {
    public:
     explicit TransferEngineVChunkDataPlane(TransferEngine& engine)
         : engine_(engine) {}
-    ~TransferEngineVChunkDataPlane() override;
 
     ErrorCode Write(const VChunkMetadataRecord& record, const void* source,
                     size_t length,
@@ -58,8 +55,6 @@ class TransferEngineVChunkDataPlane final : public VChunkDataPlane {
                        std::vector<std::string>* failed_segments);
 
     TransferEngine& engine_;
-    std::mutex drainer_mutex_;
-    std::vector<std::thread> drainers_;
 };
 
 }  // namespace mooncake
