@@ -17,6 +17,8 @@ struct VChunkMetricsSnapshot {
     std::array<uint64_t, 3> latency_us{};
     uint64_t slices{0};
     uint64_t segment_participations{0};
+    uint64_t slice_groups{0};
+    uint64_t largest_slice_group{0};
     std::array<uint64_t, 4> slice_size_distribution{};
     uint64_t allocation_failures{0};
     uint64_t transfer_failures{0};
@@ -63,6 +65,8 @@ class VChunkMetrics {
     std::array<std::atomic<uint64_t>, 3> latency_us_{};
     std::atomic<uint64_t> slices_{0};
     std::atomic<uint64_t> segment_participations_{0};
+    std::atomic<uint64_t> slice_groups_{0};
+    std::atomic<uint64_t> largest_slice_group_{0};
     std::array<std::atomic<uint64_t>, 4> slice_size_distribution_{};
     std::atomic<uint64_t> allocation_failures_{0};
     std::atomic<uint64_t> transfer_failures_{0};

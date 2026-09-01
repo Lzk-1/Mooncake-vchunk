@@ -139,12 +139,21 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     result.allocations.reserve(static_cast<size_t>(slice_count) * replica_num);
     const size_t start_offset = randomIndex(candidates.size());
     std::vector<std::unordered_set<std::string>> slice_segments(slice_count);
+    const size_t target_stripe_slices = std::clamp<size_t>(
+        (slice_count + segments_per_replica - 1) / segments_per_replica,
+        config.min_stripe_slices, config.max_stripe_slices);
 
     for (uint8_t replica = 0; replica < replica_num; ++replica) {
+        std::vector<size_t> allowed_candidates;
+        allowed_candidates.reserve(segments_per_replica);
+        for (size_t i = 0; i < segments_per_replica; ++i) {
+            allowed_candidates.push_back(
+                (start_offset +
+                 static_cast<size_t>(replica) * segments_per_replica + i) %
+                candidates.size());
+        }
         for (uint32_t row_start = 0; row_start < slice_count;
              row_start += result.row_size) {
-            std::unordered_set<std::string> used_in_row;
-            used_in_row.reserve(result.row_size);
             const size_t row_width = std::min<size_t>(
                 result.row_size, slice_count - row_start);
             for (size_t column = 0; column < row_width; ++column) {
@@ -153,15 +162,13 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
                 bool allocated = false;
                 for (size_t attempt = 0; attempt < segments_per_replica;
                      ++attempt) {
-                    const size_t index =
-                        (start_offset +
-                         static_cast<size_t>(replica) *
-                             segments_per_replica +
-                         column + attempt) %
-                        candidates.size();
+                    const size_t preferred =
+                        (slice_index / target_stripe_slices) %
+                        segments_per_replica;
+                    const size_t index = allowed_candidates[
+                        (preferred + attempt) % segments_per_replica];
                     auto& candidate = candidates[index];
-                    if (used_in_row.contains(candidate.name) ||
-                        slice_segments[slice_index].contains(candidate.name) ||
+                    if (slice_segments[slice_index].contains(candidate.name) ||
                         candidate.allocated_slices >=
                             candidate.remaining_slices) {
                         continue;
@@ -190,7 +197,6 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
                     allocation.replica_index = replica;
                     allocation.buffer = std::move(buffer);
                     result.allocations.push_back(std::move(allocation));
-                    used_in_row.insert(candidate.name);
                     slice_segments[slice_index].insert(candidate.name);
                     allocated = true;
                     break;

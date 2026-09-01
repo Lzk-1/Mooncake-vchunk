@@ -50,7 +50,7 @@ tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
 BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
                            size_t length, TransferRequest::OpCode opcode,
                            const VChunkSegmentResolver& resolve_segment,
-                           bool merge_adjacent_reads,
+                           bool merge_adjacent_requests,
                            const std::unordered_set<std::string>&
                                excluded_segments) {
     VChunkConfig validation_config;
@@ -97,8 +97,7 @@ BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
         TransferRequest request{
             opcode, static_cast<char*>(buffer) + logical_offset, handle,
             slice.target_offset, slice.logical_length};
-        if (opcode == TransferRequest::READ && merge_adjacent_reads &&
-            !requests.empty()) {
+        if (merge_adjacent_requests && !requests.empty()) {
             auto& previous = requests.back();
             if (previous.target_id == request.target_id &&
                 previous.target_offset + previous.length ==

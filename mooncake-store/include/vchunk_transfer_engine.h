@@ -29,7 +29,7 @@ tl::expected<std::vector<VChunkTransferBatch>, ErrorCode>
 BuildVChunkTransferBatches(const VChunkMetadataRecord& record, void* buffer,
                            size_t length, TransferRequest::OpCode opcode,
                            const VChunkSegmentResolver& resolve_segment,
-                           bool merge_adjacent_reads = true,
+                           bool merge_adjacent_requests = true,
                            const std::unordered_set<std::string>&
                                excluded_segments = {});
 

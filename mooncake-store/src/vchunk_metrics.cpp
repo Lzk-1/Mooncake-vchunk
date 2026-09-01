@@ -24,6 +24,16 @@ void VChunkMetrics::ObserveLayout(const VChunkMetadataRecord& record) {
         segments.insert(slice.target_segment_name);
     }
     segment_participations_.fetch_add(segments.size());
+    slice_groups_.fetch_add(record.slice_groups.size());
+    for (const auto& group : record.slice_groups) {
+        const auto group_size =
+            static_cast<uint64_t>(group.slice_indices.size());
+        auto observed = largest_slice_group_.load();
+        while (observed < group_size &&
+               !largest_slice_group_.compare_exchange_weak(
+                   observed, group_size)) {
+        }
+    }
     size_t bucket = 0;
     switch (record.slice_size_level) {
         case VCSliceSizeLevel::k4K:
@@ -51,6 +61,8 @@ VChunkMetricsSnapshot VChunkMetrics::Snapshot() const {
     }
     result.slices = slices_.load();
     result.segment_participations = segment_participations_.load();
+    result.slice_groups = slice_groups_.load();
+    result.largest_slice_group = largest_slice_group_.load();
     result.allocation_failures = allocation_failures_.load();
     result.transfer_failures = transfer_failures_.load();
     result.timeouts = timeouts_.load();

@@ -379,6 +379,8 @@ TEST_F(ClientFixture, RetriesRetryableTransfersWithinConfiguredLimit) {
     EXPECT_EQ(metrics.retries, 1U);
     EXPECT_EQ(metrics.requests[static_cast<size_t>(VChunkOperation::PUT)], 1U);
     EXPECT_EQ(metrics.successes[static_cast<size_t>(VChunkOperation::PUT)], 1U);
+    EXPECT_GT(metrics.slice_groups, 0U);
+    EXPECT_GT(metrics.largest_slice_group, 0U);
 }
 
 TEST_F(ClientFixture, ReadRetryExcludesReportedFailedSegment) {

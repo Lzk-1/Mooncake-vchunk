@@ -16,7 +16,7 @@ namespace {
 
 using test::VChunkTestAllocator;
 
-TEST(VChunkAllocationStrategyTest, AllocatesTransposeRowsAndRollsBack) {
+TEST(VChunkAllocationStrategyTest, AllocatesContiguousStripesAndRollsBack) {
     AllocatorManager manager;
     std::vector<std::shared_ptr<VChunkTestAllocator>> allocators;
     for (size_t i = 0; i < 3; ++i) {
@@ -34,11 +34,17 @@ TEST(VChunkAllocationStrategyTest, AllocatesTransposeRowsAndRollsBack) {
         EXPECT_EQ(result->row_size, 3U);
         ASSERT_EQ(result->allocations.size(), 9U);
         for (size_t row = 0; row < 3; ++row) {
-            std::unordered_set<std::string> segments;
+            const auto& segment = result->allocations[row * 3].segment_name;
             for (size_t column = 0; column < 3; ++column) {
                 const auto& allocation =
                     result->allocations[row * 3 + column];
-                EXPECT_TRUE(segments.insert(allocation.segment_name).second);
+                EXPECT_EQ(allocation.segment_name, segment);
+                if (column > 0) {
+                    EXPECT_EQ(allocation.target_offset,
+                              result->allocations[row * 3 + column - 1]
+                                      .target_offset +
+                                  4096U);
+                }
                 EXPECT_EQ(allocation.slice_index, row * 3 + column);
                 EXPECT_EQ(allocation.logical_length, 4096U);
                 EXPECT_EQ(allocation.allocated_length, 4096U);

@@ -157,6 +157,22 @@ TEST(VChunkTransferEngineTest, FallsBackToHealthyReplicaPerSlice) {
     EXPECT_EQ((*batches)[1].segment_name, "b");
 }
 
+TEST(VChunkTransferEngineTest, MergesAdjacentWritesOnOneSegment) {
+    auto record = MakeRecord();
+    record.slices[1].target_segment_name = "a";
+    record.slices[1].target_offset = 1000 + 4096;
+    record.row_size = 1;
+    std::array<char, 4096 + 17> buffer{};
+    auto batches = BuildVChunkTransferBatches(
+        record, buffer.data(), buffer.size(), TransferRequest::WRITE,
+        [](const std::string&)
+            -> tl::expected<SegmentHandle, ErrorCode> { return 11; });
+    ASSERT_TRUE(batches.has_value());
+    ASSERT_EQ(batches->size(), 1U);
+    ASSERT_EQ((*batches)[0].requests.size(), 1U);
+    EXPECT_EQ((*batches)[0].requests[0].length, buffer.size());
+}
+
 TEST(VChunkTransferEngineTest, ExcludesFailedSegmentOnReadRetry) {
     auto record = MakeRecord();
     record.replica_num = 2;
