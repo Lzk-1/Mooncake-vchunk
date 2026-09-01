@@ -75,7 +75,9 @@ ErrorCode VChunkConfig::Validate() const {
         read_timeout_ms == 0 || allocator_claim_timeout_ms == 0 ||
         membership_lease_ttl_sec < 3 || cleanup_max_attempts == 0 ||
         cleanup_retry_backoff_ms == 0 || max_etcd_txn_ops < 4 ||
-        max_etcd_txn_bytes == 0 || min_segments_per_replica == 0 ||
+        max_etcd_txn_bytes == 0 || placement_metrics_ttl_ms == 0 ||
+        placement_min_samples == 0 || placement_ewma_alpha <= 0 ||
+        placement_ewma_alpha > 1 || min_segments_per_replica == 0 ||
         min_stripe_slices == 0 || max_stripe_slices < min_stripe_slices ||
         !IsKnownSliceSize(fixed_slice_size) ||
         slice_threshold_4k_to_64k == 0 ||

@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <set>
 #include <string>
@@ -282,6 +283,26 @@ TEST(VChunkAllocationStrategyTest, ScoresFreshTelemetryWithEwmaAndTtl) {
     EXPECT_DOUBLE_EQ(ScoreVChunkSegmentProfile(profile, 7000, 5000, 2), 0.5);
     EXPECT_EQ(UpdateVChunkSegmentTelemetry(profile, -1, 0, 0, 1200, 0.5),
               ErrorCode::INVALID_PARAMS);
+}
+
+TEST(VChunkAllocationStrategyTest, AppliesReportedTelemetryToProfiles) {
+    ClearVChunkSegmentTelemetryForTesting();
+    const auto now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    ASSERT_EQ(ReportVChunkSegmentTelemetry("segment-a", 1000, 50, 0.2,
+                                           now_ms, 0.5),
+              ErrorCode::OK);
+    AllocatorManager manager;
+    auto allocator = std::make_shared<VChunkTestAllocator>(
+        "segment-a", 0x1100000000ULL, 64U * 1024U);
+    manager.addAllocator("segment-a", allocator);
+    const auto profiles = BuildVChunkSegmentProfiles(manager);
+    ASSERT_EQ(profiles.size(), 1U);
+    EXPECT_EQ(profiles[0].telemetry_samples, 1U);
+    EXPECT_DOUBLE_EQ(profiles[0].bandwidth_ewma_mbps, 1000);
+    ClearVChunkSegmentTelemetryForTesting();
 }
 
 }  // namespace

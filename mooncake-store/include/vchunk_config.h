@@ -93,6 +93,9 @@ struct VChunkConfig {
     uint64_t cleanup_retry_backoff_ms{100};
     uint32_t max_etcd_txn_ops{64};
     uint64_t max_etcd_txn_bytes{1024U * 1024U};
+    uint64_t placement_metrics_ttl_ms{30'000};
+    uint32_t placement_min_samples{3};
+    double placement_ewma_alpha{0.2};
 
     ErrorCode Validate() const;
 
@@ -113,7 +116,8 @@ struct VChunkConfig {
              max_segments_per_vchunk, allow_segment_limit_fallback,
              min_stripe_slices, max_stripe_slices, cleanup_max_attempts,
              cleanup_retry_backoff_ms, max_etcd_txn_ops,
-             max_etcd_txn_bytes);
+             max_etcd_txn_bytes, placement_metrics_ttl_ms,
+             placement_min_samples, placement_ewma_alpha);
 };
 
 }  // namespace mooncake

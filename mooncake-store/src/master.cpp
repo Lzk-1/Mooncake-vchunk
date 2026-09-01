@@ -597,6 +597,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("vchunk_max_etcd_txn_bytes",
                              &master_config.vchunk_config.max_etcd_txn_bytes,
                              1024U * 1024U);
+    default_config.GetUInt64(
+        "vchunk_placement_metrics_ttl_ms",
+        &master_config.vchunk_config.placement_metrics_ttl_ms, 30'000);
+    default_config.GetUInt32(
+        "vchunk_placement_min_samples",
+        &master_config.vchunk_config.placement_min_samples, 3);
+    default_config.GetDouble(
+        "vchunk_placement_ewma_alpha",
+        &master_config.vchunk_config.placement_ewma_alpha, 0.2);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,

@@ -1,8 +1,11 @@
 #include "vchunk_allocation_strategy.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "allocation_strategy.h"
@@ -10,6 +13,9 @@
 
 namespace mooncake {
 namespace {
+
+std::mutex telemetry_mutex;
+std::unordered_map<std::string, VChunkSegmentProfile> telemetry_profiles;
 
 tl::expected<VChunkAllocationResult, ErrorCode> RetryWithoutSegmentLimits(
     const AllocatorManager& allocator_manager, uint64_t total_size,
@@ -115,6 +121,16 @@ std::vector<VChunkSegmentProfile> BuildVChunkSegmentProfiles(
             }
         }
         if (profile.healthy && profile.available_bytes > 0) {
+            std::lock_guard<std::mutex> guard(telemetry_mutex);
+            if (const auto it = telemetry_profiles.find(name);
+                it != telemetry_profiles.end()) {
+                profile.bandwidth_ewma_mbps = it->second.bandwidth_ewma_mbps;
+                profile.latency_ewma_us = it->second.latency_ewma_us;
+                profile.load_ratio = it->second.load_ratio;
+                profile.metrics_updated_at_ms =
+                    it->second.metrics_updated_at_ms;
+                profile.telemetry_samples = it->second.telemetry_samples;
+            }
             profiles.push_back(std::move(profile));
         }
     }
@@ -172,6 +188,24 @@ double ScoreVChunkSegmentProfile(const VChunkSegmentProfile& profile,
            profile.load_ratio;
 }
 
+ErrorCode ReportVChunkSegmentTelemetry(const std::string& segment_name,
+                                       double bandwidth_mbps,
+                                       double latency_us, double load_ratio,
+                                       int64_t now_ms, double ewma_alpha) {
+    if (segment_name.empty()) return ErrorCode::INVALID_PARAMS;
+    std::lock_guard<std::mutex> guard(telemetry_mutex);
+    auto& profile = telemetry_profiles[segment_name];
+    profile.segment_name = segment_name;
+    profile.healthy = true;
+    return UpdateVChunkSegmentTelemetry(profile, bandwidth_mbps, latency_us,
+                                        load_ratio, now_ms, ewma_alpha);
+}
+
+void ClearVChunkSegmentTelemetryForTesting() {
+    std::lock_guard<std::mutex> guard(telemetry_mutex);
+    telemetry_profiles.clear();
+}
+
 tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     const AllocatorManager& allocator_manager, uint64_t total_size,
     VCSliceSizeLevel slice_size_level,
@@ -208,12 +242,22 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     if (replica_num > candidates.size()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
+    const auto placement_now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
     std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& lhs, const Candidate& rhs) {
+              [&](const Candidate& lhs, const Candidate& rhs) {
                   const auto lhs_score =
-                      ScoreVChunkSegmentProfile(lhs.profile, 0, 0, 1);
+                      ScoreVChunkSegmentProfile(
+                          lhs.profile, placement_now_ms,
+                          config.placement_metrics_ttl_ms,
+                          config.placement_min_samples);
                   const auto rhs_score =
-                      ScoreVChunkSegmentProfile(rhs.profile, 0, 0, 1);
+                      ScoreVChunkSegmentProfile(
+                          rhs.profile, placement_now_ms,
+                          config.placement_metrics_ttl_ms,
+                          config.placement_min_samples);
                   if (lhs_score != rhs_score) return lhs_score > rhs_score;
                   if (lhs.remaining_slices != rhs.remaining_slices) {
                       return lhs.remaining_slices > rhs.remaining_slices;

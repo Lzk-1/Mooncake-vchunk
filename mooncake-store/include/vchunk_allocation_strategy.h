@@ -43,6 +43,11 @@ ErrorCode UpdateVChunkSegmentTelemetry(VChunkSegmentProfile& profile,
 double ScoreVChunkSegmentProfile(const VChunkSegmentProfile& profile,
                                  int64_t now_ms, uint64_t metrics_ttl_ms,
                                  uint32_t min_samples);
+ErrorCode ReportVChunkSegmentTelemetry(const std::string& segment_name,
+                                       double bandwidth_mbps,
+                                       double latency_us, double load_ratio,
+                                       int64_t now_ms, double ewma_alpha);
+void ClearVChunkSegmentTelemetryForTesting();
 
 std::vector<VChunkSegmentProfile> BuildVChunkSegmentProfiles(
     const AllocatorManager& allocator_manager);

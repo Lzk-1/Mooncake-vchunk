@@ -89,6 +89,9 @@ TEST(VChunkConfigTest, ValidatesPlacementAndSlicePolicy) {
     config.max_etcd_txn_ops = 4;
     config.max_etcd_txn_bytes = 0;
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+    config = VChunkConfig{};
+    config.placement_ewma_alpha = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {
