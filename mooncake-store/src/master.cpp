@@ -591,6 +591,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64(
         "vchunk_cleanup_retry_backoff_ms",
         &master_config.vchunk_config.cleanup_retry_backoff_ms, 100);
+    default_config.GetUInt32("vchunk_max_etcd_txn_ops",
+                             &master_config.vchunk_config.max_etcd_txn_ops,
+                             64);
+    default_config.GetUInt64("vchunk_max_etcd_txn_bytes",
+                             &master_config.vchunk_config.max_etcd_txn_bytes,
+                             1024U * 1024U);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,

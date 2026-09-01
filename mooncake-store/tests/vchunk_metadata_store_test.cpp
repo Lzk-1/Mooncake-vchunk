@@ -324,5 +324,16 @@ TEST(VChunkMetadataStoreTest, RecoveryRejectsUnknownSchemaVersion) {
     EXPECT_EQ(manager.SizeForTesting(), 0U);
 }
 
+TEST(VChunkMetadataStoreTest, RejectsOversizedEtcdTransactionsBeforeSubmit) {
+    VChunkConfig config;
+    config.max_etcd_txn_ops = 4;
+    config.max_etcd_txn_bytes = 128;
+    EXPECT_EQ(ValidateVChunkEtcdTransaction(4, 128, config), ErrorCode::OK);
+    EXPECT_EQ(ValidateVChunkEtcdTransaction(5, 128, config),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ValidateVChunkEtcdTransaction(4, 129, config),
+              ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace
 }  // namespace mooncake

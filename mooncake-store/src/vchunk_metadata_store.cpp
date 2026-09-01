@@ -156,12 +156,33 @@ ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
                                          partition.segment_name),
                         HexEncode(BytesToString(*encoded))});
     }
+    size_t put_bytes = 0;
+    for (const auto& put : puts) {
+        if (put.key.size() > config_.max_etcd_txn_bytes -
+                                 std::min<size_t>(put_bytes,
+                                                  config_.max_etcd_txn_bytes) ||
+            put.value.size() >
+                config_.max_etcd_txn_bytes -
+                    std::min<size_t>(put_bytes + put.key.size(),
+                                     config_.max_etcd_txn_bytes)) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        put_bytes += put.key.size() + put.value.size();
+    }
 
     if (record.status == VChunkStatus::CREATING) {
         if (record.metadata_version != 1) {
             return ErrorCode::INVALID_VERSION;
         }
         puts.push_back({object_key, record.vchunk_id});
+        put_bytes += object_key.size() + record.vchunk_id.size();
+        if (const auto validation = ValidateVChunkEtcdTransaction(
+                puts.size() + 2, put_bytes + object_key.size() +
+                                     metadata_key.size(),
+                config_);
+            validation != ErrorCode::OK) {
+            return validation;
+        }
         const auto error = EtcdHelper::TxnCompareAndPut(
             {{object_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}},
              {metadata_key, EtcdHelper::TxnCompareKind::kKeyNotExists, {}}},
@@ -195,6 +216,15 @@ ErrorCode EtcdVChunkMetadataStore::Put(const VChunkMetadataRecord& record) {
                 namespace_prefix_, record, group.segment_name));
         }
     }
+    size_t txn_bytes = put_bytes + object_key.size() + record.vchunk_id.size() +
+                       metadata_key.size() + current.size();
+    for (const auto& key : stale_partition_keys) txn_bytes += key.size();
+    if (const auto validation = ValidateVChunkEtcdTransaction(
+            puts.size() + stale_partition_keys.size() + 2, txn_bytes,
+            config_);
+        validation != ErrorCode::OK) {
+        return validation;
+    }
     return EtcdHelper::TxnCompareAndPut(
         {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
           record.vchunk_id},
@@ -218,6 +248,13 @@ ErrorCode EtcdVChunkMetadataStore::Remove(
                                 revision);
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
         if (error != ErrorCode::OK) return error;
+        if (const auto validation = ValidateVChunkEtcdTransaction(
+                4, object_key.size() + record.vchunk_id.size() +
+                       legacy_key.size() + current.size(),
+                config_);
+            validation != ErrorCode::OK) {
+            return validation;
+        }
         return EtcdHelper::TxnCompareAndPut(
             {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
               record.vchunk_id},
@@ -229,6 +266,14 @@ ErrorCode EtcdVChunkMetadataStore::Remove(
     for (const auto& partition : PartitionVChunkSlices(record)) {
         delete_keys.push_back(MakePartitionKey(namespace_prefix_, record,
                                                partition.segment_name));
+    }
+    size_t txn_bytes = object_key.size() + record.vchunk_id.size() +
+                       metadata_key.size() + current.size();
+    for (const auto& key : delete_keys) txn_bytes += key.size();
+    if (const auto validation = ValidateVChunkEtcdTransaction(
+            delete_keys.size() + 2, txn_bytes, config_);
+        validation != ErrorCode::OK) {
+        return validation;
     }
     return EtcdHelper::TxnCompareAndPut(
         {{object_key, EtcdHelper::TxnCompareKind::kValueEquals,
@@ -306,6 +351,15 @@ EtcdVChunkMetadataStore::List() {
         result.push_back(std::move(*record));
     }
     return result;
+}
+
+ErrorCode ValidateVChunkEtcdTransaction(size_t operation_count,
+                                        size_t encoded_bytes,
+                                        const VChunkConfig& config) {
+    return operation_count <= config.max_etcd_txn_ops &&
+                   encoded_bytes <= config.max_etcd_txn_bytes
+               ? ErrorCode::OK
+               : ErrorCode::INVALID_PARAMS;
 }
 
 }  // namespace mooncake

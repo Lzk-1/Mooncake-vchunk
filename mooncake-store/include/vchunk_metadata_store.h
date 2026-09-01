@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,6 +17,9 @@ namespace mooncake {
 inline constexpr char kVChunkMetadataNamespace[] = "/mooncake/vchunk/v1";
 
 std::string MakeVChunkMetadataStoreKey(const VChunkMetadataRecord& record);
+ErrorCode ValidateVChunkEtcdTransaction(size_t operation_count,
+                                        size_t encoded_bytes,
+                                        const VChunkConfig& config);
 
 class VChunkMetadataStore {
    public:

@@ -74,7 +74,8 @@ ErrorCode VChunkConfig::Validate() const {
         reaper_interval_ms == 0 || reaper_max_scan == 0 ||
         read_timeout_ms == 0 || allocator_claim_timeout_ms == 0 ||
         membership_lease_ttl_sec < 3 || cleanup_max_attempts == 0 ||
-        cleanup_retry_backoff_ms == 0 || min_segments_per_replica == 0 ||
+        cleanup_retry_backoff_ms == 0 || max_etcd_txn_ops < 4 ||
+        max_etcd_txn_bytes == 0 || min_segments_per_replica == 0 ||
         min_stripe_slices == 0 || max_stripe_slices < min_stripe_slices ||
         !IsKnownSliceSize(fixed_slice_size) ||
         slice_threshold_4k_to_64k == 0 ||

@@ -82,6 +82,13 @@ TEST(VChunkConfigTest, ValidatesPlacementAndSlicePolicy) {
     config.slice_threshold_64k_to_256k =
         config.slice_threshold_4k_to_64k;
     EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+
+    config = VChunkConfig{};
+    config.max_etcd_txn_ops = 3;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
+    config.max_etcd_txn_ops = 4;
+    config.max_etcd_txn_bytes = 0;
+    EXPECT_EQ(config.Validate(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {

@@ -111,6 +111,11 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> next{0};
     std::atomic<uint64_t> succeeded{0};
     std::atomic<uint64_t> failed{0};
+    std::atomic<uint64_t> retries{0};
+    std::atomic<uint64_t> transfer_failures{0};
+    std::atomic<uint64_t> slices{0};
+    std::atomic<uint64_t> segment_participations{0};
+    std::atomic<uint64_t> slice_groups{0};
     std::vector<double> latencies(FLAGS_operations);
     std::vector<std::thread> workers;
     workers.reserve(FLAGS_concurrency);
@@ -180,6 +185,13 @@ int main(int argc, char** argv) {
                     failed.fetch_add(1);
                 }
             }
+            const auto metrics = client.MetricsSnapshot();
+            retries.fetch_add(metrics.retries);
+            transfer_failures.fetch_add(metrics.transfer_failures);
+            slices.fetch_add(metrics.slices);
+            segment_participations.fetch_add(
+                metrics.segment_participations);
+            slice_groups.fetch_add(metrics.slice_groups);
             finish_barrier.arrive_and_wait();
             engine.unregisterLocalMemory(source.data());
             engine.unregisterLocalMemory(destination.data());
@@ -217,11 +229,20 @@ int main(int argc, char** argv) {
               << "  \"operations\": " << FLAGS_operations << ",\n"
               << "  \"succeeded\": " << succeeded.load() << ",\n"
               << "  \"failed\": " << failed.load() << ",\n"
+              << "  \"vchunk_slices\": " << slices.load() << ",\n"
+              << "  \"segment_participations\": "
+              << segment_participations.load() << ",\n"
+              << "  \"slice_groups\": " << slice_groups.load() << ",\n"
+              << "  \"transfer_retries\": " << retries.load() << ",\n"
+              << "  \"transfer_failures\": " << transfer_failures.load()
+              << ",\n"
               << "  \"duration_seconds\": " << seconds << ",\n"
               << "  \"transactions_per_second\": "
               << succeeded.load() / seconds << ",\n"
               << "  \"data_gib_per_second\": " << gib / seconds << ",\n"
               << "  \"latency_p50_us\": " << Percentile(latencies, 0.50)
+              << ",\n"
+              << "  \"latency_p95_us\": " << Percentile(latencies, 0.95)
               << ",\n"
               << "  \"latency_p99_us\": " << Percentile(latencies, 0.99)
               << "\n}\n";
