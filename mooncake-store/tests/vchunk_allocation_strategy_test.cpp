@@ -183,5 +183,46 @@ TEST(VChunkAllocationStrategyTest, RejectsInvalidAndEmptyInputs) {
     EXPECT_EQ(no_replicas.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(VChunkAllocationStrategyTest, LimitsSegmentsPerReplica) {
+    AllocatorManager manager;
+    for (size_t i = 0; i < 4; ++i) {
+        auto allocator = std::make_shared<VChunkTestAllocator>(
+            "segment-" + std::to_string(i),
+            0xB00000000ULL + i * 0x100000, 64U * 1024U);
+        manager.addAllocator(allocator->getSegmentName(), allocator);
+    }
+    VChunkConfig config;
+    config.max_segments_per_replica = 2;
+    config.max_segments_per_vchunk = 3;
+    config.allow_segment_limit_fallback = false;
+
+    auto result = AllocateVChunk(manager, 8U * 4096U,
+                                 VCSliceSizeLevel::k4K, {}, 1, config);
+    ASSERT_TRUE(result.has_value());
+    std::unordered_set<std::string> segments;
+    for (const auto& allocation : result->allocations) {
+        segments.insert(allocation.segment_name);
+    }
+    EXPECT_LE(segments.size(), 2U);
+}
+
+TEST(VChunkAllocationStrategyTest, FallsBackWhenSegmentLimitIsTooStrict) {
+    AllocatorManager manager;
+    for (size_t i = 0; i < 2; ++i) {
+        auto allocator = std::make_shared<VChunkTestAllocator>(
+            "segment-" + std::to_string(i),
+            0xC00000000ULL + i * 0x100000, 4096U);
+        manager.addAllocator(allocator->getSegmentName(), allocator);
+    }
+    VChunkConfig config;
+    config.max_segments_per_replica = 1;
+    config.allow_segment_limit_fallback = true;
+
+    auto result = AllocateVChunk(manager, 2U * 4096U,
+                                 VCSliceSizeLevel::k4K, {}, 1, config);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->allocations.size(), 2U);
+}
+
 }  // namespace
 }  // namespace mooncake

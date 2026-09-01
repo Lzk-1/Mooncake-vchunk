@@ -487,6 +487,13 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32(
         "vchunk_max_recovering_attempts",
         &master_config.vchunk_config.max_recovering_attempts, 2);
+    uint32_t vchunk_replica_num = 1;
+    default_config.GetUInt32("vchunk_replica_num", &vchunk_replica_num, 1);
+    if (vchunk_replica_num == 0 || vchunk_replica_num > 255) {
+        LOG(FATAL) << "Invalid vchunk_replica_num: " << vchunk_replica_num;
+    }
+    master_config.vchunk_config.replica_num =
+        static_cast<uint8_t>(vchunk_replica_num);
     default_config.GetUInt32("vchunk_max_replica_count",
                              &master_config.vchunk_config.max_replica_count, 3);
     default_config.GetUInt32("vchunk_max_slice_count",
@@ -532,6 +539,58 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool(
         "vchunk_verify_recovered_data",
         &master_config.vchunk_config.verify_recovered_data, true);
+    std::string vchunk_slice_policy;
+    default_config.GetString("vchunk_slice_policy", &vchunk_slice_policy,
+                             "auto");
+    if (auto policy = mooncake::ParseVChunkSlicePolicy(vchunk_slice_policy)) {
+        master_config.vchunk_config.slice_policy = *policy;
+    } else {
+        LOG(FATAL) << "Invalid vchunk_slice_policy: " << vchunk_slice_policy;
+    }
+    std::string vchunk_fixed_slice_size;
+    default_config.GetString("vchunk_fixed_slice_size",
+                             &vchunk_fixed_slice_size, "64K");
+    if (auto size = mooncake::ParseVChunkSliceSize(vchunk_fixed_slice_size)) {
+        master_config.vchunk_config.fixed_slice_size = *size;
+    } else {
+        LOG(FATAL) << "Invalid vchunk_fixed_slice_size: "
+                   << vchunk_fixed_slice_size;
+    }
+    default_config.GetUInt64(
+        "vchunk_slice_threshold_4k_to_64k",
+        &master_config.vchunk_config.slice_threshold_4k_to_64k,
+        64U * 1024U);
+    default_config.GetUInt64(
+        "vchunk_slice_threshold_64k_to_256k",
+        &master_config.vchunk_config.slice_threshold_64k_to_256k,
+        256U * 1024U);
+    default_config.GetUInt64(
+        "vchunk_slice_threshold_256k_to_1m",
+        &master_config.vchunk_config.slice_threshold_256k_to_1m,
+        1024U * 1024U);
+    default_config.GetUInt32(
+        "vchunk_min_segments_per_replica",
+        &master_config.vchunk_config.min_segments_per_replica, 1);
+    default_config.GetUInt32(
+        "vchunk_max_segments_per_replica",
+        &master_config.vchunk_config.max_segments_per_replica, 0);
+    default_config.GetUInt32(
+        "vchunk_max_segments_per_vchunk",
+        &master_config.vchunk_config.max_segments_per_vchunk, 0);
+    default_config.GetBool(
+        "vchunk_allow_segment_limit_fallback",
+        &master_config.vchunk_config.allow_segment_limit_fallback, true);
+    default_config.GetUInt32("vchunk_min_stripe_slices",
+                             &master_config.vchunk_config.min_stripe_slices, 1);
+    default_config.GetUInt32("vchunk_max_stripe_slices",
+                             &master_config.vchunk_config.max_stripe_slices,
+                             256);
+    default_config.GetUInt32("vchunk_cleanup_max_attempts",
+                             &master_config.vchunk_config.cleanup_max_attempts,
+                             8);
+    default_config.GetUInt64(
+        "vchunk_cleanup_retry_backoff_ms",
+        &master_config.vchunk_config.cleanup_retry_backoff_ms, 100);
     default_config.GetString("cxl_path", &master_config.cxl_path,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,

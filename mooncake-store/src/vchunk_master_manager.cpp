@@ -345,7 +345,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
     }
 
     const auto slice_size_level =
-        SelectVChunkSliceSize(total_size, is_ssd_segment);
+        SelectVChunkSliceSize(total_size, is_ssd_segment, config_);
     const uint64_t slice_size = SliceSizeLevelToBytes(slice_size_level);
     if (total_size > std::numeric_limits<uint64_t>::max() - (slice_size - 1) ||
         (total_size + slice_size - 1) / slice_size >
@@ -356,7 +356,7 @@ tl::expected<VChunkMetadataRecord, ErrorCode> VChunkMasterManager::PutStart(
 
     auto allocation = AllocateVChunk(allocator_manager, total_size,
                                      slice_size_level, excluded_segments,
-                                     config_.replica_num);
+                                     config_.replica_num, config_);
     if (!allocation) {
         ReleasePendingPut(scoped_key);
         metrics_->AddAllocationFailure();

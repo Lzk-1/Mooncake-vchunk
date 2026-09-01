@@ -177,6 +177,17 @@ ErrorCode TransferEngineVChunkDataPlane::Read(
     return ReadAttempt(record, destination, length, deadline, {}).error;
 }
 
+TransferEngineVChunkDataPlane::~TransferEngineVChunkDataPlane() {
+    std::vector<std::thread> drainers;
+    {
+        std::lock_guard<std::mutex> guard(drainer_mutex_);
+        drainers.swap(drainers_);
+    }
+    for (auto& drainer : drainers) {
+        if (drainer.joinable()) drainer.join();
+    }
+}
+
 VChunkDataPlane::ReadAttemptResult TransferEngineVChunkDataPlane::ReadAttempt(
     const VChunkMetadataRecord& record, void* destination, size_t length,
     std::chrono::steady_clock::time_point deadline,
@@ -216,7 +227,6 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
     };
     std::vector<ActiveBatch> active;
     active.reserve(batches->size());
-    bool submit_failed = false;
     for (const auto& batch : *batches) {
         auto guard = std::make_unique<BatchGuard>(engine_, batch.requests.size());
         if (guard->id() == INVALID_BATCH_ID) {
@@ -226,20 +236,67 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
         for (const auto& request : batch.requests) {
             expected_bytes += request.length;
         }
+        active.push_back(ActiveBatch{batch.segment_name, std::move(guard),
+                                     expected_bytes, false, false});
+    }
+    bool submit_failed = false;
+    for (size_t i = 0; i < batches->size(); ++i) {
         bool finished = false;
         bool failed = false;
+        auto& guard = active[i].guard;
+        const auto& batch = (*batches)[i];
         if (!engine_.submitTransfer(guard->id(), batch.requests).ok()) {
             submit_failed = true;
             failed = true;
             finished = guard->TryFree();
         }
-        active.push_back(ActiveBatch{batch.segment_name, std::move(guard),
-                                     expected_bytes, finished, failed});
+        active[i].finished = finished;
+        active[i].failed = failed;
     }
-    bool deadline_exceeded = false;
     for (;;) {
-        deadline_exceeded = deadline_exceeded ||
-                            std::chrono::steady_clock::now() >= deadline;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            if (failed_segments != nullptr) {
+                for (const auto& batch : active) {
+                    if (!batch.finished || batch.failed) {
+                        failed_segments->push_back(batch.segment_name);
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> guard(drainer_mutex_);
+            drainers_.emplace_back(
+                [this, pending = std::move(active)]() mutable {
+                    for (;;) {
+                        bool all_finished = true;
+                        for (auto& batch : pending) {
+                            if (batch.finished) continue;
+                            all_finished = false;
+                            TransferStatus status{};
+                            if (!engine_
+                                     .getBatchTransferStatus(batch.guard->id(),
+                                                             status)
+                                     .ok()) {
+                                continue;
+                            }
+                            batch.finished =
+                                status.s == TransferStatusEnum::COMPLETED ||
+                                status.s == TransferStatusEnum::FAILED ||
+                                status.s == TransferStatusEnum::TIMEOUT ||
+                                status.s == TransferStatusEnum::CANCELED ||
+                                status.s == TransferStatusEnum::INVALID;
+                        }
+                        if (all_finished ||
+                            std::all_of(pending.begin(), pending.end(),
+                                        [](const ActiveBatch& batch) {
+                                            return batch.finished;
+                                        })) {
+                            return;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                });
+            return ErrorCode::RPC_TIMEOUT;
+        }
         bool all_finished = true;
         for (auto& batch : active) {
             if (batch.finished) continue;
@@ -266,7 +323,6 @@ ErrorCode TransferEngineVChunkDataPlane::Transfer(
             active.begin(), active.end(),
             [](const ActiveBatch& batch) { return batch.finished; });
         if (all_finished) {
-            if (deadline_exceeded) return ErrorCode::RPC_TIMEOUT;
             const bool transfer_failed =
                 submit_failed ||
                 std::any_of(active.begin(), active.end(),

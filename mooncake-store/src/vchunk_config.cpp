@@ -28,13 +28,38 @@ tl::expected<VChunkHAMode, ErrorCode> ParseVChunkHAMode(
 
 VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
                                       bool is_ssd_segment) {
-    if (is_ssd_segment || value_size < 64U * 1024U) {
+    return SelectVChunkSliceSize(value_size, is_ssd_segment, VChunkConfig{});
+}
+
+tl::expected<VChunkSlicePolicy, ErrorCode> ParseVChunkSlicePolicy(
+    const std::string& value) {
+    if (value == "auto") return VChunkSlicePolicy::AUTO;
+    if (value == "fixed") return VChunkSlicePolicy::FIXED;
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+tl::expected<VCSliceSizeLevel, ErrorCode> ParseVChunkSliceSize(
+    const std::string& value) {
+    if (value == "4K") return VCSliceSizeLevel::k4K;
+    if (value == "64K") return VCSliceSizeLevel::k64K;
+    if (value == "256K") return VCSliceSizeLevel::k256K;
+    if (value == "1M") return VCSliceSizeLevel::k1M;
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
+                                      bool is_ssd_segment,
+                                      const VChunkConfig& config) {
+    if (config.slice_policy == VChunkSlicePolicy::FIXED) {
+        return config.fixed_slice_size;
+    }
+    if (is_ssd_segment || value_size < config.slice_threshold_4k_to_64k) {
         return VCSliceSizeLevel::k4K;
     }
-    if (value_size < 256U * 1024U) {
+    if (value_size < config.slice_threshold_64k_to_256k) {
         return VCSliceSizeLevel::k64K;
     }
-    if (value_size < 1024U * 1024U) {
+    if (value_size < config.slice_threshold_256k_to_1m) {
         return VCSliceSizeLevel::k256K;
     }
     return VCSliceSizeLevel::k1M;

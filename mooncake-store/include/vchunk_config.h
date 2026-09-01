@@ -10,6 +10,8 @@
 
 namespace mooncake {
 
+struct VChunkConfig;
+
 enum class VCSliceSizeLevel : uint32_t {
     k4K = 4U * 1024U,
     k64K = 64U * 1024U,
@@ -31,6 +33,10 @@ enum class VChunkSlicePolicy : uint8_t {
 
 tl::expected<VChunkHAMode, ErrorCode> ParseVChunkHAMode(
     const std::string& value);
+tl::expected<VChunkSlicePolicy, ErrorCode> ParseVChunkSlicePolicy(
+    const std::string& value);
+tl::expected<VCSliceSizeLevel, ErrorCode> ParseVChunkSliceSize(
+    const std::string& value);
 
 constexpr uint32_t SliceSizeLevelToBytes(VCSliceSizeLevel level) {
     return static_cast<uint32_t>(level);
@@ -38,6 +44,9 @@ constexpr uint32_t SliceSizeLevelToBytes(VCSliceSizeLevel level) {
 
 VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
                                       bool is_ssd_segment);
+VCSliceSizeLevel SelectVChunkSliceSize(uint64_t value_size,
+                                      bool is_ssd_segment,
+                                      const VChunkConfig& config);
 
 struct VChunkConfig {
     bool enabled{false};

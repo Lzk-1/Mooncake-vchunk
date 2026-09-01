@@ -53,6 +53,7 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     const AllocatorManager& allocator_manager, uint64_t total_size,
     VCSliceSizeLevel slice_size_level,
     const std::set<std::string>& excluded_segments = {},
-    uint8_t replica_num = 1);
+    uint8_t replica_num = 1,
+    const VChunkConfig& config = VChunkConfig{});
 
 }  // namespace mooncake

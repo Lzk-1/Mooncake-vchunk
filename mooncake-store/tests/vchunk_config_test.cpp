@@ -100,6 +100,25 @@ TEST(VChunkConfigTest, SelectsMemorySliceBoundaries) {
               VCSliceSizeLevel::k1M);
 }
 
+TEST(VChunkConfigTest, SelectsConfiguredFixedAndAutomaticSliceSizes) {
+    VChunkConfig config;
+    config.slice_policy = VChunkSlicePolicy::FIXED;
+    config.fixed_slice_size = VCSliceSizeLevel::k256K;
+    EXPECT_EQ(SelectVChunkSliceSize(4096, false, config),
+              VCSliceSizeLevel::k256K);
+
+    config.slice_policy = VChunkSlicePolicy::AUTO;
+    config.slice_threshold_4k_to_64k = 128U * 1024U;
+    config.slice_threshold_64k_to_256k = 512U * 1024U;
+    config.slice_threshold_256k_to_1m = 2U * 1024U * 1024U;
+    EXPECT_EQ(SelectVChunkSliceSize(100U * 1024U, false, config),
+              VCSliceSizeLevel::k4K);
+    EXPECT_EQ(SelectVChunkSliceSize(256U * 1024U, false, config),
+              VCSliceSizeLevel::k64K);
+    EXPECT_EQ(SelectVChunkSliceSize(1024U * 1024U, false, config),
+              VCSliceSizeLevel::k256K);
+}
+
 TEST(VChunkConfigTest, DynamicMembershipRequiresRoutingAndLeaseBudget) {
     VChunkConfig config;
     config.enable_dynamic_membership = true;
@@ -128,6 +147,17 @@ TEST(VChunkConfigTest, ParsesExplicitHaModes) {
               VChunkHAMode::RECOVERABLE);
     EXPECT_EQ(ParseVChunkHAMode("unsafe").error(),
               ErrorCode::INVALID_PARAMS);
+}
+
+TEST(VChunkConfigTest, ParsesSliceConfiguration) {
+    EXPECT_EQ(*ParseVChunkSlicePolicy("auto"), VChunkSlicePolicy::AUTO);
+    EXPECT_EQ(*ParseVChunkSlicePolicy("fixed"), VChunkSlicePolicy::FIXED);
+    EXPECT_FALSE(ParseVChunkSlicePolicy("adaptive").has_value());
+    EXPECT_EQ(*ParseVChunkSliceSize("4K"), VCSliceSizeLevel::k4K);
+    EXPECT_EQ(*ParseVChunkSliceSize("64K"), VCSliceSizeLevel::k64K);
+    EXPECT_EQ(*ParseVChunkSliceSize("256K"), VCSliceSizeLevel::k256K);
+    EXPECT_EQ(*ParseVChunkSliceSize("1M"), VCSliceSizeLevel::k1M);
+    EXPECT_FALSE(ParseVChunkSliceSize("4096").has_value());
 }
 
 }  // namespace

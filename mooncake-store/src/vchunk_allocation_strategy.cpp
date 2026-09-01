@@ -10,6 +10,19 @@
 namespace mooncake {
 namespace {
 
+tl::expected<VChunkAllocationResult, ErrorCode> RetryWithoutSegmentLimits(
+    const AllocatorManager& allocator_manager, uint64_t total_size,
+    VCSliceSizeLevel slice_size_level,
+    const std::set<std::string>& excluded_segments, uint8_t replica_num,
+    const VChunkConfig& config) {
+    auto fallback = config;
+    fallback.max_segments_per_replica = 0;
+    fallback.max_segments_per_vchunk = 0;
+    fallback.allow_segment_limit_fallback = false;
+    return AllocateVChunk(allocator_manager, total_size, slice_size_level,
+                          excluded_segments, replica_num, fallback);
+}
+
 struct Candidate {
     std::string name;
     const std::vector<std::shared_ptr<BufferAllocatorBase>>* allocators;
@@ -44,7 +57,8 @@ std::unique_ptr<AllocatedBuffer> AllocateFromCandidate(Candidate& candidate,
 tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     const AllocatorManager& allocator_manager, uint64_t total_size,
     VCSliceSizeLevel slice_size_level,
-    const std::set<std::string>& excluded_segments, uint8_t replica_num) {
+    const std::set<std::string>& excluded_segments, uint8_t replica_num,
+    const VChunkConfig& config) {
     const uint64_t slice_size = SliceSizeLevelToBytes(slice_size_level);
     if (total_size == 0 || slice_size == 0 || replica_num == 0 ||
         total_size > std::numeric_limits<uint64_t>::max() - (slice_size - 1)) {
@@ -88,11 +102,40 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
     if (replica_num > candidates.size()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& lhs, const Candidate& rhs) {
+                  if (lhs.remaining_slices != rhs.remaining_slices) {
+                      return lhs.remaining_slices > rhs.remaining_slices;
+                  }
+                  return lhs.name < rhs.name;
+              });
+    if (config.max_segments_per_vchunk != 0 &&
+        candidates.size() > config.max_segments_per_vchunk) {
+        candidates.resize(config.max_segments_per_vchunk);
+    }
+    if (replica_num > candidates.size() ||
+        config.min_segments_per_replica > candidates.size()) {
+        if (config.allow_segment_limit_fallback &&
+            config.max_segments_per_vchunk != 0) {
+            return RetryWithoutSegmentLimits(
+                allocator_manager, total_size, slice_size_level,
+                excluded_segments, replica_num, config);
+        }
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
 
     const auto slice_count = static_cast<uint32_t>(slice_count_u64);
     VChunkAllocationResult result;
     result.replica_num = replica_num;
-    result.row_size = std::min<size_t>(slice_count, candidates.size());
+    const size_t segments_per_replica =
+        config.max_segments_per_replica == 0
+            ? candidates.size()
+            : std::min<size_t>(candidates.size(),
+                               config.max_segments_per_replica);
+    if (segments_per_replica < config.min_segments_per_replica) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    result.row_size = std::min<size_t>(slice_count, segments_per_replica);
     result.allocations.reserve(static_cast<size_t>(slice_count) * replica_num);
     const size_t start_offset = randomIndex(candidates.size());
     std::vector<std::unordered_set<std::string>> slice_segments(slice_count);
@@ -102,17 +145,19 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
              row_start += result.row_size) {
             std::unordered_set<std::string> used_in_row;
             used_in_row.reserve(result.row_size);
-            const size_t row = row_start / result.row_size;
             const size_t row_width = std::min<size_t>(
                 result.row_size, slice_count - row_start);
             for (size_t column = 0; column < row_width; ++column) {
                 const auto slice_index =
                     static_cast<uint32_t>(row_start + column);
                 bool allocated = false;
-                for (size_t attempt = 0; attempt < candidates.size();
+                for (size_t attempt = 0; attempt < segments_per_replica;
                      ++attempt) {
                     const size_t index =
-                        (start_offset + replica + row + column + attempt) %
+                        (start_offset +
+                         static_cast<size_t>(replica) *
+                             segments_per_replica +
+                         column + attempt) %
                         candidates.size();
                     auto& candidate = candidates[index];
                     if (used_in_row.contains(candidate.name) ||
@@ -151,6 +196,14 @@ tl::expected<VChunkAllocationResult, ErrorCode> AllocateVChunk(
                     break;
                 }
                 if (!allocated) {
+                    if (config.allow_segment_limit_fallback &&
+                        (config.max_segments_per_replica != 0 ||
+                         config.max_segments_per_vchunk != 0)) {
+                        result.allocations.clear();
+                        return RetryWithoutSegmentLimits(
+                            allocator_manager, total_size, slice_size_level,
+                            excluded_segments, replica_num, config);
+                    }
                     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
                 }
             }
