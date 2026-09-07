@@ -389,6 +389,145 @@ ErrorCode EtcdViewStore::LoadAllSegmentOwners(
     return ErrorCode::OK;
 }
 
+// ---- Segment neutral entity (segments/{segment_id}) ----
+
+ErrorCode EtcdViewStore::SerializeSegmentDescriptor(
+    const SegmentDescriptor& desc, std::string& out) {
+    try {
+        struct_json::to_json(desc, out);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeSegmentDescriptor failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode EtcdViewStore::DeserializeSegmentDescriptor(
+    const std::string& in, SegmentDescriptor& out) {
+    try {
+        struct_json::from_json(out, in);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeSegmentDescriptor failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode EtcdViewStore::SaveSegmentDescriptor(
+    const std::string& cluster_namespace, const SegmentDescriptor& desc) {
+    const std::string key =
+        SegmentNeutralEntityKey(cluster_namespace, desc.segment_id);
+    std::string value;
+    ErrorCode err = SerializeSegmentDescriptor(desc, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
+}
+
+ErrorCode EtcdViewStore::LoadSegmentDescriptor(
+    const std::string& cluster_namespace, const std::string& segment_id,
+    SegmentDescriptor& out, ViewVersionId& version) {
+    const std::string key =
+        SegmentNeutralEntityKey(cluster_namespace, segment_id);
+    std::string value;
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    return DeserializeSegmentDescriptor(value, out);
+}
+
+ErrorCode EtcdViewStore::DeleteSegmentDescriptor(
+    const std::string& cluster_namespace, const std::string& segment_id) {
+    const std::string key =
+        SegmentNeutralEntityKey(cluster_namespace, segment_id);
+    const std::string end = PrefixEnd(key);
+    return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
+                                   end.size());
+}
+
+// ---- Per-master segment mount (submaster_snapshot/{id}/segments/{seg}) ----
+
+ErrorCode EtcdViewStore::SerializeMountEntry(const MountEntry& entry,
+                                             std::string& out) {
+    try {
+        struct_json::to_json(entry, out);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeMountEntry failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode EtcdViewStore::DeserializeMountEntry(const std::string& in,
+                                               MountEntry& out) {
+    try {
+        struct_json::from_json(out, in);
+        return ErrorCode::OK;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeMountEntry failed: " << e.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode EtcdViewStore::SaveMountEntryWithLease(
+    const std::string& cluster_namespace, const std::string& master_id,
+    const MountEntry& entry, EtcdLeaseId lease_id) {
+    const std::string key =
+        SubmasterSegmentMountKey(cluster_namespace, master_id, entry.segment_id);
+    std::string value;
+    ErrorCode err = SerializeMountEntry(entry, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    return EtcdHelper::PutWithLease(key.data(), key.size(), value.data(),
+                                    value.size(), lease_id);
+}
+
+ErrorCode EtcdViewStore::DeleteMountEntry(
+    const std::string& cluster_namespace, const std::string& master_id,
+    const std::string& segment_id) {
+    const std::string key =
+        SubmasterSegmentMountKey(cluster_namespace, master_id, segment_id);
+    const std::string end = PrefixEnd(key);
+    return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
+                                   end.size());
+}
+
+ErrorCode EtcdViewStore::LoadSubmasterSegmentMounts(
+    const std::string& cluster_namespace, const std::string& master_id,
+    std::vector<MountEntry>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix =
+        SubmasterSegmentsPrefix(cluster_namespace, master_id);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    std::vector<std::pair<std::string, std::string>> kvs;
+    err = ParseRangeJson(json, kvs);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        MountEntry entry;
+        err = DeserializeMountEntry(kv.second, entry);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        out.push_back(std::move(entry));
+    }
+    return ErrorCode::OK;
+}
+
 // ---- Master registration ----
 
 ErrorCode EtcdViewStore::RegisterMaster(const std::string& cluster_namespace,

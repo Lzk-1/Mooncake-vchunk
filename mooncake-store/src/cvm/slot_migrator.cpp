@@ -221,8 +221,10 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
     // kReaffirmIntervalCycles 个周期一次）。slot key 附着在 lease 上，
     // keepalive 持续保活即不过期；逐周期重写等值 value 只会线性堆积 etcd
     // MVCC revision（曾以 ~3k put/s 的速率写满 backend 配额）。正常稳态
-    // 下 lease 存活即代表所有权持续有效，无需重写。
-    constexpr uint64_t kReaffirmIntervalCycles = 12;  // ~60s @ 5s heartbeat
+    // 下 lease 存活即代表所有权持续有效，无需重写。间隔取 60（5min）与
+    // etcd auto-compaction-retention=5m 对齐：每个突发产生的历史在下个
+    // 突发前即被压缩清空，dbSize 贴地；且仍保持 5min 一次的高频安全网。
+    constexpr uint64_t kReaffirmIntervalCycles = 60;  // 60*5s=5min @ 5s heartbeat
     const bool do_reaffirm = (++reconcile_cycles_ % kReaffirmIntervalCycles) == 0;
     if (do_reaffirm) {
         for (uint16_t slot : cur) {

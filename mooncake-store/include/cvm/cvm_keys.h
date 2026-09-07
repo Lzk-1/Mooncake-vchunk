@@ -96,5 +96,38 @@ inline std::string SegmentViewSnapshotKey(const std::string& cluster_namespace) 
     return SnapshotPrefix(cluster_namespace) + "segment_view";
 }
 
+// ---- New segment neutral entity + per-master mount keys (§3 view layout) ----
+
+// "/cvm/<namespace>/segments/"
+inline std::string SegmentNeutralEntityPrefix(
+    const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "segments/";
+}
+
+// "/cvm/<namespace>/segments/<segment_id>"
+inline std::string SegmentNeutralEntityKey(const std::string& cluster_namespace,
+                                           const std::string& segment_id) {
+    return SegmentNeutralEntityPrefix(cluster_namespace) + segment_id;
+}
+
+// "/cvm/<namespace>/submaster_snapshot/"
+inline std::string SubmasterSnapshotPrefix(
+    const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "submaster_snapshot/";
+}
+
+// "/cvm/<namespace>/submaster_snapshot/<master_id>/segments/"
+inline std::string SubmasterSegmentsPrefix(
+    const std::string& cluster_namespace, const std::string& master_id) {
+    return SubmasterSnapshotPrefix(cluster_namespace) + master_id + "/segments/";
+}
+
+// "/cvm/<namespace>/submaster_snapshot/<master_id>/segments/<segment_id>"
+inline std::string SubmasterSegmentMountKey(
+    const std::string& cluster_namespace, const std::string& master_id,
+    const std::string& segment_id) {
+    return SubmasterSegmentsPrefix(cluster_namespace, master_id) + segment_id;
+}
+
 }  // namespace cvm
 }  // namespace mooncake

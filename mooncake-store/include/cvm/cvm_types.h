@@ -57,6 +57,42 @@ struct SegmentOwner {
 YLT_REFL(SegmentOwner, segment_id, owner_master_id, state);
 
 // ---------------------------------------------------------------------------
+// Segment neutral entity (one per segment, no owner) — replaces the old
+// single-owner SegmentView model.  Stored under segments/{segment_id}.
+// ---------------------------------------------------------------------------
+
+// Lightweight per-master mount record.  key = (master_id, segment_id) naturally
+// supports one-segment-multi-master mounting without overwrite conflicts.
+struct MountEntry {
+    std::string segment_id;
+    int64_t mounted_at_ms{0};
+    // Future: partition_slot_starts for psegment/vsegment partial mount
+    std::vector<uint16_t> partition_slot_starts;
+};
+YLT_REFL(MountEntry, segment_id, mounted_at_ms, partition_slot_starts);
+
+// Neutral descriptor of a segment — authoritative copy lives under
+// segments/{segment_id} and is written once per segment (idempotent).
+struct SegmentDescriptor {
+    std::string segment_id;
+    std::string segment_name;
+    size_t capacity{0};
+    std::string te_endpoint;  // transport endpoint, e.g. "host:port"
+    std::string protocol;
+    std::string host_id;
+    // Future: partitions for psegment/vsegment split
+    struct Partition {
+        uint16_t slot_start{0};
+        uint16_t slot_end{0};
+        uint64_t offset{0};
+        uint64_t length{0};
+    };
+    std::vector<Partition> partitions;
+};
+YLT_REFL(SegmentDescriptor, segment_id, segment_name, capacity, te_endpoint,
+         protocol, host_id, partitions);
+
+// ---------------------------------------------------------------------------
 // Master registration: liveness + role, persisted under an etcd lease
 // ---------------------------------------------------------------------------
 

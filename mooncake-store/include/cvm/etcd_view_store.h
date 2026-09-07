@@ -68,7 +68,7 @@ class EtcdViewStore {
                                        std::vector<SlotOwner>& out,
                                        ViewVersionId& version);
 
-    // ---- Segment view (reserved) ----
+    // ---- Segment view (reserved, deprecated in favor of per-master mount) ----
     static ErrorCode LoadSegmentOwner(const std::string& cluster_namespace,
                                       const std::string& segment_id,
                                       SegmentOwner& out,
@@ -83,6 +83,36 @@ class EtcdViewStore {
     static ErrorCode LoadAllSegmentOwners(const std::string& cluster_namespace,
                                           std::vector<SegmentOwner>& out,
                                           ViewVersionId& version);
+
+    // ---- Segment neutral entity (segments/{segment_id}) ----
+    static ErrorCode SerializeSegmentDescriptor(const SegmentDescriptor& desc,
+                                                std::string& out);
+    static ErrorCode DeserializeSegmentDescriptor(const std::string& in,
+                                                  SegmentDescriptor& out);
+    static ErrorCode SaveSegmentDescriptor(const std::string& cluster_namespace,
+                                           const SegmentDescriptor& desc);
+    static ErrorCode LoadSegmentDescriptor(const std::string& cluster_namespace,
+                                           const std::string& segment_id,
+                                           SegmentDescriptor& out,
+                                           ViewVersionId& version);
+    static ErrorCode DeleteSegmentDescriptor(
+        const std::string& cluster_namespace, const std::string& segment_id);
+
+    // ---- Per-master segment mount (submaster_snapshot/{id}/segments/{seg}) ----
+    static ErrorCode SerializeMountEntry(const MountEntry& entry,
+                                         std::string& out);
+    static ErrorCode DeserializeMountEntry(const std::string& in,
+                                           MountEntry& out);
+    static ErrorCode SaveMountEntryWithLease(const std::string& cluster_namespace,
+                                             const std::string& master_id,
+                                             const MountEntry& entry,
+                                             EtcdLeaseId lease_id);
+    static ErrorCode DeleteMountEntry(const std::string& cluster_namespace,
+                                      const std::string& master_id,
+                                      const std::string& segment_id);
+    static ErrorCode LoadSubmasterSegmentMounts(
+        const std::string& cluster_namespace, const std::string& master_id,
+        std::vector<MountEntry>& out, ViewVersionId& version);
 
     // ---- Master registration ----
     static ErrorCode RegisterMaster(const std::string& cluster_namespace,

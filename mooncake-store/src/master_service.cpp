@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -1395,25 +1396,52 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
         cluster_id_.empty()) {
         return;
     }
-    cvm::SegmentOwner owner;
-    owner.segment_id = UuidToString(segment.id);
-    owner.owner_master_id = master_id_;
-    owner.state = static_cast<int32_t>(cvm::SegmentOwnerState::kStable);
+    const std::string seg_id = UuidToString(segment.id);
 
-    // Bind to the supervisor-owned CvmController's lease so segment ownership
-    // is auto-removed when this master dies; fall back to a persistent record
-    // when no lease has been injected yet.
-    ErrorCode err;
+    // 1. Write neutral SegmentDescriptor to segments/{seg_id} (idempotent,
+    //    without lease — one copy per segment, no owner).
+    cvm::SegmentDescriptor desc;
+    desc.segment_id = seg_id;
+    desc.segment_name = segment.name;
+    desc.capacity = segment.size;
+    desc.te_endpoint = segment.te_endpoint;
+    desc.protocol = segment.protocol;
+    desc.host_id = segment.host_id;
+    ErrorCode err =
+        cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "PublishSegmentOwnerForCvm SaveSegmentDescriptor "
+                        "failed: segment="
+                     << seg_id << " err=" << err;
+    }
+
+    // 2. Write per-master MountEntry to
+    //    submaster_snapshot/{master_id}/segments/{seg_id} (with lease —
+    //    auto-cleaned on master death; key=(master_id, segment_id) naturally
+    //    supports one-segment-multi-master without overwrite conflicts).
+    cvm::MountEntry mount;
+    mount.segment_id = seg_id;
+    mount.mounted_at_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
     if (cvm_lease_id_ != 0) {
-        err = cvm::EtcdViewStore::SaveSegmentOwnerWithLease(
-            cluster_id_, owner, cvm_lease_id_);
+        err = cvm::EtcdViewStore::SaveMountEntryWithLease(
+            cluster_id_, master_id_, mount, cvm_lease_id_);
     } else {
-        err = cvm::EtcdViewStore::SaveSegmentOwner(cluster_id_, owner);
+        // Fallback: write persistent MountEntry without lease.
+        const std::string key = cvm::SubmasterSegmentMountKey(
+            cluster_id_, master_id_, seg_id);
+        std::string value;
+        cvm::EtcdViewStore::SerializeMountEntry(mount, value);
+        err = EtcdHelper::Put(key.data(), key.size(), value.data(),
+                              value.size());
     }
     if (err != ErrorCode::OK) {
-        LOG(WARNING) << "PublishSegmentOwnerForCvm SaveSegmentOwner failed: "
-                        "segment="
-                     << owner.segment_id << " err=" << err;
+        LOG(WARNING) << "PublishSegmentOwnerForCvm SaveMountEntryWithLease "
+                        "failed: segment="
+                     << seg_id << " master=" << master_id_
+                     << " err=" << err;
     }
 }
 
@@ -1423,11 +1451,15 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
         return;
     }
     const std::string id = UuidToString(segment_id);
-    ErrorCode err = cvm::EtcdViewStore::DeleteSegmentOwner(cluster_id_, id);
+
+    // Delete only this master's MountEntry; the neutral SegmentDescriptor
+    // stays if other submasters still have this segment mounted.
+    ErrorCode err =
+        cvm::EtcdViewStore::DeleteMountEntry(cluster_id_, master_id_, id);
     if (err != ErrorCode::OK) {
-        LOG(WARNING) << "RemoveSegmentOwnerForCvm DeleteSegmentOwner failed: "
+        LOG(WARNING) << "RemoveSegmentOwnerForCvm DeleteMountEntry failed: "
                         "segment="
-                     << id << " err=" << err;
+                     << id << " master=" << master_id_ << " err=" << err;
     }
 }
 
