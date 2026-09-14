@@ -23,6 +23,7 @@ set(MOONCAKE_STORE_SOURCES
     cvm/cvm_http_server.cpp
     cvm/inter_master_rpc.cpp
     partition/partition_router.cpp
+    vsegment/vsegment.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp

@@ -309,6 +309,8 @@ enum class ErrorCode : int32_t {
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
     CLIENT_NOT_FOUND = -103,          ///< Client not found.
+    VSEGMENT_STATIC_QUOTA_INSUFFICIENT =
+        -104,  ///< Partition quota cannot satisfy the configured layout.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
