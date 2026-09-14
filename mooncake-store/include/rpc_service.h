@@ -96,24 +96,6 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
-        const std::string& tenant_id, const std::string& key,
-        uint64_t total_size, int64_t now_ms);
-    tl::expected<void, ErrorCode> VChunkPutEnd(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id, int64_t now_ms);
-    tl::expected<void, ErrorCode> VChunkPutRevoke(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id);
-    tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
-        const std::string& tenant_id, const std::string& key);
-    tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
-        const std::string& lease_id);
-    tl::expected<void, ErrorCode> RemoveVChunk(const std::string& tenant_id,
-                                               const std::string& key,
-                                               int64_t now_ms);
-    VChunkRuntimeInfo GetVChunkRuntimeInfo();
-
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
