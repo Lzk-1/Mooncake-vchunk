@@ -77,7 +77,7 @@ struct ClientSlice {
 };
 
 struct TransferSubRequest {
-    uint32_t sequence{0};
+    uint64_t sequence{0};
     uint64_t client_buffer_offset{0};
     uint64_t client_address{0};
     std::string segment_id;

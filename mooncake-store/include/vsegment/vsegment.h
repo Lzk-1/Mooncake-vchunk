@@ -11,7 +11,8 @@
 
 namespace mooncake::vsegment {
 
-enum class Lifecycle : uint8_t { PREPARING, ACTIVE, DRAINING, DEGRADED };
+enum class MappingAlgorithm : uint8_t { ROUND_ROBIN = 0 };
+enum class Lifecycle : uint8_t { PREPARING, ACTIVE, DRAINING, RETIRED };
 
 struct PSegmentExtent {
     std::string segment_id;
@@ -30,9 +31,11 @@ struct VSegmentProfile {
     uint32_t member_count{0};
     uint64_t stripe_size{0};
     uint64_t member_extent_size{0};
+    uint64_t io_alignment{1};
+    std::string required_medium;
 };
 YLT_REFL(VSegmentProfile, name, member_count, stripe_size,
-         member_extent_size);
+         member_extent_size, io_alignment, required_medium);
 
 struct PartitionPSegmentQuota {
     std::string segment_id;
@@ -43,23 +46,33 @@ YLT_REFL(PartitionPSegmentQuota, segment_id, base_offset, length);
 
 struct PartitionVSegmentConfig {
     std::string partition_id;
+    std::string profile_name;
+    uint32_t initial_vsegment_count{0};
     uint64_t config_generation{0};
     std::vector<PartitionPSegmentQuota> quotas;
 };
-YLT_REFL(PartitionVSegmentConfig, partition_id, config_generation, quotas);
+YLT_REFL(PartitionVSegmentConfig, partition_id, profile_name,
+         initial_vsegment_count, config_generation, quotas);
+
+struct PSegmentGeometry {
+    std::string segment_id;
+    uint64_t capacity{0};
+    uint64_t io_alignment{1};
+    std::string medium;
+};
+YLT_REFL(PSegmentGeometry, segment_id, capacity, io_alignment, medium);
 
 struct VSegmentView {
     std::string vsegment_id;
     std::string partition_id;
-    std::string mapping_algorithm{"round_robin_stripe"};
+    MappingAlgorithm mapping_algorithm{MappingAlgorithm::ROUND_ROBIN};
     uint64_t stripe_size{0};
     uint64_t logical_capacity{0};
-    Lifecycle lifecycle{Lifecycle::PREPARING};
     std::vector<PSegmentExtent> members;
     uint32_t checksum{0};
 };
 YLT_REFL(VSegmentView, vsegment_id, partition_id, mapping_algorithm,
-         stripe_size, logical_capacity, lifecycle, members, checksum);
+         stripe_size, logical_capacity, members, checksum);
 
 struct VSegmentAllocationResult {
     ErrorCode error{ErrorCode::OK};
@@ -75,9 +88,17 @@ ErrorCode ValidateProfile(const VSegmentProfile& profile,
                           std::string* detail = nullptr);
 ErrorCode ValidatePartitionConfig(const PartitionVSegmentConfig& config,
                                   std::string* detail = nullptr);
+ErrorCode ValidatePublishedConfig(
+    const std::vector<VSegmentProfile>& profiles,
+    const std::vector<PartitionVSegmentConfig>& partitions,
+    const std::vector<PSegmentGeometry>& segments,
+    const std::unordered_map<std::string, uint64_t>& current_generations,
+    std::string* detail = nullptr);
 ErrorCode ValidateView(const VSegmentView& view,
                        const VSegmentProfile& profile,
                        std::string* detail = nullptr);
+ErrorCode ValidateViewStructure(const VSegmentView& view,
+                                std::string* detail = nullptr);
 
 uint32_t ComputeViewChecksum(const VSegmentView& view);
 

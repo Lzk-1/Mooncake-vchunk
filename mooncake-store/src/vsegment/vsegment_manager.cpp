@@ -60,7 +60,8 @@ VSegmentAllocationResult VSegmentManager::GetOrCreate(
         {
             std::lock_guard<std::mutex> lock(mutex_);
             vsegments_.emplace(
-                key, ManagedVSegment{profile_name, allocation.view,
+                key, ManagedVSegment{profile_name, Lifecycle::ACTIVE,
+                                     allocation.view,
                                      std::move(logical)});
         }
         return allocation;
@@ -79,10 +80,18 @@ LogicalRangeAllocator* VSegmentManager::FindAllocator(
 ReservationResult VSegmentManager::ReservePut(
     const std::string& vsegment_id, const std::string& operation_id,
     uint64_t length) {
-    auto* allocator = FindAllocator(vsegment_id);
+    LogicalRangeAllocator* allocator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed != vsegments_.end() &&
+            managed->second.lifecycle == Lifecycle::ACTIVE) {
+            allocator = managed->second.logical_allocator.get();
+        }
+    }
     if (!allocator)
         return ReservationError(ErrorCode::SEGMENT_NOT_FOUND,
-                                "vsegment not found");
+                                "vsegment not found or not active");
     return allocator->Reserve(operation_id, length);
 }
 
@@ -114,7 +123,7 @@ PartitionVSegmentSnapshot VSegmentManager::Snapshot() const {
     snapshot.config_generation = config_.config_generation;
     for (const auto& [id, managed] : vsegments_) {
         snapshot.vsegments.push_back(
-            {managed.profile_name, managed.view,
+            {managed.profile_name, managed.lifecycle, managed.view,
              managed.logical_allocator->Snapshot()});
     }
     std::sort(snapshot.vsegments.begin(), snapshot.vsegments.end(),
@@ -165,7 +174,7 @@ ErrorCode VSegmentManager::Restore(
         if (restored != ErrorCode::OK) return restored;
         vsegments_.emplace(
             state.view.vsegment_id,
-            ManagedVSegment{state.profile_name, state.view,
+            ManagedVSegment{state.profile_name, state.lifecycle, state.view,
                             std::move(logical_allocators[index])});
     }
     return ErrorCode::OK;

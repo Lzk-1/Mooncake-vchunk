@@ -200,7 +200,12 @@ size_t LogicalRangeAllocator::ReservationCount() const {
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
                               const std::vector<ClientSlice>& slices) {
-    if (view.stripe_size == 0 || view.members.empty() || length == 0 ||
+    std::string validation_detail;
+    const auto validation = ValidateViewStructure(view, &validation_detail);
+    if (validation != ErrorCode::OK) {
+        return ResolveError(validation, std::move(validation_detail));
+    }
+    if (length == 0 ||
         AddOverflows(logical_offset, length) ||
         logical_offset + length > view.logical_capacity) {
         return ResolveError(ErrorCode::INVALID_PARAMS,
@@ -257,7 +262,7 @@ ResolveResult ResolveTransfer(const VSegmentView& view,
                                 "mapping exceeds member extent");
         }
         result.requests.push_back(
-            {static_cast<uint32_t>(result.requests.size()), client_offset,
+            {static_cast<uint64_t>(result.requests.size()), client_offset,
              slices[slice_index].address + offset_in_slice,
              member.segment_id, physical_offset, sub_length});
 

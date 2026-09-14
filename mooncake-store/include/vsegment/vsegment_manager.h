@@ -13,10 +13,12 @@ namespace mooncake::vsegment {
 
 struct VSegmentStateSnapshot {
     std::string profile_name;
+    Lifecycle lifecycle{Lifecycle::PREPARING};
     VSegmentView view;
     LogicalAllocationSnapshot logical_allocation;
 };
-YLT_REFL(VSegmentStateSnapshot, profile_name, view, logical_allocation);
+YLT_REFL(VSegmentStateSnapshot, profile_name, lifecycle, view,
+         logical_allocation);
 
 struct PartitionVSegmentSnapshot {
     std::string partition_id;
@@ -55,6 +57,7 @@ class VSegmentManager {
    private:
     struct ManagedVSegment {
         std::string profile_name;
+        Lifecycle lifecycle{Lifecycle::PREPARING};
         VSegmentView view;
         std::unique_ptr<LogicalRangeAllocator> logical_allocator;
     };

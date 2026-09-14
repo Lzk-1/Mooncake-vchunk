@@ -40,6 +40,12 @@ ErrorCode ValidateProfile(const VSegmentProfile& profile, std::string* detail) {
         return Invalid("stripe_size must be positive", detail);
     if (profile.member_extent_size == 0)
         return Invalid("member_extent_size must be positive", detail);
+    if (profile.io_alignment == 0)
+        return Invalid("io_alignment must be positive", detail);
+    if (profile.stripe_size % profile.io_alignment != 0 ||
+        profile.member_extent_size % profile.io_alignment != 0) {
+        return Invalid("stripe and extent must satisfy io_alignment", detail);
+    }
     if (profile.member_extent_size % profile.stripe_size != 0) {
         return Invalid("member_extent_size must be a multiple of stripe_size",
                        detail);
@@ -55,6 +61,10 @@ ErrorCode ValidatePartitionConfig(const PartitionVSegmentConfig& config,
                                   std::string* detail) {
     if (config.partition_id.empty())
         return Invalid("partition_id is empty", detail);
+    if (config.profile_name.empty())
+        return Invalid("profile_name is empty", detail);
+    if (config.initial_vsegment_count == 0)
+        return Invalid("initial_vsegment_count must be positive", detail);
     if (config.config_generation == 0)
         return Invalid("config_generation must be positive", detail);
     if (config.quotas.empty()) return Invalid("quotas are empty", detail);
@@ -84,14 +94,105 @@ ErrorCode ValidatePartitionConfig(const PartitionVSegmentConfig& config,
     return ErrorCode::OK;
 }
 
+ErrorCode ValidatePublishedConfig(
+    const std::vector<VSegmentProfile>& profiles,
+    const std::vector<PartitionVSegmentConfig>& partitions,
+    const std::vector<PSegmentGeometry>& segments,
+    const std::unordered_map<std::string, uint64_t>& current_generations,
+    std::string* detail) {
+    std::unordered_map<std::string, VSegmentProfile> profile_by_name;
+    for (const auto& profile : profiles) {
+        auto validation = ValidateProfile(profile, detail);
+        if (validation != ErrorCode::OK) return validation;
+        if (!profile_by_name.emplace(profile.name, profile).second)
+            return Invalid("duplicate profile: " + profile.name, detail);
+    }
+    std::unordered_map<std::string, PSegmentGeometry> segment_by_id;
+    for (const auto& segment : segments) {
+        if (segment.segment_id.empty() || segment.capacity == 0 ||
+            segment.io_alignment == 0)
+            return Invalid("invalid psegment geometry", detail);
+        if (!segment_by_id.emplace(segment.segment_id, segment).second)
+            return Invalid("duplicate psegment geometry", detail);
+    }
+
+    struct OwnedQuota {
+        std::string partition_id;
+        uint64_t offset;
+        uint64_t length;
+    };
+    std::unordered_map<std::string, std::vector<OwnedQuota>> all_quotas;
+    std::set<std::string> partition_ids;
+    for (const auto& partition : partitions) {
+        auto validation = ValidatePartitionConfig(partition, detail);
+        if (validation != ErrorCode::OK) return validation;
+        if (!partition_ids.insert(partition.partition_id).second)
+            return Invalid("duplicate partition config", detail);
+        auto current = current_generations.find(partition.partition_id);
+        if (current != current_generations.end() &&
+            partition.config_generation <= current->second)
+            return Invalid("config_generation is not newer for " +
+                               partition.partition_id,
+                           detail);
+        auto profile = profile_by_name.find(partition.profile_name);
+        if (profile == profile_by_name.end())
+            return Invalid("unknown profile: " + partition.profile_name,
+                           detail);
+        const auto& layout = profile->second;
+        if (layout.member_extent_size >
+            std::numeric_limits<uint64_t>::max() /
+                partition.initial_vsegment_count)
+            return Invalid("initial allocation size overflows", detail);
+        const uint64_t initial_bytes =
+            layout.member_extent_size * partition.initial_vsegment_count;
+        std::set<std::string> eligible_segments;
+        for (const auto& quota : partition.quotas) {
+            auto geometry = segment_by_id.find(quota.segment_id);
+            if (geometry == segment_by_id.end())
+                return Invalid("unknown psegment: " + quota.segment_id,
+                               detail);
+            const auto& segment = geometry->second;
+            if (quota.base_offset + quota.length > segment.capacity)
+                return Invalid("quota exceeds psegment capacity", detail);
+            const uint64_t alignment =
+                std::max(layout.io_alignment, segment.io_alignment);
+            if (quota.base_offset % alignment != 0 ||
+                quota.length % alignment != 0)
+                return Invalid("quota does not satisfy I/O alignment", detail);
+            if (!layout.required_medium.empty() &&
+                layout.required_medium != segment.medium)
+                return Invalid("psegment medium does not match profile",
+                               detail);
+            if (quota.length >= initial_bytes)
+                eligible_segments.insert(quota.segment_id);
+            all_quotas[quota.segment_id].push_back(
+                {partition.partition_id, quota.base_offset, quota.length});
+        }
+        if (eligible_segments.size() < layout.member_count)
+            return Invalid("Partition cannot satisfy initial vsegment count",
+                           detail);
+    }
+    for (auto& [segment, quotas] : all_quotas) {
+        std::sort(quotas.begin(), quotas.end(), [](const auto& a, const auto& b) {
+            return a.offset < b.offset;
+        });
+        for (size_t index = 1; index < quotas.size(); ++index) {
+            if (quotas[index - 1].offset + quotas[index - 1].length >
+                quotas[index].offset)
+                return Invalid("cross-Partition quota overlap on " + segment,
+                               detail);
+        }
+    }
+    return ErrorCode::OK;
+}
+
 uint32_t ComputeViewChecksum(const VSegmentView& view) {
     std::string bytes;
     AppendString(bytes, view.vsegment_id);
     AppendString(bytes, view.partition_id);
-    AppendString(bytes, view.mapping_algorithm);
+    AppendUint64(bytes, static_cast<uint8_t>(view.mapping_algorithm));
     AppendUint64(bytes, view.stripe_size);
     AppendUint64(bytes, view.logical_capacity);
-    AppendUint64(bytes, static_cast<uint8_t>(view.lifecycle));
     AppendUint64(bytes, view.members.size());
     for (const auto& member : view.members) {
         AppendString(bytes, member.segment_id);
@@ -105,10 +206,10 @@ ErrorCode ValidateView(const VSegmentView& view,
                        const VSegmentProfile& profile, std::string* detail) {
     auto result = ValidateProfile(profile, detail);
     if (result != ErrorCode::OK) return result;
+    result = ValidateViewStructure(view, detail);
+    if (result != ErrorCode::OK) return result;
     if (view.vsegment_id.empty() || view.partition_id.empty())
         return Invalid("view identity is empty", detail);
-    if (view.mapping_algorithm != "round_robin_stripe")
-        return Invalid("unsupported mapping_algorithm", detail);
     if (view.stripe_size != profile.stripe_size)
         return Invalid("view stripe_size does not match profile", detail);
     if (view.members.size() != profile.member_count)
@@ -131,6 +232,31 @@ ErrorCode ValidateView(const VSegmentView& view,
         }
         if (!member_ids.insert(member.segment_id).second)
             return Invalid("duplicate member segment", detail);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ValidateViewStructure(const VSegmentView& view,
+                                std::string* detail) {
+    if (view.vsegment_id.empty() || view.partition_id.empty())
+        return Invalid("view identity is empty", detail);
+    if (view.mapping_algorithm != MappingAlgorithm::ROUND_ROBIN)
+        return Invalid("unsupported mapping_algorithm", detail);
+    if (view.stripe_size == 0 || view.members.empty())
+        return Invalid("view layout is empty", detail);
+    if (view.logical_capacity % view.members.size() != 0)
+        return Invalid("logical capacity is not divisible by members", detail);
+    const uint64_t member_length =
+        view.logical_capacity / view.members.size();
+    if (member_length == 0 || member_length % view.stripe_size != 0)
+        return Invalid("member length is incompatible with stripe_size", detail);
+    std::set<std::string> ids;
+    for (const auto& member : view.members) {
+        if (member.segment_id.empty() || member.length != member_length ||
+            AddOverflows(member.base_offset, member.length) ||
+            !ids.insert(member.segment_id).second) {
+            return Invalid("invalid member extent", detail);
+        }
     }
     if (view.checksum != ComputeViewChecksum(view))
         return ErrorCode::CHECKSUM_MISMATCH;
@@ -170,12 +296,15 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
         uint64_t offset;
     };
     std::vector<Candidate> candidates;
-    for (const auto& [segment, ranges] : free_ranges_) {
+    std::set<std::string> visited_segments;
+    for (const auto& quota : config_.quotas) {
+        if (!visited_segments.insert(quota.segment_id).second) continue;
+        const auto& ranges = free_ranges_.at(quota.segment_id);
         auto range = std::find_if(ranges.begin(), ranges.end(), [&](const auto& r) {
             return r.length >= profile.member_extent_size;
         });
         if (range != ranges.end()) {
-            candidates.push_back({segment,
+            candidates.push_back({quota.segment_id,
                                   static_cast<size_t>(range - ranges.begin()),
                                   range->offset});
         }
@@ -197,7 +326,6 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     view.partition_id = config_.partition_id;
     view.stripe_size = profile.stripe_size;
     view.logical_capacity = profile.member_extent_size * profile.member_count;
-    view.lifecycle = Lifecycle::ACTIVE;
     for (const auto& candidate : candidates) {
         auto& ranges = free_ranges_.at(candidate.segment);
         auto& range = ranges[candidate.range_index];
@@ -311,3 +439,13 @@ uint64_t PartitionQuotaAllocator::FreeBytes(
 }
 
 }  // namespace mooncake::vsegment
+    if (profile.io_alignment == 0)
+        return Invalid("io_alignment must be positive", detail);
+    if (profile.stripe_size % profile.io_alignment != 0 ||
+        profile.member_extent_size % profile.io_alignment != 0) {
+        return Invalid("stripe and extent must satisfy io_alignment", detail);
+    }
+    if (config.profile_name.empty())
+        return Invalid("profile_name is empty", detail);
+    if (config.initial_vsegment_count == 0)
+        return Invalid("initial_vsegment_count must be positive", detail);

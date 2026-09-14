@@ -14,11 +14,15 @@ VSegmentProfile Profile(uint32_t members = 2) {
     return {.name = "default",
             .member_count = members,
             .stripe_size = 64,
-            .member_extent_size = 256};
+            .member_extent_size = 256,
+            .io_alignment = 8,
+            .required_medium = "DRAM"};
 }
 
 PartitionVSegmentConfig Config() {
     return {.partition_id = "partition-1",
+            .profile_name = "default",
+            .initial_vsegment_count = 1,
             .config_generation = 1,
             .quotas = {{"segment-a", 0, 512}, {"segment-b", 1024, 512}}};
 }
@@ -33,6 +37,26 @@ TEST(VSegmentConfigTest, RejectsInvalidLayoutAndOverlappingQuota) {
     EXPECT_EQ(ValidatePartitionConfig(config), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(VSegmentConfigTest, ValidatesPublishedConfigAgainstSegmentGeometry) {
+    auto profile = Profile();
+    auto config = Config();
+    std::vector<PSegmentGeometry> segments = {
+        {"segment-a", 2048, 8, "DRAM"},
+        {"segment-b", 2048, 8, "DRAM"}};
+    EXPECT_EQ(ValidatePublishedConfig({profile}, {config}, segments, {}),
+              ErrorCode::OK);
+
+    auto overlapping = config;
+    overlapping.partition_id = "partition-2";
+    overlapping.config_generation = 2;
+    EXPECT_EQ(ValidatePublishedConfig({profile}, {config, overlapping},
+                                      segments, {}),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ValidatePublishedConfig({profile}, {config}, segments,
+                                      {{"partition-1", 1}}),
+              ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VSegmentViewTest, ChecksumCoversOrderedMembers) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -42,6 +66,18 @@ TEST(VSegmentViewTest, ChecksumCoversOrderedMembers) {
     std::swap(allocation.view.members[0], allocation.view.members[1]);
     EXPECT_EQ(ValidateView(allocation.view, Profile()),
               ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(VSegmentViewTest, LifecycleDoesNotChangeImmutableViewChecksum) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentStateSnapshot state{"default", Lifecycle::ACTIVE,
+                                allocation.view, {}};
+    const auto checksum = state.view.checksum;
+    state.lifecycle = Lifecycle::DRAINING;
+    EXPECT_EQ(state.view.checksum, checksum);
+    EXPECT_EQ(ValidateView(state.view, Profile()), ErrorCode::OK);
 }
 
 TEST(PartitionQuotaAllocatorTest, AllocatesAndReleasesStaticQuota) {
@@ -124,6 +160,25 @@ TEST(VSegmentResolverTest, SplitsAtStripeAndClientSliceBoundaries) {
     EXPECT_EQ(resolved.requests[3].segment_id, "segment-a");
     EXPECT_EQ(resolved.requests[3].physical_offset, 64);
     EXPECT_EQ(resolved.requests[3].client_buffer_offset, 80);
+}
+
+TEST(VSegmentResolverTest, RejectsViewWithInvalidChecksum) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    allocation.view.members[0].base_offset += 8;
+    auto resolved = ResolveTransfer(allocation.view, 0, 8, {{1000, 8}});
+    EXPECT_EQ(resolved.error, ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
+    auto config = Config();
+    std::swap(config.quotas[0], config.quotas[1]);
+    PartitionQuotaAllocator allocator(config);
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(allocation.view.members[0].segment_id, "segment-b");
+    EXPECT_EQ(allocation.view.members[1].segment_id, "segment-a");
 }
 
 TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
