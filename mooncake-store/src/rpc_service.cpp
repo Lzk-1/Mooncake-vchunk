@@ -455,7 +455,7 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
@@ -473,13 +473,25 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
     auto result = execute_rpc(
         "PutStart", PerfKey::MASTER_RPC_PUT_START,
         [&] {
-            return WithWriteTenant(tenant_id,
-                                   master_service_.IsTenantQuotaEnabled(),
-                                   [&](const TenantId& resolved_tenant_id) {
-                                       return master_service_.PutStart(
-                                           client_id, key, resolved_tenant_id,
-                                           slice_length, config);
-                                   });
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<PutStartResult, ErrorCode> {
+                    auto descriptors = master_service_.PutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!descriptors) {
+                        return tl::make_unexpected(descriptors.error());
+                    }
+                    // vsegment 两阶段写：由 VSegmentServiceDelegate 预留逻辑
+                    // 区间并生成 operation_id；未注入 delegate 时回退旧直达写
+                    // （operation_id 为空）。
+                    auto operation_id =
+                        master_service_.GeneratePutStartOperationId(
+                            key, slice_length, config);
+                    return PutStartResult{std::move(operation_id),
+                                          std::move(descriptors.value())};
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -504,7 +516,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id, uint64_t client_trace_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    uint64_t client_trace_id, const std::string& operation_id) {
     std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
     if (client_trace_id != 0) {
         trace_scope_ =
@@ -523,7 +536,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
                                              client_id, object_meta,
-                                             resolved_tenant_id, replica_type);
+                                             resolved_tenant_id, replica_type,
+                                             operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -624,7 +638,7 @@ VChunkRuntimeInfo WrappedMasterService::GetVChunkRuntimeInfo() {
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const std::string& operation_id) {
     return execute_rpc(
         "PutRevoke",
         PerfKey::MASTER_RPC_PUT_REVOKE,
@@ -635,7 +649,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutRevoke(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             replica_type, operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -857,7 +871,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+tl::expected<PutStartResult, ErrorCode>
 WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
                                   const ReplicateConfig& config,
@@ -866,13 +880,24 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
         "UpsertStart",
         PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
-            return WithWriteTenant(tenant_id,
-                                   master_service_.IsTenantQuotaEnabled(),
-                                   [&](const TenantId& resolved_tenant_id) {
-                                       return master_service_.UpsertStart(
-                                           client_id, key, resolved_tenant_id,
-                                           slice_length, config);
-                                   });
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<PutStartResult, ErrorCode> {
+                    auto descriptors = master_service_.UpsertStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!descriptors) {
+                        return tl::make_unexpected(descriptors.error());
+                    }
+                    // 与 PutStart 对称：由 VSegmentServiceDelegate 预留逻辑
+                    // 区间并生成 operation_id（未注入时回退旧直达写）。
+                    auto operation_id =
+                        master_service_.GeneratePutStartOperationId(
+                            key, slice_length, config);
+                    return PutStartResult{std::move(operation_id),
+                                          std::move(descriptors.value())};
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -884,7 +909,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const std::string& operation_id) {
     return execute_rpc(
         "UpsertEnd",
         PerfKey::MASTER_RPC_UPSERT_END,
@@ -895,7 +921,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertEnd(
                                              client_id, object_meta,
-                                             resolved_tenant_id, replica_type);
+                                             resolved_tenant_id, replica_type,
+                                             operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -908,7 +935,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const std::string& operation_id) {
     return execute_rpc(
         "UpsertRevoke",
         PerfKey::MASTER_RPC_UPSERT_REVOKE,
@@ -919,7 +946,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertRevoke(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             replica_type, operation_id);
                                      });
         },
         [&](auto& timer) {
@@ -2025,6 +2052,59 @@ WrappedMasterService::InterMasterUpsertStart(
         [] {}, [] {});
 }
 
+// ---- vsegment 预留 RPC 接口占位实现（方法体由 vsegment 实现方落地）----
+tl::expected<partition::VSegmentView, ErrorCode>
+WrappedMasterService::GetVSegmentView(const std::string& vsegment_id) {
+    (void)vsegment_id;
+    throw std::runtime_error(
+        "GetVSegmentView not implemented (vsegment reserved interface)");
+}
+
+tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
+WrappedMasterService::GetExtentSummary(
+    const partition::GetExtentSummaryRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "GetExtentSummary not implemented (vsegment reserved interface)");
+}
+
+tl::expected<partition::ReserveExtentResponse, ErrorCode>
+WrappedMasterService::ReserveExtent(
+    const partition::ReserveExtentRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "ReserveExtent not implemented (vsegment reserved interface)");
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CommitExtent(
+    const partition::CommitExtentRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "CommitExtent not implemented (vsegment reserved interface)");
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::AbortExtent(
+    const partition::AbortExtentRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "AbortExtent not implemented (vsegment reserved interface)");
+}
+
+tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
+WrappedMasterService::QueryExtentAllocation(
+    const partition::QueryExtentAllocationRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "QueryExtentAllocation not implemented (vsegment reserved interface)");
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ReleaseCommittedExtent(
+    const partition::ReleaseCommittedExtentRequest& request) {
+    (void)request;
+    throw std::runtime_error(
+        "ReleaseCommittedExtent not implemented (vsegment reserved interface)");
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -2215,6 +2295,23 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    // vsegment 预留 RPC 接口。
+    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetExtentSummary>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReserveExtent>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CommitExtent>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::AbortExtent>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QueryExtentAllocation>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReleaseCommittedExtent>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

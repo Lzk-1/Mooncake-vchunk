@@ -242,12 +242,11 @@ class MasterClient {
      * @param slice_lengths Vector of slice lengths
      * @param value_length Total value length
      * @param config Replication configuration
-     * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-     * indicating success/failure
+     * @return tl::expected<PutStartResult, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-    PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
-             const ReplicateConfig& config);
+    [[nodiscard]] tl::expected<PutStartResult, ErrorCode> PutStart(
+        const std::string& key, const std::vector<size_t>& slice_lengths,
+        const ReplicateConfig& config);
 
     /**
      * @brief Starts a batch of put operations for N objects
@@ -270,7 +269,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const std::string& operation_id = "");
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -288,7 +288,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const std::string& operation_id = "");
 
     [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
         const std::string& tenant_id, const std::string& key,
@@ -323,12 +324,11 @@ class MasterClient {
      * @param key Object key
      * @param slice_lengths Vector of slice lengths
      * @param config Replication configuration
-     * @return Replica descriptors on success, ErrorCode on failure
+     * @return PutStartResult on success, ErrorCode on failure
      */
-    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-    UpsertStart(const std::string& key,
-                const std::vector<size_t>& slice_lengths,
-                const ReplicateConfig& config);
+    [[nodiscard]] tl::expected<PutStartResult, ErrorCode> UpsertStart(
+        const std::string& key, const std::vector<size_t>& slice_lengths,
+        const ReplicateConfig& config);
 
     [[nodiscard]] std::vector<
         tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -337,13 +337,15 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const std::string& operation_id = "");
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const std::vector<ObjectMeta>& object_metas);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const std::string& operation_id = "");
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const std::vector<std::string>& keys);

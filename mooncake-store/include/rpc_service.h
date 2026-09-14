@@ -14,6 +14,7 @@
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
 #include "segment.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake {
 
@@ -78,7 +79,7 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    tl::expected<PutStartResult, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
         const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
@@ -86,12 +87,14 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0,
+        const std::string& operation_id = "");
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::string& operation_id = "");
 
     tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
         const std::string& tenant_id, const std::string& key,
@@ -128,7 +131,7 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    tl::expected<PutStartResult, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
         const std::string& tenant_id = "default");
@@ -136,12 +139,14 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::string& operation_id = "");
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::string& operation_id = "");
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
@@ -341,6 +346,25 @@ class WrappedMasterService {
     InterMasterUpsertStart(const UUID& client_id, const std::string& key,
                            const std::string& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config);
+
+    // ---- vsegment 预留 RPC 接口（§5.2，方法体由 vsegment 实现方落地）----
+    // 元数据面：cache miss 时拉取完整不可变 view。
+    tl::expected<partition::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& vsegment_id);
+
+    // 物理分配面（幂等，幂等键 = allocation_id + segment_id）。
+    tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
+    GetExtentSummary(const partition::GetExtentSummaryRequest& request);
+    tl::expected<partition::ReserveExtentResponse, ErrorCode> ReserveExtent(
+        const partition::ReserveExtentRequest& request);
+    tl::expected<void, ErrorCode> CommitExtent(
+        const partition::CommitExtentRequest& request);
+    tl::expected<void, ErrorCode> AbortExtent(
+        const partition::AbortExtentRequest& request);
+    tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
+    QueryExtentAllocation(const partition::QueryExtentAllocationRequest& request);
+    tl::expected<void, ErrorCode> ReleaseCommittedExtent(
+        const partition::ReleaseCommittedExtentRequest& request);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

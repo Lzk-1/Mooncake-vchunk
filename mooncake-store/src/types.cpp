@@ -79,7 +79,13 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
         {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
         {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
-        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"},
+        {ErrorCode::NOT_OWNER, "NOT_OWNER"},
+        {ErrorCode::STALE_ROUTE, "STALE_ROUTE"},
+        {ErrorCode::MIGRATION_IN_PROGRESS, "MIGRATION_IN_PROGRESS"},
+        {ErrorCode::STALE_ALLOCATOR_EPOCH, "STALE_ALLOCATOR_EPOCH"},
+        {ErrorCode::VSEGMENT_NOT_FOUND, "VSEGMENT_NOT_FOUND"},
+        {ErrorCode::VSEGMENT_INVALID, "VSEGMENT_INVALID"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

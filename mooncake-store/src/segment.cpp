@@ -1575,6 +1575,19 @@ void SegmentManager::releaseCapacityMetrics() {
     }
 }
 
+void SegmentManager::SetAllocatorOwner(AllocatorOwner* owner) {
+    const bool was_set = (allocator_owner_ != nullptr);
+    const bool is_set = (owner != nullptr);
+    allocator_owner_ = owner;
+    if (is_set) {
+        LOG(INFO) << "AllocatorOwner " << (was_set ? "replaced" : "injected");
+    } else if (was_set) {
+        // 清空 owner 会回退旧直达写路径，属关键拓扑变化，用 WARNING 便于排查。
+        LOG(WARNING) << "AllocatorOwner cleared, falling back to legacy "
+                        "direct-write path";
+    }
+}
+
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";

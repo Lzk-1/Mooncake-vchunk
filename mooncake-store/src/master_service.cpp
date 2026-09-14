@@ -775,6 +775,23 @@ void MasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     cvm_lease_id_ = lease_id;
 }
 
+void MasterService::SetVSegmentServiceDelegate(
+    VSegmentServiceDelegate* delegate) {
+    vsegment_service_delegate_ = delegate;
+}
+
+std::string MasterService::GeneratePutStartOperationId(
+    const std::string& key, uint64_t slice_length,
+    const ReplicateConfig& config) const {
+    if (!vsegment_service_delegate_) {
+        return {};
+    }
+    // 委托 vsegment 实现方预留逻辑区间并生成 operation_id；其内部决定该 key
+    // 是否启用 vsegment（返回空字符串表示回退旧直达写路径）。
+    return vsegment_service_delegate_->ReserveOperation(key, slice_length,
+                                                        config);
+}
+
 void MasterService::StopSlotOwnerHeartbeat() {
     if (slot_owner_heartbeat_) {
         slot_owner_heartbeat_->Stop();
@@ -5252,7 +5269,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+                           const TenantId& tenant_id, ReplicaType replica_type,
+                           const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -5364,6 +5382,13 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
                          << ", err=" << static_cast<int>(result.error());
         }
+    }
+
+    // vsegment 两阶段写：PutEnd 成功时提交预留的逻辑区间（失败路径由调用方
+    // 走 PutRevoke 触达 AbortOperation 撤销）。operation_id 为空表示旧直达写
+    // 路径，不涉及 commit。
+    if (!operation_id.empty() && vsegment_service_delegate_) {
+        vsegment_service_delegate_->CommitOperation(operation_id);
     }
     return {};
 }
@@ -5509,8 +5534,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
+    // vsegment 两阶段写：撤销预留的逻辑区间。AbortOperation 由 vsegment 实现方
+    // 保证幂等，故进入 PutRevoke 即触发（含对象已不存在等提前返回路径）。
+    // operation_id 为空表示旧直达写路径，不涉及 abort。
+    if (!operation_id.empty() && vsegment_service_delegate_) {
+        vsegment_service_delegate_->AbortOperation(operation_id);
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5614,10 +5646,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+                           const TenantId& tenant_id, ReplicaType replica_type,
+                           const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
     return PutEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
-                  replica_type);
+                  replica_type, operation_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
@@ -6029,24 +6062,28 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 auto MasterService::UpsertEnd(const UUID& client_id,
                               const ObjectMeta& object_meta,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+    return PutEnd(client_id, object_meta, tenant_id, replica_type,
+                  operation_id);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
     return UpsertEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
-                     replica_type);
+                     replica_type, operation_id);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  const TenantId& tenant_id,
-                                 ReplicaType replica_type)
+                                 ReplicaType replica_type,
+                                 const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
-    return PutRevoke(client_id, key, tenant_id, replica_type);
+    return PutRevoke(client_id, key, tenant_id, replica_type, operation_id);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>

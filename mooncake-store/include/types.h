@@ -415,6 +415,18 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    // vsegment / Partition routing errors (Range: -1800 to -1899)
+    NOT_OWNER = -1800,            ///< Wrong SubMaster; response carries owner
+                                  ///< and route epoch.
+    STALE_ROUTE = -1801,          ///< route_epoch is stale; refresh KV PT and
+                                  ///< retry.
+    MIGRATION_IN_PROGRESS = -1802,  ///< Partition is switching owners; PutStart
+                                    ///< may bounded-retry.
+    STALE_ALLOCATOR_EPOCH = -1803,  ///< allocator_epoch is stale; retry with the
+                                    ///< same allocation_id.
+    VSEGMENT_NOT_FOUND = -1804,   ///< VSegmentView is missing.
+    VSEGMENT_INVALID = -1805,     ///< VSegmentView failed validation.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

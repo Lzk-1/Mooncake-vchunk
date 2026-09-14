@@ -206,6 +206,16 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+// vsegment 逻辑区间引用：对象数据不再直接指向物理 buffer/文件，而是通过
+// vsegment_id 引用一份不可变布局，再由 (logical_offset, length) 定位到
+// 逻辑空间中的一段。物理落点由 Store 侧按 VSegmentView 映射展开。
+struct VSegmentDescriptor {
+    std::string vsegment_id;
+    uint64_t logical_offset{0};
+    uint64_t length{0};
+    YLT_REFL(VSegmentDescriptor, vsegment_id, logical_offset, length);
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -505,7 +515,7 @@ class Replica {
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, VSegmentDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -542,6 +552,16 @@ class Replica {
 
         bool is_local_disk_replica() const noexcept {
             return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() const noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
                 descriptor_variant);
         }
 
@@ -603,6 +623,22 @@ class Replica {
                 return *desc;
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
+        }
+
+        VSegmentDescriptor& get_vsegment_descriptor() {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
+        }
+
+        const VSegmentDescriptor& get_vsegment_descriptor() const {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
         }
     };
 

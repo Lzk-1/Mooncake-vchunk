@@ -129,5 +129,33 @@ inline std::string SubmasterSegmentMountKey(
     return SubmasterSegmentsPrefix(cluster_namespace, master_id) + segment_id;
 }
 
+// ---- Partition 路由（§5.2 vsegment 预留接口，仅存 owner + epoch）----
+
+// "/cvm/<namespace>/partition_route/"
+inline std::string PartitionRoutePrefix(const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "partition_route/";
+}
+
+// "/cvm/<namespace>/partition_route/<partition_id>"
+// 保存 Partition owner + route_epoch（迁移期另存 state 与 target）。迁移完成
+// 后键仍保留，仅内容随 owner 切换更新。
+inline std::string PartitionRouteKey(const std::string& cluster_namespace,
+                                     const std::string& partition_id) {
+    return PartitionRoutePrefix(cluster_namespace) + partition_id;
+}
+
+// "/cvm/<namespace>/segment_allocator_route/"
+inline std::string PSegmentAllocatorRoutePrefix(
+    const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "segment_allocator_route/";
+}
+
+// "/cvm/<namespace>/segment_allocator_route/<segment_id>"
+// 保存 psegment 物理分配唯一写者 allocator owner + allocator_epoch。
+inline std::string PSegmentAllocatorRouteKey(
+    const std::string& cluster_namespace, const std::string& segment_id) {
+    return PSegmentAllocatorRoutePrefix(cluster_namespace) + segment_id;
+}
+
 }  // namespace cvm
 }  // namespace mooncake

@@ -2067,8 +2067,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    PutStartResult& put_start = start_result.value();
     ReplicaTransferSummary transfer_summary;
-    for (const auto& replica : start_result.value()) {
+    for (const auto& replica : put_start.replicas) {
         transfer_summary.RecordAllocatedReplica(replica);
     }
 
@@ -2078,8 +2079,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // We must deal with disk replica first, then the disk putrevoke/putend can
     // be called surely
     if (storage_backend_) {
-        for (auto it = start_result.value().rbegin();
-             it != start_result.value().rend(); ++it) {
+        for (auto it = put_start.replicas.rbegin();
+             it != put_start.replicas.rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
@@ -2090,7 +2091,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
-    for (const auto& replica : start_result.value()) {
+    for (const auto& replica : put_start.replicas) {
         if (replica.is_memory_replica() || replica.is_nof_replica()) {
             // Transfer data using allocated handles from all replicas
             const auto replica_type = replica.is_memory_replica()
@@ -2120,7 +2121,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                  SpDiag::PerfLevel::MODULE);
         pt_end.Start();
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            put_start.operation_id);
         pt_end.End(end_result ? 0 : -1);
         if (!end_result) {
             ErrorCode err = end_result.error();
@@ -2131,8 +2133,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, put_start.operation_id);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             pt_full.End(-1);
@@ -2193,12 +2195,13 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Record transfer latency
+    PutStartResult& upsert_start = start_result.value();
     auto t0 = std::chrono::steady_clock::now();
 
     // Handle disk replicas first
     if (storage_backend_) {
-        for (auto it = start_result.value().rbegin();
-             it != start_result.value().rend(); ++it) {
+        for (auto it = upsert_start.replicas.rbegin();
+             it != upsert_start.replicas.rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 auto disk_descriptor = replica.get_disk_descriptor();
@@ -2209,12 +2212,12 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Transfer to memory replicas
-    for (const auto& replica : start_result.value()) {
+    for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
-                auto revoke_result =
-                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                auto revoke_result = master_client_.UpsertRevoke(
+                    key, ReplicaType::MEMORY, upsert_start.operation_id);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke upsert operation";
                     return tl::unexpected(revoke_result.error());
@@ -2233,7 +2236,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     // End upsert operation
     auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
-                                               ReplicaType::MEMORY);
+                                               ReplicaType::MEMORY,
+                                               upsert_start.operation_id);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;

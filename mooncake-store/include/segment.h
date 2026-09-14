@@ -13,6 +13,7 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#include "partition/vsegment_types.h"
 #include "rpc_types.h"
 #include "types.h"
 
@@ -446,6 +447,38 @@ class SegmentSerializer {
     SegmentManager* segment_manager_;
 };
 
+/**
+ * @brief vsegment 物理分配 owner 抽象接口（§12.3.8 预留）。
+ *
+ * 当 SegmentManager 处于 psegment allocator owner 角色时，通过该抽象接口把
+ * 物理 extent 的 Reserve/Commit/Abort/Release 仲裁委托给 vsegment 实现方，
+ * 避免反向依赖其 psegment 分配状态机（free/reserved/committed extents）。
+ *
+ * 当前仅定义契约：未注入实现（指针为 null）时回退旧直达写路径，不参与物理
+ * extent 仲裁。幂等键为 ReserveExtentRequest 中的 (allocation_id, segment_id)。
+ */
+class AllocatorOwner {
+   public:
+    virtual ~AllocatorOwner() = default;
+
+    // 预留物理 extent：free -> reserved。返回的 extent 为该分配在 psegment
+    // 上的物理区间 [base_offset, base_offset + length)。
+    virtual tl::expected<partition::ReserveExtentResponse, ErrorCode>
+    ReserveExtent(const partition::ReserveExtentRequest& request) = 0;
+
+    // 提交预留的 extent：reserved -> committed（view 持久化后调用）。
+    virtual tl::expected<void, ErrorCode> CommitExtent(
+        const partition::CommitExtentRequest& request) = 0;
+
+    // 撤销预留的 extent：reserved -> free。由实现方保证幂等，view 未发布时
+    // 触发即可。
+    virtual void AbortExtent(const partition::AbortExtentRequest& request) = 0;
+
+    // 释放已提交的 extent（vsegment 退役后调用）。
+    virtual tl::expected<void, ErrorCode> ReleaseCommittedExtent(
+        const partition::ReleaseCommittedExtentRequest& request) = 0;
+};
+
 class SegmentManager {
    public:
     /**
@@ -493,6 +526,12 @@ class SegmentManager {
 
     SegmentView getView() const { return SegmentView(this); }
 
+    // vsegment allocator owner 依赖注入（§12.3.8 预留）：物理 extent 的
+    // Reserve/Commit/Abort/Release 仲裁委托给 vsegment 实现方。未注入时回退
+    // 旧直达写路径。注入/替换/清空会记录日志，便于排查仲裁路径是否生效。
+    void SetAllocatorOwner(AllocatorOwner* owner);
+    AllocatorOwner* allocator_owner() const { return allocator_owner_; }
+
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
 
@@ -532,6 +571,8 @@ class SegmentManager {
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
+    // vsegment 物理分配 owner 仲裁（§12.3.8 预留），未注入时为 nullptr。
+    AllocatorOwner* allocator_owner_ = nullptr;
 
     friend class ScopedSegmentAccess;
     friend class SegmentTest;        // for unit tests

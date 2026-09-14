@@ -53,6 +53,23 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
+/**
+ * @brief PutStart 响应（vsegment 两阶段写预留接口）。
+ * operation_id 关联本次 PutStart 预留的逻辑区间，供 PutEnd / PutRevoke
+ * 引用；旧直达写路径不使用 vsegment，operation_id 为空字符串。
+ */
+struct PutStartResult {
+    std::string operation_id;
+    std::vector<Replica::Descriptor> replicas;
+
+    PutStartResult() = default;
+    PutStartResult(std::string operation_id_param,
+                   std::vector<Replica::Descriptor> replicas_param)
+        : operation_id(std::move(operation_id_param)),
+          replicas(std::move(replicas_param)) {}
+};
+YLT_REFL(PutStartResult, operation_id, replicas);
+
 struct CachedQueryResultResponse {
     bool success;
     GetReplicaListResponse value;

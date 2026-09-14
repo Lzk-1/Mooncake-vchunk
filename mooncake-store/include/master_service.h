@@ -89,6 +89,33 @@ namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
 
+// vsegment 依赖反转接口（§12.3.8 预留）。MasterService 通过该抽象接口把
+// 两阶段写（PutStart 预留 → PutEnd 提交 / PutRevoke 撤销）与 vsegment
+// 生命周期变化委托给 vsegment 实现方，避免反向依赖其内部分配状态机。
+// 当前仅定义契约：未注入实现（指针为 null）时 MasterService 回退旧直达写
+// 路径，operation_id 恒为空字符串。
+class VSegmentServiceDelegate {
+   public:
+    virtual ~VSegmentServiceDelegate() = default;
+
+    // PutStart 时预留逻辑区间并生成两阶段写 operation_id。返回空字符串
+    // 表示该 key 不启用 vsegment，回退旧直达写路径。
+    virtual std::string ReserveOperation(const std::string& key,
+                                         uint64_t slice_length,
+                                         const ReplicateConfig& config) = 0;
+
+    // PutEnd 成功时提交该 operation 预留的区间。
+    virtual void CommitOperation(const std::string& operation_id) = 0;
+
+    // PutRevoke / PutEnd 失败时撤销该 operation 预留的区间。
+    virtual void AbortOperation(const std::string& operation_id) = 0;
+
+    // vsegment 生命周期变化通知。lifecycle 取 partition::Lifecycle 枚举值
+    // （见 partition/vsegment_types.h）。
+    virtual void OnLifecycleChanged(const std::string& vsegment_id,
+                                    int32_t lifecycle) {}
+};
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -171,6 +198,19 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+
+    // vsegment 依赖注入（§12.3.8 预留）：PutStart/PutEnd/PutRevoke 的两阶段
+    // 写语义委托给 vsegment 实现方。未注入时回退旧直达写路径。
+    void SetVSegmentServiceDelegate(VSegmentServiceDelegate* delegate);
+    VSegmentServiceDelegate* vsegment_service_delegate() const {
+        return vsegment_service_delegate_;
+    }
+
+    // PutStart 时生成两阶段写 operation_id：delegate 存在则委托其预留逻辑，
+    // 否则返回空字符串（旧直达写路径，不使用 vsegment）。
+    std::string GeneratePutStartOperationId(
+        const std::string& key, uint64_t slice_length,
+        const ReplicateConfig& config) const;
 
     // Inter-master allocation forwarding (CVM plan B phase 2). Called by
     // WrappedMasterService when a slot-owning peer asks this submaster
@@ -525,11 +565,13 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                const TenantId& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -546,7 +588,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -585,18 +628,21 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      const TenantId& tenant_id, ReplicaType replica_type)
+                      const TenantId& tenant_id, ReplicaType replica_type,
+                      const std::string& operation_id = "")
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -2227,6 +2273,10 @@ class MasterService {
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
+
+    // vsegment 两阶段写委托（§12.3.8 预留）。nullptr 表示未启用 vsegment，
+    // 回退旧直达写路径；由 vsegment 实现方经 SetVSegmentServiceDelegate 注入。
+    VSegmentServiceDelegate* vsegment_service_delegate_{nullptr};
 
     // ----- Inter-master allocation forwarding (CVM plan B phase 2) -----
 
