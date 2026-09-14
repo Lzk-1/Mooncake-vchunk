@@ -89,6 +89,7 @@ class VSegmentManager {
     std::unordered_map<std::string, VSegmentProfile> profiles_;
     PartitionQuotaAllocator physical_allocator_;
     CreationCoordinator creation_coordinator_;
+    CreationCoordinator profile_creation_coordinator_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, ManagedVSegment> vsegments_;
     std::unordered_map<std::string, std::string> creation_results_;

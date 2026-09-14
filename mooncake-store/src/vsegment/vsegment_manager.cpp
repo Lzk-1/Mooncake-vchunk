@@ -36,22 +36,29 @@ VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
 
 VSegmentAllocationResult VSegmentManager::Create(
     const std::string& profile_name) {
-    uint64_t slot = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto next = next_creation_slots_.find(profile_name);
-        if (next == next_creation_slots_.end())
-            return ManagerError(ErrorCode::INVALID_PARAMS,
-                                "unknown vsegment profile: " + profile_name);
-        slot = next->second++;
-        std::string detail;
-        auto persisted = PersistLocked("creation_slot_advanced", &detail);
-        if (persisted != ErrorCode::OK) {
-            --next->second;
-            return ManagerError(persisted, std::move(detail));
-        }
-    }
-    return GetOrCreate(profile_name, slot);
+    auto result = profile_creation_coordinator_.GetOrCreate(
+        profile_name, [&] {
+            uint64_t slot = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto next = next_creation_slots_.find(profile_name);
+                if (next == next_creation_slots_.end())
+                    return ManagerError(
+                        ErrorCode::INVALID_PARAMS,
+                        "unknown vsegment profile: " + profile_name);
+                slot = next->second++;
+                std::string detail;
+                auto persisted =
+                    PersistLocked("creation_slot_advanced", &detail);
+                if (persisted != ErrorCode::OK) {
+                    --next->second;
+                    return ManagerError(persisted, std::move(detail));
+                }
+            }
+            return GetOrCreate(profile_name, slot);
+        });
+    profile_creation_coordinator_.Forget(profile_name);
+    return result;
 }
 
 std::string VSegmentManager::CreationKey(const std::string& partition_id,

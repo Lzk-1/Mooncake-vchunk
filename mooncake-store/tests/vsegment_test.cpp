@@ -4,7 +4,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <barrier>
+#include <chrono>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -17,6 +20,8 @@ class TestStateCommitter : public VSegmentStateCommitter {
                      std::string* detail) override {
         mutations.push_back(mutation);
         last_state = state;
+        if (delay_create_begin && mutation == "vsegment_create_begin")
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         if (fail_next) {
             fail_next = false;
             if (detail) *detail = "injected persistence failure";
@@ -26,6 +31,7 @@ class TestStateCommitter : public VSegmentStateCommitter {
     }
 
     bool fail_next{false};
+    bool delay_create_begin{false};
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
 };
@@ -374,6 +380,31 @@ TEST(VSegmentManagerTest, RecoveryRollsBackUncommittedCreation) {
     VSegmentView view;
     EXPECT_FALSE(recovered.FindView(allocation.view.vsegment_id, &view));
     EXPECT_TRUE(recovered.Create("default"));
+}
+
+TEST(VSegmentManagerTest, ConcurrentProfileCreationSharesOneVSegment) {
+    auto committer = Committer();
+    committer->delay_create_begin = true;
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    constexpr size_t kCallers = 8;
+    std::barrier start(static_cast<std::ptrdiff_t>(kCallers));
+    std::vector<VSegmentAllocationResult> results(kCallers);
+    std::vector<std::thread> threads;
+    for (size_t index = 0; index < kCallers; ++index) {
+        threads.emplace_back([&, index] {
+            start.arrive_and_wait();
+            results[index] = manager.Create("default");
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    for (const auto& result : results) {
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.view.vsegment_id, results[0].view.vsegment_id);
+    }
+    EXPECT_EQ(std::count(committer->mutations.begin(),
+                         committer->mutations.end(),
+                         "vsegment_create_begin"),
+              1);
 }
 
 }  // namespace
