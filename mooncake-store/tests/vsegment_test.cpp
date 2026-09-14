@@ -1,6 +1,10 @@
 #include "vsegment/vsegment.h"
+#include "vsegment/vsegment_runtime.h"
 
 #include <gtest/gtest.h>
+
+#include <atomic>
+#include <thread>
 
 namespace mooncake::vsegment {
 namespace {
@@ -72,6 +76,74 @@ TEST(PartitionQuotaAllocatorTest, ConcurrentIdentityIsIdempotentlyRejected) {
     ASSERT_TRUE(allocator.Allocate("vs-1", Profile()));
     auto duplicate = allocator.Allocate("vs-1", Profile());
     EXPECT_EQ(duplicate.error, ErrorCode::SEGMENT_ALREADY_EXISTS);
+}
+
+TEST(LogicalRangeAllocatorTest, ReservationIsIdempotentAndAbortReturnsSpace) {
+    LogicalRangeAllocator allocator(1024);
+    auto first = allocator.Reserve("put-1", 128);
+    ASSERT_TRUE(first);
+    auto retry = allocator.Reserve("put-1", 128);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry.range.offset, first.range.offset);
+    EXPECT_EQ(allocator.FreeBytes(), 896);
+    EXPECT_EQ(allocator.ReservationCount(), 1);
+    EXPECT_EQ(allocator.Abort("put-1"), ErrorCode::OK);
+    EXPECT_EQ(allocator.FreeBytes(), 1024);
+}
+
+TEST(LogicalRangeAllocatorTest, CommitKeepsRangeAllocatedUntilRelease) {
+    LogicalRangeAllocator allocator(1024);
+    ASSERT_TRUE(allocator.Reserve("put-1", 128));
+    LogicalRange committed;
+    EXPECT_EQ(allocator.Commit("put-1", &committed), ErrorCode::OK);
+    EXPECT_EQ(allocator.FreeBytes(), 896);
+    EXPECT_EQ(allocator.Release(committed), ErrorCode::OK);
+    EXPECT_EQ(allocator.FreeBytes(), 1024);
+    EXPECT_EQ(allocator.Release(committed), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(VSegmentResolverTest, SplitsAtStripeAndClientSliceBoundaries) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+
+    auto resolved = ResolveTransfer(allocation.view, 48, 96,
+                                    {{1000, 40}, {2000, 56}});
+    ASSERT_TRUE(resolved);
+    ASSERT_EQ(resolved.requests.size(), 4);
+    EXPECT_EQ(resolved.requests[0].length, 16);
+    EXPECT_EQ(resolved.requests[0].segment_id, "segment-a");
+    EXPECT_EQ(resolved.requests[0].physical_offset, 48);
+    EXPECT_EQ(resolved.requests[1].length, 24);
+    EXPECT_EQ(resolved.requests[1].segment_id, "segment-b");
+    EXPECT_EQ(resolved.requests[1].client_address, 1016);
+    EXPECT_EQ(resolved.requests[2].length, 40);
+    EXPECT_EQ(resolved.requests[2].client_address, 2000);
+    EXPECT_EQ(resolved.requests[3].length, 16);
+    EXPECT_EQ(resolved.requests[3].segment_id, "segment-a");
+    EXPECT_EQ(resolved.requests[3].physical_offset, 64);
+    EXPECT_EQ(resolved.requests[3].client_buffer_offset, 80);
+}
+
+TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
+    CreationCoordinator coordinator;
+    std::atomic<int> calls{0};
+    VSegmentAllocationResult first;
+    VSegmentAllocationResult second;
+    auto factory = [&] {
+        ++calls;
+        std::this_thread::yield();
+        VSegmentAllocationResult result;
+        result.view.vsegment_id = "vs-1";
+        return result;
+    };
+    std::thread one([&] { first = coordinator.GetOrCreate("p/default/0", factory); });
+    std::thread two([&] { second = coordinator.GetOrCreate("p/default/0", factory); });
+    one.join();
+    two.join();
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(first.view.vsegment_id, "vs-1");
+    EXPECT_EQ(second.view.vsegment_id, "vs-1");
 }
 
 }  // namespace
