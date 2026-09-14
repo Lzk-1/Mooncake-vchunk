@@ -10,6 +10,30 @@
 namespace mooncake::vsegment {
 namespace {
 
+class TestStateCommitter : public VSegmentStateCommitter {
+   public:
+    ErrorCode Commit(const PartitionVSegmentSnapshot& state,
+                     const std::string& mutation,
+                     std::string* detail) override {
+        mutations.push_back(mutation);
+        last_state = state;
+        if (fail_next) {
+            fail_next = false;
+            if (detail) *detail = "injected persistence failure";
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+        return ErrorCode::OK;
+    }
+
+    bool fail_next{false};
+    std::vector<std::string> mutations;
+    PartitionVSegmentSnapshot last_state;
+};
+
+std::shared_ptr<TestStateCommitter> Committer() {
+    return std::make_shared<TestStateCommitter>();
+}
+
 VSegmentProfile Profile(uint32_t members = 2) {
     return {.name = "default",
             .member_count = members,
@@ -225,7 +249,7 @@ TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
 }
 
 TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
-    VSegmentManager manager(Config(), {Profile()});
+    VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
     auto reservation = manager.ReservePut(allocation.view.vsegment_id,
@@ -234,7 +258,7 @@ TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
 
     const auto snapshot = manager.Snapshot();
     ASSERT_EQ(snapshot.vsegments.size(), 1);
-    VSegmentManager recovered(Config(), {Profile()});
+    VSegmentManager recovered(Config(), {Profile()}, Committer());
     std::string detail;
     ASSERT_EQ(recovered.Restore(snapshot, &detail), ErrorCode::OK) << detail;
 
@@ -251,17 +275,17 @@ TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
 }
 
 TEST(VSegmentManagerTest, RejectsSnapshotFromAnotherConfigGeneration) {
-    VSegmentManager manager(Config(), {Profile()});
+    VSegmentManager manager(Config(), {Profile()}, Committer());
     ASSERT_TRUE(manager.Create("default"));
     auto snapshot = manager.Snapshot();
     snapshot.config_generation = 2;
 
-    VSegmentManager recovered(Config(), {Profile()});
+    VSegmentManager recovered(Config(), {Profile()}, Committer());
     EXPECT_EQ(recovered.Restore(snapshot), ErrorCode::INVALID_VERSION);
 }
 
 TEST(VSegmentManagerTest, EnforcesLifecycleTransitions) {
-    VSegmentManager manager(Config(), {Profile()});
+    VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
     EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
@@ -277,7 +301,7 @@ TEST(VSegmentManagerTest, EnforcesLifecycleTransitions) {
 }
 
 TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
-    VSegmentManager manager(Config(), {Profile()});
+    VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
     ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
@@ -287,7 +311,7 @@ TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
               ErrorCode::OK);
     auto snapshot = manager.Snapshot();
 
-    VSegmentManager recovered(Config(), {Profile()});
+    VSegmentManager recovered(Config(), {Profile()}, Committer());
     ASSERT_EQ(recovered.Restore(snapshot), ErrorCode::OK);
     EXPECT_EQ(recovered.ReleaseObject(allocation.view.vsegment_id,
                                       "object-1", range),
@@ -295,7 +319,7 @@ TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
 }
 
 TEST(VSegmentManagerTest, SnapshotIsJsonSerializable) {
-    VSegmentManager manager(Config(), {Profile()});
+    VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
     ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
@@ -307,6 +331,49 @@ TEST(VSegmentManagerTest, SnapshotIsJsonSerializable) {
     ASSERT_EQ(decoded.vsegments.size(), 1);
     EXPECT_EQ(decoded.partition_id, "partition-1");
     EXPECT_EQ(decoded.vsegments[0].logical_allocation.reservations.size(), 1);
+}
+
+TEST(VSegmentManagerTest, PersistsCreationBeforePublishingActive) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_EQ(committer->mutations.size(), 3);
+    EXPECT_EQ(committer->mutations[0], "creation_slot_advanced");
+    EXPECT_EQ(committer->mutations[1], "vsegment_create_begin");
+    EXPECT_EQ(committer->mutations[2], "vsegment_create_commit");
+    ASSERT_EQ(committer->last_state.vsegments.size(), 1);
+    EXPECT_EQ(committer->last_state.vsegments[0].lifecycle,
+              Lifecycle::ACTIVE);
+}
+
+TEST(VSegmentManagerTest, RollsBackReservationWhenPersistenceFails) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    committer->fail_next = true;
+    auto failed = manager.ReservePut(allocation.view.vsegment_id, "put-1", 64);
+    EXPECT_EQ(failed.error, ErrorCode::PERSISTENT_FAIL);
+
+    auto retry = manager.ReservePut(allocation.view.vsegment_id, "put-1", 64);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry.range.offset, 0);
+}
+
+TEST(VSegmentManagerTest, RecoveryRollsBackUncommittedCreation) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    auto snapshot = manager.Snapshot();
+    snapshot.vsegments[0].lifecycle = Lifecycle::PREPARING;
+
+    VSegmentManager recovered(Config(), {Profile()}, Committer());
+    ASSERT_EQ(recovered.Restore(snapshot), ErrorCode::OK);
+    VSegmentView view;
+    EXPECT_FALSE(recovered.FindView(allocation.view.vsegment_id, &view));
+    EXPECT_TRUE(recovered.Create("default"));
 }
 
 }  // namespace

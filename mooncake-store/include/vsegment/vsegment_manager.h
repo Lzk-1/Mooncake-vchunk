@@ -30,13 +30,22 @@ struct PartitionVSegmentSnapshot {
 YLT_REFL(PartitionVSegmentSnapshot, partition_id, config_generation,
          vsegments, next_creation_slots);
 
+class VSegmentStateCommitter {
+   public:
+    virtual ~VSegmentStateCommitter() = default;
+    virtual ErrorCode Commit(const PartitionVSegmentSnapshot& state,
+                             const std::string& mutation,
+                             std::string* detail) = 0;
+};
+
 // Partition-local facade intended to be owned by the Partition's SubMaster.
 // Persistence transport is deliberately outside this class: HA Snapshot/OpLog
 // code serializes the returned state and calls Restore after failover.
 class VSegmentManager {
    public:
     VSegmentManager(PartitionVSegmentConfig config,
-                    std::vector<VSegmentProfile> profiles);
+                    std::vector<VSegmentProfile> profiles,
+                    std::shared_ptr<VSegmentStateCommitter> committer);
 
     VSegmentAllocationResult Create(const std::string& profile_name);
     ReservationResult ReservePut(const std::string& vsegment_id,
@@ -73,6 +82,9 @@ class VSegmentManager {
                                    uint64_t creation_slot);
     VSegmentAllocationResult GetOrCreate(const std::string& profile_name,
                                          uint64_t creation_slot);
+    PartitionVSegmentSnapshot SnapshotLocked() const;
+    ErrorCode PersistLocked(const std::string& mutation,
+                            std::string* detail = nullptr);
     PartitionVSegmentConfig config_;
     std::unordered_map<std::string, VSegmentProfile> profiles_;
     PartitionQuotaAllocator physical_allocator_;
@@ -81,6 +93,7 @@ class VSegmentManager {
     std::unordered_map<std::string, ManagedVSegment> vsegments_;
     std::unordered_map<std::string, std::string> creation_results_;
     std::unordered_map<std::string, uint64_t> next_creation_slots_;
+    std::shared_ptr<VSegmentStateCommitter> committer_;
 };
 
 }  // namespace mooncake::vsegment
