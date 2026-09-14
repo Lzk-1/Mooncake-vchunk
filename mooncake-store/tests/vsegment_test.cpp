@@ -72,7 +72,8 @@ TEST(VSegmentViewTest, LifecycleDoesNotChangeImmutableViewChecksum) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    VSegmentStateSnapshot state{"default", Lifecycle::ACTIVE,
+    VSegmentStateSnapshot state{"default", "partition-1/default/0",
+                                Lifecycle::ACTIVE,
                                 allocation.view, {}};
     const auto checksum = state.view.checksum;
     state.lifecycle = Lifecycle::DRAINING;
@@ -125,18 +126,39 @@ TEST(LogicalRangeAllocatorTest, ReservationIsIdempotentAndAbortReturnsSpace) {
     EXPECT_EQ(allocator.FreeBytes(), 896);
     EXPECT_EQ(allocator.ReservationCount(), 1);
     EXPECT_EQ(allocator.Abort("put-1"), ErrorCode::OK);
+    EXPECT_EQ(allocator.Abort("put-1"), ErrorCode::OK);
     EXPECT_EQ(allocator.FreeBytes(), 1024);
+}
+
+TEST(LogicalRangeAllocatorTest, ReleaseRequiresExactObjectAllocation) {
+    LogicalRangeAllocator allocator(1024);
+    ASSERT_TRUE(allocator.Reserve("put-1", 128));
+    LogicalRange committed;
+    ASSERT_EQ(allocator.Commit("put-1", "object-1", &committed),
+              ErrorCode::OK);
+    EXPECT_EQ(allocator.Release("object-2", committed),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(allocator.Release("object-1",
+                                {committed.offset, committed.length / 2}),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(allocator.FreeBytes(), 896);
 }
 
 TEST(LogicalRangeAllocatorTest, CommitKeepsRangeAllocatedUntilRelease) {
     LogicalRangeAllocator allocator(1024);
     ASSERT_TRUE(allocator.Reserve("put-1", 128));
     LogicalRange committed;
-    EXPECT_EQ(allocator.Commit("put-1", &committed), ErrorCode::OK);
+    EXPECT_EQ(allocator.Commit("put-1", "object-1", &committed),
+              ErrorCode::OK);
+    LogicalRange retried;
+    EXPECT_EQ(allocator.Commit("put-1", "object-1", &retried),
+              ErrorCode::OK);
+    EXPECT_EQ(retried.offset, committed.offset);
     EXPECT_EQ(allocator.FreeBytes(), 896);
-    EXPECT_EQ(allocator.Release(committed), ErrorCode::OK);
+    EXPECT_EQ(allocator.Release("object-1", committed), ErrorCode::OK);
     EXPECT_EQ(allocator.FreeBytes(), 1024);
-    EXPECT_EQ(allocator.Release(committed), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(allocator.Release("object-1", committed),
+              ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST(VSegmentResolverTest, SplitsAtStripeAndClientSliceBoundaries) {
@@ -204,7 +226,7 @@ TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
 
 TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
     VSegmentManager manager(Config(), {Profile()});
-    auto allocation = manager.GetOrCreate("default", 0);
+    auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
     auto reservation = manager.ReservePut(allocation.view.vsegment_id,
                                           "put-1", 128);
@@ -222,7 +244,7 @@ TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
     EXPECT_EQ(restored_view.checksum, allocation.view.checksum);
     LogicalRange committed;
     EXPECT_EQ(recovered.CommitPut(allocation.view.vsegment_id, "put-1",
-                                  &committed),
+                                  "object-1", &committed),
               ErrorCode::OK);
     EXPECT_EQ(committed.offset, reservation.range.offset);
     EXPECT_EQ(committed.length, reservation.range.length);
@@ -230,7 +252,7 @@ TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
 
 TEST(VSegmentManagerTest, RejectsSnapshotFromAnotherConfigGeneration) {
     VSegmentManager manager(Config(), {Profile()});
-    ASSERT_TRUE(manager.GetOrCreate("default", 0));
+    ASSERT_TRUE(manager.Create("default"));
     auto snapshot = manager.Snapshot();
     snapshot.config_generation = 2;
 
@@ -238,10 +260,45 @@ TEST(VSegmentManagerTest, RejectsSnapshotFromAnotherConfigGeneration) {
     EXPECT_EQ(recovered.Restore(snapshot), ErrorCode::INVALID_VERSION);
 }
 
+TEST(VSegmentManagerTest, EnforcesLifecycleTransitions) {
+    VSegmentManager manager(Config(), {Profile()});
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::DRAINING),
+              ErrorCode::OK);
+    EXPECT_FALSE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 8));
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OK);
+}
+
+TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
+    VSegmentManager manager(Config(), {Profile()});
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
+    LogicalRange range;
+    ASSERT_EQ(manager.CommitPut(allocation.view.vsegment_id, "put-1",
+                                "object-1", &range),
+              ErrorCode::OK);
+    auto snapshot = manager.Snapshot();
+
+    VSegmentManager recovered(Config(), {Profile()});
+    ASSERT_EQ(recovered.Restore(snapshot), ErrorCode::OK);
+    EXPECT_EQ(recovered.ReleaseObject(allocation.view.vsegment_id,
+                                      "object-1", range),
+              ErrorCode::OK);
+}
+
 TEST(VSegmentManagerTest, SnapshotIsJsonSerializable) {
     VSegmentManager manager(Config(), {Profile()});
-    ASSERT_TRUE(manager.GetOrCreate("default", 0));
-    ASSERT_TRUE(manager.ReservePut("partition-1/default/0", "put-1", 64));
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
 
     std::string json;
     struct_json::to_json(manager.Snapshot(), json);

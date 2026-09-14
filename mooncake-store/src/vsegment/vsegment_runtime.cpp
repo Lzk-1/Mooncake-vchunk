@@ -53,6 +53,14 @@ ReservationResult LogicalRangeAllocator::Reserve(
         }
         return {ErrorCode::OK, existing->second, {}};
     }
+    auto completed = completed_operations_.find(operation_id);
+    if (completed != completed_operations_.end()) {
+        if (completed->second.outcome == OperationOutcome::COMMITTED &&
+            completed->second.range.length == length)
+            return {ErrorCode::OK, completed->second.range, {}};
+        return ReservationError(ErrorCode::INVALID_WRITE,
+                                "operation has already completed");
+    }
 
     auto range = std::find_if(free_ranges_.begin(), free_ranges_.end(),
                               [&](const auto& candidate) {
@@ -71,11 +79,30 @@ ReservationResult LogicalRangeAllocator::Reserve(
 }
 
 ErrorCode LogicalRangeAllocator::Commit(const std::string& operation_id,
+                                        const std::string& allocation_id,
                                         LogicalRange* range) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (allocation_id.empty()) return ErrorCode::INVALID_PARAMS;
+    auto completed = completed_operations_.find(operation_id);
+    if (completed != completed_operations_.end()) {
+        if (completed->second.outcome != OperationOutcome::COMMITTED ||
+            completed->second.allocation_id != allocation_id)
+            return ErrorCode::INVALID_WRITE;
+        if (range) *range = completed->second.range;
+        return ErrorCode::OK;
+    }
     auto reservation = reservations_.find(operation_id);
     if (reservation == reservations_.end()) return ErrorCode::INVALID_WRITE;
+    auto allocated = committed_allocations_.find(allocation_id);
+    if (allocated != committed_allocations_.end())
+        return ErrorCode::OBJECT_ALREADY_EXISTS;
     if (range) *range = reservation->second;
+    committed_allocations_[allocation_id] = reservation->second;
+    completed_operations_.emplace(
+        operation_id,
+        CompletedOperationRecord{operation_id, allocation_id,
+                                 OperationOutcome::COMMITTED,
+                                 reservation->second});
     reservations_.erase(reservation);
     return ErrorCode::OK;
 }
@@ -100,9 +127,18 @@ void LogicalRangeAllocator::InsertAndMerge(
 
 ErrorCode LogicalRangeAllocator::Abort(const std::string& operation_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    auto completed = completed_operations_.find(operation_id);
+    if (completed != completed_operations_.end())
+        return completed->second.outcome == OperationOutcome::ABORTED
+                   ? ErrorCode::OK
+                   : ErrorCode::INVALID_WRITE;
     auto reservation = reservations_.find(operation_id);
     if (reservation == reservations_.end()) return ErrorCode::INVALID_WRITE;
     InsertAndMerge(free_ranges_, reservation->second);
+    completed_operations_.emplace(
+        operation_id,
+        CompletedOperationRecord{operation_id, {}, OperationOutcome::ABORTED,
+                                 reservation->second});
     reservations_.erase(reservation);
     return ErrorCode::OK;
 }
@@ -117,14 +153,26 @@ bool LogicalRangeAllocator::OverlapsFreeOrReserved(LogicalRange range) const {
     return false;
 }
 
-ErrorCode LogicalRangeAllocator::Release(LogicalRange range) {
+ErrorCode LogicalRangeAllocator::Release(const std::string& allocation_id,
+                                         LogicalRange range) {
     std::lock_guard<std::mutex> lock(mutex_);
+    auto allocation = committed_allocations_.find(allocation_id);
+    if (allocation == committed_allocations_.end() ||
+        allocation->second.offset != range.offset ||
+        allocation->second.length != range.length)
+        return ErrorCode::OBJECT_NOT_FOUND;
     if (range.length == 0 || AddOverflows(range.offset, range.length) ||
         range.offset + range.length > logical_capacity_ ||
         OverlapsFreeOrReserved(range)) {
         return ErrorCode::INVALID_PARAMS;
     }
     InsertAndMerge(free_ranges_, range);
+    committed_allocations_.erase(allocation);
+    for (auto& [operation_id, completed] : completed_operations_) {
+        if (completed.allocation_id == allocation_id &&
+            completed.outcome == OperationOutcome::COMMITTED)
+            completed.outcome = OperationOutcome::RELEASED;
+    }
     return ErrorCode::OK;
 }
 
@@ -136,7 +184,14 @@ LogicalAllocationSnapshot LogicalRangeAllocator::Snapshot() const {
     for (const auto& [operation_id, range] : reservations_) {
         snapshot.reservations.push_back({operation_id, range});
     }
+    for (const auto& [operation_id, completed] : completed_operations_)
+        snapshot.completed_operations.push_back(completed);
     std::sort(snapshot.reservations.begin(), snapshot.reservations.end(),
+              [](const auto& left, const auto& right) {
+                  return left.operation_id < right.operation_id;
+              });
+    std::sort(snapshot.completed_operations.begin(),
+              snapshot.completed_operations.end(),
               [](const auto& left, const auto& right) {
                   return left.operation_id < right.operation_id;
               });
@@ -152,6 +207,8 @@ ErrorCode LogicalRangeAllocator::Restore(
     }
     std::vector<LogicalRange> all_ranges = snapshot.free_ranges;
     std::unordered_map<std::string, LogicalRange> reservations;
+    std::unordered_map<std::string, CompletedOperationRecord> completed;
+    std::unordered_map<std::string, LogicalRange> committed;
     for (const auto& reservation : snapshot.reservations) {
         if (reservation.operation_id.empty() ||
             !reservations.emplace(reservation.operation_id, reservation.range)
@@ -160,6 +217,22 @@ ErrorCode LogicalRangeAllocator::Restore(
             return ErrorCode::INVALID_PARAMS;
         }
         all_ranges.push_back(reservation.range);
+    }
+    for (const auto& operation : snapshot.completed_operations) {
+        if (operation.operation_id.empty() ||
+            !completed.emplace(operation.operation_id, operation).second) {
+            if (detail) *detail = "duplicate completed operation identity";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (operation.outcome == OperationOutcome::COMMITTED) {
+            if (operation.allocation_id.empty() ||
+                !committed.emplace(operation.allocation_id, operation.range)
+                     .second) {
+                if (detail) *detail = "invalid committed allocation identity";
+                return ErrorCode::INVALID_PARAMS;
+            }
+            all_ranges.push_back(operation.range);
+        }
     }
     std::sort(all_ranges.begin(), all_ranges.end(),
               [](const auto& left, const auto& right) {
@@ -182,6 +255,8 @@ ErrorCode LogicalRangeAllocator::Restore(
                   return left.offset < right.offset;
               });
     reservations_ = std::move(reservations);
+    completed_operations_ = std::move(completed);
+    committed_allocations_ = std::move(committed);
     return ErrorCode::OK;
 }
 

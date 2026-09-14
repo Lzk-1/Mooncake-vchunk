@@ -33,13 +33,24 @@ struct ReservationRecord {
 };
 YLT_REFL(ReservationRecord, operation_id, range);
 
+enum class OperationOutcome : uint8_t { COMMITTED, ABORTED, RELEASED };
+struct CompletedOperationRecord {
+    std::string operation_id;
+    std::string allocation_id;
+    OperationOutcome outcome{OperationOutcome::ABORTED};
+    LogicalRange range;
+};
+YLT_REFL(CompletedOperationRecord, operation_id, allocation_id, outcome,
+         range);
+
 struct LogicalAllocationSnapshot {
     uint64_t logical_capacity{0};
     std::vector<LogicalRange> free_ranges;
     std::vector<ReservationRecord> reservations;
+    std::vector<CompletedOperationRecord> completed_operations;
 };
 YLT_REFL(LogicalAllocationSnapshot, logical_capacity, free_ranges,
-         reservations);
+         reservations, completed_operations);
 
 // Tracks only free space and in-flight PutStart reservations. Committed ranges
 // are represented by ObjectMetadata and are returned through Release().
@@ -49,9 +60,10 @@ class LogicalRangeAllocator {
 
     ReservationResult Reserve(const std::string& operation_id,
                               uint64_t length);
-    ErrorCode Commit(const std::string& operation_id, LogicalRange* range);
+    ErrorCode Commit(const std::string& operation_id,
+                     const std::string& allocation_id, LogicalRange* range);
     ErrorCode Abort(const std::string& operation_id);
-    ErrorCode Release(LogicalRange range);
+    ErrorCode Release(const std::string& allocation_id, LogicalRange range);
 
     LogicalAllocationSnapshot Snapshot() const;
     ErrorCode Restore(const LogicalAllocationSnapshot& snapshot,
@@ -69,6 +81,9 @@ class LogicalRangeAllocator {
     mutable std::mutex mutex_;
     std::vector<LogicalRange> free_ranges_;
     std::unordered_map<std::string, LogicalRange> reservations_;
+    std::unordered_map<std::string, CompletedOperationRecord>
+        completed_operations_;
+    std::unordered_map<std::string, LogicalRange> committed_allocations_;
 };
 
 struct ClientSlice {
@@ -99,8 +114,8 @@ ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
                               const std::vector<ClientSlice>& slices);
 
-// Serializes creation for the same creation_key. Different keys may execute
-// concurrently, and successful results remain cached for subsequent callers.
+// Serializes overlapping creation calls for the same creation_key. The owner
+// stores durable results and calls Forget after publishing them.
 class CreationCoordinator {
    public:
     using Factory = std::function<VSegmentAllocationResult()>;
