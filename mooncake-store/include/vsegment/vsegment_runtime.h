@@ -17,6 +17,7 @@ struct LogicalRange {
     uint64_t offset{0};
     uint64_t length{0};
 };
+YLT_REFL(LogicalRange, offset, length);
 
 struct ReservationResult {
     ErrorCode error{ErrorCode::OK};
@@ -25,6 +26,20 @@ struct ReservationResult {
 
     explicit operator bool() const { return error == ErrorCode::OK; }
 };
+
+struct ReservationRecord {
+    std::string operation_id;
+    LogicalRange range;
+};
+YLT_REFL(ReservationRecord, operation_id, range);
+
+struct LogicalAllocationSnapshot {
+    uint64_t logical_capacity{0};
+    std::vector<LogicalRange> free_ranges;
+    std::vector<ReservationRecord> reservations;
+};
+YLT_REFL(LogicalAllocationSnapshot, logical_capacity, free_ranges,
+         reservations);
 
 // Tracks only free space and in-flight PutStart reservations. Committed ranges
 // are represented by ObjectMetadata and are returned through Release().
@@ -37,6 +52,10 @@ class LogicalRangeAllocator {
     ErrorCode Commit(const std::string& operation_id, LogicalRange* range);
     ErrorCode Abort(const std::string& operation_id);
     ErrorCode Release(LogicalRange range);
+
+    LogicalAllocationSnapshot Snapshot() const;
+    ErrorCode Restore(const LogicalAllocationSnapshot& snapshot,
+                      std::string* detail = nullptr);
 
     uint64_t FreeBytes() const;
     size_t ReservationCount() const;

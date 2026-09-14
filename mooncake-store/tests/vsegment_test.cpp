@@ -1,5 +1,6 @@
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
+#include "vsegment/vsegment_manager.h"
 
 #include <gtest/gtest.h>
 
@@ -144,6 +145,56 @@ TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(first.view.vsegment_id, "vs-1");
     EXPECT_EQ(second.view.vsegment_id, "vs-1");
+}
+
+TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
+    VSegmentManager manager(Config(), {Profile()});
+    auto allocation = manager.GetOrCreate("default", 0);
+    ASSERT_TRUE(allocation);
+    auto reservation = manager.ReservePut(allocation.view.vsegment_id,
+                                          "put-1", 128);
+    ASSERT_TRUE(reservation);
+
+    const auto snapshot = manager.Snapshot();
+    ASSERT_EQ(snapshot.vsegments.size(), 1);
+    VSegmentManager recovered(Config(), {Profile()});
+    std::string detail;
+    ASSERT_EQ(recovered.Restore(snapshot, &detail), ErrorCode::OK) << detail;
+
+    VSegmentView restored_view;
+    EXPECT_TRUE(recovered.FindView(allocation.view.vsegment_id,
+                                   &restored_view));
+    EXPECT_EQ(restored_view.checksum, allocation.view.checksum);
+    LogicalRange committed;
+    EXPECT_EQ(recovered.CommitPut(allocation.view.vsegment_id, "put-1",
+                                  &committed),
+              ErrorCode::OK);
+    EXPECT_EQ(committed.offset, reservation.range.offset);
+    EXPECT_EQ(committed.length, reservation.range.length);
+}
+
+TEST(VSegmentManagerTest, RejectsSnapshotFromAnotherConfigGeneration) {
+    VSegmentManager manager(Config(), {Profile()});
+    ASSERT_TRUE(manager.GetOrCreate("default", 0));
+    auto snapshot = manager.Snapshot();
+    snapshot.config_generation = 2;
+
+    VSegmentManager recovered(Config(), {Profile()});
+    EXPECT_EQ(recovered.Restore(snapshot), ErrorCode::INVALID_VERSION);
+}
+
+TEST(VSegmentManagerTest, SnapshotIsJsonSerializable) {
+    VSegmentManager manager(Config(), {Profile()});
+    ASSERT_TRUE(manager.GetOrCreate("default", 0));
+    ASSERT_TRUE(manager.ReservePut("partition-1/default/0", "put-1", 64));
+
+    std::string json;
+    struct_json::to_json(manager.Snapshot(), json);
+    PartitionVSegmentSnapshot decoded;
+    struct_json::from_json(decoded, json);
+    ASSERT_EQ(decoded.vsegments.size(), 1);
+    EXPECT_EQ(decoded.partition_id, "partition-1");
+    EXPECT_EQ(decoded.vsegments[0].logical_allocation.reservations.size(), 1);
 }
 
 }  // namespace

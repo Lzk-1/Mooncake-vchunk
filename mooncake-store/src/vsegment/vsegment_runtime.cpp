@@ -128,6 +128,63 @@ ErrorCode LogicalRangeAllocator::Release(LogicalRange range) {
     return ErrorCode::OK;
 }
 
+LogicalAllocationSnapshot LogicalRangeAllocator::Snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    LogicalAllocationSnapshot snapshot;
+    snapshot.logical_capacity = logical_capacity_;
+    snapshot.free_ranges = free_ranges_;
+    for (const auto& [operation_id, range] : reservations_) {
+        snapshot.reservations.push_back({operation_id, range});
+    }
+    std::sort(snapshot.reservations.begin(), snapshot.reservations.end(),
+              [](const auto& left, const auto& right) {
+                  return left.operation_id < right.operation_id;
+              });
+    return snapshot;
+}
+
+ErrorCode LogicalRangeAllocator::Restore(
+    const LogicalAllocationSnapshot& snapshot, std::string* detail) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (snapshot.logical_capacity != logical_capacity_) {
+        if (detail) *detail = "logical capacity changed during restore";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::vector<LogicalRange> all_ranges = snapshot.free_ranges;
+    std::unordered_map<std::string, LogicalRange> reservations;
+    for (const auto& reservation : snapshot.reservations) {
+        if (reservation.operation_id.empty() ||
+            !reservations.emplace(reservation.operation_id, reservation.range)
+                 .second) {
+            if (detail) *detail = "duplicate or empty reservation identity";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        all_ranges.push_back(reservation.range);
+    }
+    std::sort(all_ranges.begin(), all_ranges.end(),
+              [](const auto& left, const auto& right) {
+                  return left.offset < right.offset;
+              });
+    for (size_t index = 0; index < all_ranges.size(); ++index) {
+        const auto& range = all_ranges[index];
+        if (range.length == 0 || AddOverflows(range.offset, range.length) ||
+            range.offset + range.length > logical_capacity_ ||
+            (index > 0 && all_ranges[index - 1].offset +
+                                      all_ranges[index - 1].length >
+                                  range.offset)) {
+            if (detail) *detail = "invalid or overlapping logical ranges";
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    free_ranges_ = snapshot.free_ranges;
+    std::sort(free_ranges_.begin(), free_ranges_.end(),
+              [](const auto& left, const auto& right) {
+                  return left.offset < right.offset;
+              });
+    reservations_ = std::move(reservations);
+    return ErrorCode::OK;
+}
+
 uint64_t LogicalRangeAllocator::FreeBytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t bytes = 0;

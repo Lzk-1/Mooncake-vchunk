@@ -23,6 +23,7 @@ struct PSegmentExtent {
                base_offset == other.base_offset && length == other.length;
     }
 };
+YLT_REFL(PSegmentExtent, segment_id, base_offset, length);
 
 struct VSegmentProfile {
     std::string name;
@@ -30,18 +31,22 @@ struct VSegmentProfile {
     uint64_t stripe_size{0};
     uint64_t member_extent_size{0};
 };
+YLT_REFL(VSegmentProfile, name, member_count, stripe_size,
+         member_extent_size);
 
 struct PartitionPSegmentQuota {
     std::string segment_id;
     uint64_t base_offset{0};
     uint64_t length{0};
 };
+YLT_REFL(PartitionPSegmentQuota, segment_id, base_offset, length);
 
 struct PartitionVSegmentConfig {
     std::string partition_id;
     uint64_t config_generation{0};
     std::vector<PartitionPSegmentQuota> quotas;
 };
+YLT_REFL(PartitionVSegmentConfig, partition_id, config_generation, quotas);
 
 struct VSegmentView {
     std::string vsegment_id;
@@ -53,6 +58,8 @@ struct VSegmentView {
     std::vector<PSegmentExtent> members;
     uint32_t checksum{0};
 };
+YLT_REFL(VSegmentView, vsegment_id, partition_id, mapping_algorithm,
+         stripe_size, logical_capacity, lifecycle, members, checksum);
 
 struct VSegmentAllocationResult {
     ErrorCode error{ErrorCode::OK};
@@ -83,6 +90,9 @@ class PartitionQuotaAllocator {
 
     VSegmentAllocationResult Allocate(const std::string& vsegment_id,
                                       const VSegmentProfile& profile);
+    ErrorCode Restore(const VSegmentView& view,
+                      const VSegmentProfile& profile,
+                      std::string* detail = nullptr);
     ErrorCode Release(const VSegmentView& view);
 
     uint64_t FreeBytes(const std::string& segment_id) const;

@@ -213,6 +213,62 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     return result;
 }
 
+ErrorCode PartitionQuotaAllocator::Restore(const VSegmentView& view,
+                                           const VSegmentProfile& profile,
+                                           std::string* detail) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto validation = ValidateView(view, profile, detail);
+    if (validation != ErrorCode::OK) return validation;
+    if (view.partition_id != config_.partition_id)
+        return Invalid("view belongs to another partition", detail);
+    if (allocations_.count(view.vsegment_id))
+        return Invalid("duplicate vsegment in restore state", detail);
+
+    struct Match {
+        std::string segment;
+        size_t range_index;
+        PSegmentExtent extent;
+    };
+    std::vector<Match> matches;
+    for (const auto& member : view.members) {
+        auto segment = free_ranges_.find(member.segment_id);
+        if (segment == free_ranges_.end())
+            return Invalid("member is outside Partition quota", detail);
+        auto range = std::find_if(
+            segment->second.begin(), segment->second.end(), [&](const auto& r) {
+                return member.base_offset >= r.offset &&
+                       member.base_offset + member.length <= r.offset + r.length;
+            });
+        if (range == segment->second.end())
+            return Invalid("member overlaps another restored view", detail);
+        matches.push_back({member.segment_id,
+                           static_cast<size_t>(range - segment->second.begin()),
+                           member});
+    }
+
+    for (const auto& match : matches) {
+        auto& ranges = free_ranges_.at(match.segment);
+        const auto original = ranges[match.range_index];
+        const auto original_end = original.offset + original.length;
+        const auto member_end =
+            match.extent.base_offset + match.extent.length;
+        ranges.erase(ranges.begin() + match.range_index);
+        if (original.offset < match.extent.base_offset) {
+            ranges.push_back(
+                {original.offset, match.extent.base_offset - original.offset});
+        }
+        if (member_end < original_end) {
+            ranges.push_back({member_end, original_end - member_end});
+        }
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.offset < b.offset;
+                  });
+    }
+    allocations_.emplace(view.vsegment_id, view);
+    return ErrorCode::OK;
+}
+
 void PartitionQuotaAllocator::InsertAndMerge(std::vector<Range>& ranges,
                                              Range range) {
     ranges.push_back(range);
