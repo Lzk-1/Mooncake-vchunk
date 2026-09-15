@@ -1,6 +1,7 @@
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_manager.h"
+#include "vsegment/partition_quota_planner.h"
 
 #include <gtest/gtest.h>
 
@@ -85,6 +86,76 @@ TEST(VSegmentConfigTest, ValidatesPublishedConfigAgainstSegmentGeometry) {
     EXPECT_EQ(ValidatePublishedConfig({profile}, {config}, segments,
                                       {{"partition-1", 1}}),
               ErrorCode::INVALID_PARAMS);
+}
+
+TEST(PartitionQuotaPlannerTest, SplitsEveryMediumAcrossAllPartitions) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 7;
+    request.policy_digest = "policy-v7";
+    request.default_profile = "dram";
+    request.partition_ids = {"partition-b", "partition-a"};
+    request.profile_specs = {
+        {.name = "dram",
+         .member_count = 2,
+         .stripe_size = 64,
+         .member_extent_size = 128,
+         .io_alignment = 8,
+         .required_medium = "DRAM"},
+        {.name = "nvme",
+         .member_count = 2,
+         .stripe_size = 64,
+         .member_extent_size = 128,
+         .io_alignment = 8,
+         .required_medium = "NVMe"}};
+    request.segments = {{"dram-a", 1024, 8, "DRAM"},
+                        {"dram-b", 1024, 8, "DRAM"},
+                        {"nvme-a", 2048, 8, "NVMe"},
+                        {"nvme-b", 2048, 8, "NVMe"}};
+
+    auto result = PartitionQuotaPlanner().Plan(request);
+    ASSERT_TRUE(result) << result.detail;
+    ASSERT_EQ(result.snapshot.quotas.size(), 4);
+    EXPECT_EQ(result.snapshot.quotas[0].partition_id, "partition-a");
+    EXPECT_EQ(result.snapshot.quotas[0].profile_name, "dram");
+    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 0);
+    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 512);
+    EXPECT_EQ(result.snapshot.quotas[2].profile_name, "nvme");
+    EXPECT_EQ(ValidateQuotaSnapshot(result.snapshot, request.segments),
+              ErrorCode::OK);
+
+    PartitionVSegmentConfig config;
+    EXPECT_EQ(BuildPartitionConfig(result.snapshot, "partition-a", "nvme",
+                                   &config),
+              ErrorCode::OK);
+    EXPECT_EQ(config.quotas.size(), 2);
+    EXPECT_EQ(config.config_generation, 7);
+}
+
+TEST(PartitionQuotaPlannerTest, RejectsInsufficientMemberSegments) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 1;
+    request.policy_digest = "policy";
+    request.default_profile = "default";
+    request.partition_ids = {"partition-a"};
+    request.profile_specs = {Profile(2)};
+    request.segments = {{"only-one", 4096, 8, "DRAM"}};
+    auto result = PartitionQuotaPlanner().Plan(request);
+    EXPECT_EQ(result.error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+    EXPECT_NE(result.detail.find("requires 2 psegments"), std::string::npos);
+}
+
+TEST(PartitionQuotaPlannerTest, ExcludesUnhealthySegments) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 1;
+    request.policy_digest = "policy";
+    request.default_profile = "default";
+    request.partition_ids = {"partition-a"};
+    request.profile_specs = {Profile(2)};
+    request.segments = {{"healthy", 4096, 8, "DRAM", true, true, "host-a"},
+                        {"unhealthy", 4096, 8, "DRAM", false, true,
+                         "host-b"}};
+    EXPECT_EQ(PartitionQuotaPlanner().Plan(request).error,
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
 }
 
 TEST(VSegmentViewTest, ChecksumCoversOrderedMembers) {

@@ -33,9 +33,13 @@ struct VSegmentProfile {
     uint64_t member_extent_size{0};
     uint64_t io_alignment{1};
     std::string required_medium;
+    uint32_t initial_vsegment_count{1};
 };
 YLT_REFL(VSegmentProfile, name, member_count, stripe_size,
-         member_extent_size, io_alignment, required_medium);
+         member_extent_size, io_alignment, required_medium,
+         initial_vsegment_count);
+
+using VSegmentProfileSpec = VSegmentProfile;
 
 struct PartitionPSegmentQuota {
     std::string segment_id;
@@ -59,8 +63,32 @@ struct PSegmentGeometry {
     uint64_t capacity{0};
     uint64_t io_alignment{1};
     std::string medium;
+    bool healthy{true};
+    bool supports_unaligned_io{true};
+    std::string failure_domain;
 };
-YLT_REFL(PSegmentGeometry, segment_id, capacity, io_alignment, medium);
+YLT_REFL(PSegmentGeometry, segment_id, capacity, io_alignment, medium, healthy,
+         supports_unaligned_io, failure_domain);
+
+struct PartitionPhysicalQuota {
+    std::string partition_id;
+    std::string profile_name;
+    std::string medium;
+    std::vector<PSegmentExtent> extents;
+};
+YLT_REFL(PartitionPhysicalQuota, partition_id, profile_name, medium, extents);
+
+// Immutable cluster-wide result produced by PartitionQuotaPlanner. It is small
+// control-plane metadata and is published as one CAS-protected ETCD value.
+struct PartitionPhysicalQuotaSnapshot {
+    uint64_t config_generation{0};
+    std::string policy_digest;
+    std::string default_profile;
+    std::vector<VSegmentProfileSpec> profile_specs;
+    std::vector<PartitionPhysicalQuota> quotas;
+};
+YLT_REFL(PartitionPhysicalQuotaSnapshot, config_generation, policy_digest,
+         default_profile, profile_specs, quotas);
 
 struct VSegmentView {
     std::string vsegment_id;
@@ -99,6 +127,18 @@ ErrorCode ValidateView(const VSegmentView& view,
                        std::string* detail = nullptr);
 ErrorCode ValidateViewStructure(const VSegmentView& view,
                                 std::string* detail = nullptr);
+ErrorCode ValidateQuotaSnapshot(
+    const PartitionPhysicalQuotaSnapshot& snapshot,
+    const std::vector<PSegmentGeometry>& segments,
+    std::string* detail = nullptr);
+
+// Builds the legacy partition-local allocator input from one profile in a
+// published snapshot. This keeps the allocator independent from ETCD while
+// allowing the runtime to consume the new multi-profile model.
+ErrorCode BuildPartitionConfig(
+    const PartitionPhysicalQuotaSnapshot& snapshot,
+    const std::string& partition_id, const std::string& profile_name,
+    PartitionVSegmentConfig* config, std::string* detail = nullptr);
 
 uint32_t ComputeViewChecksum(const VSegmentView& view);
 

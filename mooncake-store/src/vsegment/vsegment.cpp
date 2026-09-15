@@ -34,14 +34,16 @@ void AppendString(std::string& output, const std::string& value) {
 
 ErrorCode ValidateProfile(const VSegmentProfile& profile, std::string* detail) {
     if (profile.name.empty()) return Invalid("profile name is empty", detail);
-    if (profile.member_count == 0)
-        return Invalid("member_count must be positive", detail);
+    if (profile.member_count < 2)
+        return Invalid("member_count must be at least 2", detail);
     if (profile.stripe_size == 0)
         return Invalid("stripe_size must be positive", detail);
     if (profile.member_extent_size == 0)
         return Invalid("member_extent_size must be positive", detail);
     if (profile.io_alignment == 0)
         return Invalid("io_alignment must be positive", detail);
+    if (profile.initial_vsegment_count == 0)
+        return Invalid("initial_vsegment_count must be positive", detail);
     if (profile.stripe_size % profile.io_alignment != 0 ||
         profile.member_extent_size % profile.io_alignment != 0) {
         return Invalid("stripe and extent must satisfy io_alignment", detail);
@@ -260,6 +262,135 @@ ErrorCode ValidateViewStructure(const VSegmentView& view,
     }
     if (view.checksum != ComputeViewChecksum(view))
         return ErrorCode::CHECKSUM_MISMATCH;
+    return ErrorCode::OK;
+}
+
+ErrorCode ValidateQuotaSnapshot(
+    const PartitionPhysicalQuotaSnapshot& snapshot,
+    const std::vector<PSegmentGeometry>& segments, std::string* detail) {
+    if (snapshot.config_generation == 0)
+        return Invalid("quota snapshot generation must be positive", detail);
+    if (snapshot.policy_digest.empty())
+        return Invalid("quota snapshot policy_digest is empty", detail);
+    if (snapshot.default_profile.empty())
+        return Invalid("quota snapshot default_profile is empty", detail);
+
+    std::unordered_map<std::string, VSegmentProfileSpec> profiles;
+    for (const auto& profile : snapshot.profile_specs) {
+        auto result = ValidateProfile(profile, detail);
+        if (result != ErrorCode::OK) return result;
+        if (!profiles.emplace(profile.name, profile).second)
+            return Invalid("duplicate quota snapshot profile", detail);
+    }
+    if (!profiles.count(snapshot.default_profile))
+        return Invalid("default_profile is not present in profile_specs",
+                       detail);
+
+    std::unordered_map<std::string, PSegmentGeometry> geometry;
+    for (const auto& segment : segments) {
+        if (segment.segment_id.empty() || segment.capacity == 0 ||
+            segment.io_alignment == 0)
+            return Invalid("invalid psegment geometry", detail);
+        if (!geometry.emplace(segment.segment_id, segment).second)
+            return Invalid("duplicate psegment geometry", detail);
+    }
+
+    struct OwnedRange {
+        uint64_t offset;
+        uint64_t length;
+    };
+    std::unordered_map<std::string, std::vector<OwnedRange>> ranges;
+    std::set<std::pair<std::string, std::string>> quota_keys;
+    for (const auto& quota : snapshot.quotas) {
+        if (quota.partition_id.empty() || quota.profile_name.empty() ||
+            quota.extents.empty())
+            return Invalid("invalid empty quota identity or extents", detail);
+        if (!quota_keys.emplace(quota.partition_id, quota.profile_name).second)
+            return Invalid("duplicate partition/profile quota", detail);
+        auto profile = profiles.find(quota.profile_name);
+        if (profile == profiles.end())
+            return Invalid("quota references unknown profile", detail);
+        if (quota.medium != profile->second.required_medium)
+            return Invalid("quota medium does not match profile", detail);
+
+        std::set<std::string> members;
+        uint32_t eligible = 0;
+        if (profile->second.member_extent_size >
+            std::numeric_limits<uint64_t>::max() /
+                profile->second.initial_vsegment_count)
+            return Invalid("initial profile allocation overflows", detail);
+        const uint64_t initial_bytes =
+            profile->second.member_extent_size *
+            profile->second.initial_vsegment_count;
+        for (const auto& extent : quota.extents) {
+            auto segment = geometry.find(extent.segment_id);
+            if (segment == geometry.end())
+                return Invalid("quota references unknown psegment", detail);
+            if (!segment->second.healthy ||
+                !segment->second.supports_unaligned_io)
+                return Invalid("quota references ineligible psegment", detail);
+            if (segment->second.medium != quota.medium)
+                return Invalid("quota psegment medium mismatch", detail);
+            if (extent.length == 0 ||
+                AddOverflows(extent.base_offset, extent.length) ||
+                extent.base_offset + extent.length > segment->second.capacity)
+                return Invalid("quota extent exceeds psegment", detail);
+            const auto alignment = std::max(profile->second.io_alignment,
+                                            segment->second.io_alignment);
+            if (extent.base_offset % alignment != 0 ||
+                extent.length % alignment != 0)
+                return Invalid("quota extent is not aligned", detail);
+            if (members.insert(extent.segment_id).second &&
+                extent.length >= initial_bytes)
+                ++eligible;
+            ranges[extent.segment_id].push_back(
+                {extent.base_offset, extent.length});
+        }
+        if (eligible < profile->second.member_count)
+            return Invalid("quota cannot create one configured vsegment",
+                           detail);
+    }
+    for (auto& [segment, owned] : ranges) {
+        std::sort(owned.begin(), owned.end(), [](const auto& a, const auto& b) {
+            return a.offset < b.offset;
+        });
+        for (size_t i = 1; i < owned.size(); ++i) {
+            if (owned[i - 1].offset + owned[i - 1].length > owned[i].offset)
+                return Invalid("quota snapshot has overlapping extents on " +
+                                   segment,
+                               detail);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode BuildPartitionConfig(
+    const PartitionPhysicalQuotaSnapshot& snapshot,
+    const std::string& partition_id, const std::string& profile_name,
+    PartitionVSegmentConfig* config, std::string* detail) {
+    if (!config) return Invalid("output config is null", detail);
+    auto profile = std::find_if(snapshot.profile_specs.begin(),
+                                snapshot.profile_specs.end(), [&](const auto& p) {
+                                    return p.name == profile_name;
+                                });
+    if (profile == snapshot.profile_specs.end())
+        return Invalid("unknown profile in quota snapshot", detail);
+    auto quota = std::find_if(snapshot.quotas.begin(), snapshot.quotas.end(),
+                              [&](const auto& q) {
+                                  return q.partition_id == partition_id &&
+                                         q.profile_name == profile_name;
+                              });
+    if (quota == snapshot.quotas.end())
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    PartitionVSegmentConfig output;
+    output.partition_id = partition_id;
+    output.profile_name = profile_name;
+    output.initial_vsegment_count = 1;
+    output.config_generation = snapshot.config_generation;
+    for (const auto& extent : quota->extents)
+        output.quotas.push_back(
+            {extent.segment_id, extent.base_offset, extent.length});
+    *config = std::move(output);
     return ErrorCode::OK;
 }
 
