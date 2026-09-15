@@ -793,6 +793,33 @@ TEST(VSegmentHaTest, RejectsRevisionGapAndStaleEpoch) {
               ErrorCode::STALE_ROUTE);
 }
 
+TEST(VSegmentHaTest, AcceptedCommitWaitsForDurabilityWithoutRollbackSignal) {
+    std::atomic<bool> allow_write{false};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{},
+        [&](const OpLogBatchRecord&, const DurablePrefix&) {
+            while (!allow_write.load()) std::this_thread::yield();
+            return ErrorCode::OK;
+        });
+    writer.Start();
+    OrderedOpLogVSegmentCommitter committer(
+        &writer, std::chrono::milliseconds(5));
+    PartitionVSegmentSnapshot state;
+    state.partition_id = "partition-1";
+    state.config_generation = 1;
+    state.route_epoch = 1;
+    state.metadata_revision = 1;
+
+    auto result = std::async(std::launch::async, [&] {
+        return committer.Commit(state, "logical_reserve", nullptr);
+    });
+    EXPECT_EQ(result.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    allow_write = true;
+    EXPECT_EQ(result.get(), ErrorCode::OK);
+    writer.Stop();
+}
+
 TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;

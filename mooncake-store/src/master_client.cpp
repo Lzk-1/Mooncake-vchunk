@@ -787,7 +787,15 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
 
 tl::expected<std::string, ErrorCode>
 MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
-    if (partition_router_.Size() == 0) return std::string{};
+    std::string cluster_namespace;
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        cluster_namespace = routing_cluster_namespace_;
+    }
+    // No routing configuration means an intentional legacy single-master
+    // deployment. An empty slot table alone is not sufficient evidence: it
+    // also occurs during startup and failed refreshes.
+    if (cluster_namespace.empty()) return std::string{};
 
     if (auto slot = ParsePartitionSlot(partition_id)) {
         auto target = partition_router_.ResolveSubmaster(*slot);
@@ -798,21 +806,13 @@ MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
         return *target;
     }
 
-    std::string cluster_namespace;
-    {
-        std::lock_guard<std::mutex> lock(routing_config_mutex_);
-        cluster_namespace = routing_cluster_namespace_;
-    }
-    if (cluster_namespace.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     partition::PartitionRoute route;
     ViewVersionId version = 0;
     auto error = cvm::EtcdViewStore::LoadPartitionRoute(
         cluster_namespace, partition_id, route, version);
     if (error != ErrorCode::OK) return tl::make_unexpected(error);
-    if (route.owner_submaster_id.empty() ||
+    if (route.partition_id.partition_id != partition_id ||
+        route.owner_submaster_id.empty() ||
         route.state !=
             static_cast<int32_t>(partition::PartitionState::kActive)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);

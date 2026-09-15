@@ -24,9 +24,13 @@ class OrderedOpLogVSegmentCommitter final : public VSegmentStateCommitter {
    public:
     explicit OrderedOpLogVSegmentCommitter(
         OrderedOpLogWriter* writer,
-        std::chrono::milliseconds durable_timeout =
+        std::chrono::milliseconds durable_wait_warning_interval =
             std::chrono::milliseconds(30000))
-        : writer_(writer), durable_timeout_(durable_timeout) {}
+        : writer_(writer),
+          durable_wait_warning_interval_(
+              durable_wait_warning_interval.count() > 0
+                  ? durable_wait_warning_interval
+                  : std::chrono::milliseconds(30000)) {}
 
     ErrorCode Commit(const PartitionVSegmentSnapshot& state,
                      const std::string& mutation,
@@ -34,7 +38,7 @@ class OrderedOpLogVSegmentCommitter final : public VSegmentStateCommitter {
 
    private:
     OrderedOpLogWriter* writer_;
-    std::chrono::milliseconds durable_timeout_;
+    std::chrono::milliseconds durable_wait_warning_interval_;
 };
 
 // Replays only vsegment state records after a snapshot. Every record carries

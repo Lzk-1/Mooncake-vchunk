@@ -700,6 +700,31 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
 }
 
 TEST_F(MasterServiceHATest,
+       RestoreFromStandbyPreservesVSegmentDescriptor) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto object = MakeStandbyObject("standby_vsegment_key", "unused");
+    Replica::Descriptor descriptor;
+    descriptor.id = 42;
+    descriptor.status = ReplicaStatus::COMPLETE;
+    descriptor.descriptor_variant =
+        VSegmentDescriptor{"partition-1", "vs-1", 128, 64};
+    object.metadata.replicas = {descriptor};
+
+    service.RestoreFromStandbySnapshot({object}, 7, {});
+
+    auto replicas = ReplicaDescriptorsForTesting(
+        service, kDefaultTenant, "standby_vsegment_key");
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_vsegment_replica());
+    const auto& restored = replicas.front().get_vsegment_descriptor();
+    EXPECT_EQ(restored.partition_id, "partition-1");
+    EXPECT_EQ(restored.vsegment_id, "vs-1");
+    EXPECT_EQ(restored.logical_offset, 128);
+    EXPECT_EQ(restored.length, 64);
+}
+
+TEST_F(MasterServiceHATest,
        RestoredMemoryReplicaBecomesEvictableOnlyAfterRemountLeaseExpires) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)

@@ -1165,6 +1165,9 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
                                           local_disk_desc.object_size,
                                           local_disk_desc.transport_endpoint,
                                           desc.status);
+                } else if (desc.is_vsegment_replica()) {
+                    replicas.emplace_back(desc.get_vsegment_descriptor(),
+                                          desc.status);
                 }
             }
 
@@ -3821,6 +3824,9 @@ void MasterService::RestoreFromStandbySnapshot(
                     replicas.emplace_back(
                         local_disk_desc.client_id, local_disk_desc.object_size,
                         local_disk_desc.transport_endpoint, desc.status);
+                } else if (desc.is_vsegment_replica()) {
+                    replicas.emplace_back(desc.get_vsegment_descriptor(),
+                                          desc.status);
                 }
             }
 

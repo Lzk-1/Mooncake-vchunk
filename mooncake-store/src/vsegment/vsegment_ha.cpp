@@ -3,6 +3,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include "mooncake_logging.h"
+
 namespace mooncake::vsegment {
 
 ErrorCode OrderedOpLogVSegmentCommitter::Commit(
@@ -50,10 +52,17 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
         return pending.error();
     }
     std::unique_lock<std::mutex> lock(wait->mutex);
-    if (!wait->ready.wait_for(lock, durable_timeout_,
-                              [&] { return wait->durable; })) {
-        if (detail) *detail = "timed out waiting for durable vsegment OpLog";
-        return ErrorCode::PERSISTENT_FAIL;
+    // Once Commit accepts an entry it cannot be cancelled: the ordered writer
+    // may persist it after any local timeout. Returning failure here would make
+    // VSegmentManager roll back memory while recovery later replays the entry.
+    // Preserve the write-ahead invariant by waiting for the durable callback;
+    // the interval is only used to surface a prolonged backend outage.
+    while (!wait->ready.wait_for(lock, durable_wait_warning_interval_,
+                                 [&] { return wait->durable; })) {
+        MC_LOG(WARNING)
+            << "Still waiting for durable vsegment OpLog, sequence_id="
+            << pending->sequence_id()
+            << ", writer_error=" << writer_->LastError();
     }
     return ErrorCode::OK;
 }
