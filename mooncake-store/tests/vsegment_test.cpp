@@ -1102,12 +1102,48 @@ TEST(VSegmentIntegrationTest, OrdinaryPutReturnsAndCommitsVSegmentReplica) {
     EXPECT_TRUE((**started).replicas.front().is_vsegment_replica());
 
     ObjectMeta object{key, std::nullopt};
-    ASSERT_TRUE(master.PutEnd(client, object, tenant, ReplicaType::ALL,
+    // The ordinary client API still describes this as its memory write path;
+    // the server maps that completion to the returned VSEGMENT replica.
+    ASSERT_TRUE(master.PutEnd(client, object, tenant, ReplicaType::MEMORY,
                               (**started).operation_id));
     auto loaded = master.GetReplicaList(key, tenant);
     ASSERT_TRUE(loaded.has_value());
     ASSERT_EQ(loaded->replicas.size(), 1u);
     EXPECT_TRUE(loaded->replicas.front().is_vsegment_replica());
+}
+
+TEST(VSegmentIntegrationTest, OrdinaryMemoryRevokeRemovesVSegmentReplica) {
+    const std::string key = "ordinary-vsegment-revoke";
+    const auto& tenant = TenantId::Default();
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(tenant, key));
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {
+        {partition_id, "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+
+    MasterService master;
+    master.SetVSegmentService(vsegments);
+    ReplicateConfig config;
+    UUID client = generate_uuid();
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, config);
+        if (started && started->has_value()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started && started->has_value());
+    ASSERT_TRUE(master.PutRevoke(client, key, tenant, ReplicaType::MEMORY,
+                                 (**started).operation_id));
+    EXPECT_EQ(master.GetReplicaList(key, tenant).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {

@@ -1304,6 +1304,10 @@ class MasterService {
             return HasReplica(&Replica::fn_is_memory_replica);
         }
 
+        bool HasVSegmentReplica() const {
+            return HasReplica(&Replica::fn_is_vsegment_replica);
+        }
+
         bool HasNoFReplica() const {
             return HasReplica(&Replica::fn_is_nof_replica);
         }

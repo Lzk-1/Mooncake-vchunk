@@ -2291,21 +2291,6 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
-    // vsegment 预留物理分配 RPC 接口。
-    server.register_handler<&mooncake::WrappedMasterService::GetExtentSummary>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReserveExtent>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CommitExtent>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::AbortExtent>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::QueryExtentAllocation>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::ReleaseCommittedExtent>(
-        &wrapped_master_service);
 }
 
 }  // namespace mooncake

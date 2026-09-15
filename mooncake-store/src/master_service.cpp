@@ -2672,7 +2672,9 @@ uint64_t MasterService::CompletedMemoryQuotaCharge(
     const ObjectMetadata& metadata) const {
     return static_cast<uint64_t>(metadata.size) *
            metadata.CountReplicas([](const Replica& replica) {
-               return replica.is_memory_replica() && replica.is_completed();
+               return (replica.is_memory_replica() ||
+                       replica.is_vsegment_replica()) &&
+                      replica.is_completed();
            });
 }
 
@@ -5657,6 +5659,11 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     metadata.VisitReplicas(
         [replica_type](const Replica& replica) {
+            if (replica.is_vsegment_replica()) {
+                return replica_type == ReplicaType::ALL ||
+                       replica_type == ReplicaType::MEMORY ||
+                       replica_type == ReplicaType::VSEGMENT;
+            }
             if (replica_type == ReplicaType::ALL) {
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
@@ -5682,7 +5689,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.object_checksum = object_meta.object_checksum;
     }
 
-    const bool has_memory_replica = metadata.HasMemReplica();
+    const bool has_memory_replica =
+        metadata.HasMemReplica() || metadata.HasVSegmentReplica();
     const bool should_settle_quota =
         replica_type == ReplicaType::MEMORY ||
         (replica_type == ReplicaType::ALL && has_memory_replica) ||
@@ -5947,6 +5955,12 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
+        if (replica.is_vsegment_replica()) {
+            return (replica_type == ReplicaType::MEMORY ||
+                    replica_type == ReplicaType::VSEGMENT ||
+                    replica_type == ReplicaType::ALL) &&
+                   !replica.is_processing();
+        }
         if (replica_type == ReplicaType::ALL) {
             return (replica.is_memory_replica() || replica.is_nof_replica() ||
                     replica.is_vsegment_replica()) &&
@@ -5961,6 +5975,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto target_pred = [replica_type](const Replica& r) {
+        if (r.is_vsegment_replica()) {
+            return replica_type == ReplicaType::MEMORY ||
+                   replica_type == ReplicaType::VSEGMENT ||
+                   replica_type == ReplicaType::ALL;
+        }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica() ||
                    r.is_vsegment_replica();
