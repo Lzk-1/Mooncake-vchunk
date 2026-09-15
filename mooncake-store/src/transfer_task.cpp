@@ -1085,6 +1085,9 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
         return std::nullopt;
 #endif
+    } else if (replica.is_vsegment_replica()) {
+        LOG(ERROR) << "VSegment transfer requires an expanded transfer plan";
+        return std::nullopt;
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1097,6 +1100,39 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitVSegment(
+    const vsegment::VSegmentTransferPlan& plan,
+    TransferRequest::OpCode op_code) {
+    if (!plan || plan.requests.empty()) return std::nullopt;
+    std::vector<TransferRequest> requests;
+    requests.reserve(plan.requests.size());
+    for (const auto& subrequest : plan.requests) {
+        SegmentHandle segment = engine_.openSegment(subrequest.endpoint);
+        if (segment == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open vsegment member endpoint='"
+                       << subrequest.endpoint << "'";
+            return std::nullopt;
+        }
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = reinterpret_cast<void*>(
+            subrequest.transfer.client_address);
+        request.target_id = segment;
+        request.target_offset = subrequest.transfer.physical_offset;
+        request.length = subrequest.transfer.length;
+        requests.push_back(request);
+    }
+    auto future = submitTransfer(requests);
+    if (future) {
+        size_t bytes = 0;
+        for (const auto& request : plan.requests)
+            bytes += request.transfer.length;
+        std::vector<Slice> metric_slices{{nullptr, bytes}};
+        updateTransferMetrics(metric_slices, op_code);
+    }
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
@@ -1106,6 +1142,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << "Batch transfer only supports memory replicas";
+            return std::nullopt;
+        }
         auto& mem_desc = replica.get_memory_descriptor();
         if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
             return std::nullopt;

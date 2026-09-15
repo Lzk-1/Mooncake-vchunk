@@ -63,6 +63,10 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default",
         uint64_t client_trace_id = 0, const UUID& client_id = {});
+    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& partition_id, const std::string& vsegment_id);
+    tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,

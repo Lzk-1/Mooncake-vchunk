@@ -197,6 +197,50 @@ struct ReplicaTransferSummary {
     }
 };
 
+class MasterClientVSegmentViewProvider final
+    : public vsegment::VSegmentViewProvider {
+   public:
+    explicit MasterClientVSegmentViewProvider(MasterClient* master_client)
+        : master_client_(master_client) {}
+
+    ErrorCode LoadView(const std::string& partition_id,
+                       const std::string& vsegment_id,
+                       vsegment::VSegmentView* view,
+                       std::string* detail) override {
+        if (!master_client_ || !view) return ErrorCode::INVALID_PARAMS;
+        auto result =
+            master_client_->GetVSegmentView(partition_id, vsegment_id);
+        if (!result) {
+            if (detail) *detail = "failed to load vsegment view from owner";
+            return result.error();
+        }
+        *view = std::move(result.value());
+        return ErrorCode::OK;
+    }
+
+   private:
+    MasterClient* master_client_;
+};
+
+class MasterClientSegmentEndpointResolver final
+    : public vsegment::SegmentEndpointResolver {
+   public:
+    explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
+        : master_client_(master_client) {}
+
+    ErrorCode ResolveEndpoint(const std::string& segment_id,
+                              std::string* endpoint) override {
+        if (!master_client_ || !endpoint) return ErrorCode::INVALID_PARAMS;
+        auto result = master_client_->GetPSegmentEndpoint(segment_id);
+        if (!result) return result.error();
+        *endpoint = std::move(result.value());
+        return endpoint->empty() ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
+    }
+
+   private:
+    MasterClient* master_client_;
+};
+
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
     if (config.nof_replica_num == 0) {
@@ -1199,6 +1243,15 @@ void Client::InitTransferSubmitter() {
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 #endif
+    vsegment_view_provider_ =
+        std::make_unique<MasterClientVSegmentViewProvider>(&master_client_);
+    vsegment_endpoint_resolver_ =
+        std::make_unique<MasterClientSegmentEndpointResolver>(&master_client_);
+    vsegment_view_cache_ = std::make_unique<vsegment::VSegmentViewCache>();
+    vsegment_transfer_planner_ =
+        std::make_shared<vsegment::VSegmentTransferPlanner>(
+            vsegment_view_provider_.get(), vsegment_endpoint_resolver_.get(),
+            vsegment_view_cache_.get());
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -4332,7 +4385,25 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
 
     std::optional<TransferFuture> future;
-    if (replica_descriptor.is_nof_replica()) {
+    if (replica_descriptor.is_vsegment_replica()) {
+        if (!vsegment_transfer_planner_) {
+            LOG(ERROR) << "VSegmentTransferPlanner not initialized";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        std::vector<vsegment::ClientSlice> client_slices;
+        client_slices.reserve(slices.size());
+        for (const auto& slice : slices) {
+            client_slices.push_back(
+                {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+        }
+        auto plan = vsegment_transfer_planner_->Plan(
+            replica_descriptor.get_vsegment_descriptor(), client_slices);
+        if (!plan) {
+            LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
+            return plan.error;
+        }
+        future = transfer_submitter_->submitVSegment(plan, op_code);
+    } else if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
@@ -4361,6 +4432,33 @@ ErrorCode Client::TransferReadInternal(
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (replica_descriptor.is_vsegment_replica()) {
+        if (!vsegment_transfer_planner_) return ErrorCode::INVALID_PARAMS;
+        auto replica = replica_descriptor.get_vsegment_descriptor();
+        uint64_t length = 0;
+        std::vector<vsegment::ClientSlice> client_slices;
+        client_slices.reserve(slices.size());
+        for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<uint64_t>::max() - length)
+                return ErrorCode::INVALID_PARAMS;
+            length += slice.size;
+            client_slices.push_back(
+                {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+        }
+        if (src_offset > replica.length || length > replica.length - src_offset)
+            return ErrorCode::INVALID_PARAMS;
+        if (src_offset > std::numeric_limits<uint64_t>::max() -
+                             replica.logical_offset)
+            return ErrorCode::INVALID_PARAMS;
+        replica.logical_offset += src_offset;
+        replica.length = length;
+        auto plan = vsegment_transfer_planner_->Plan(replica, client_slices);
+        if (!plan) return plan.error;
+        auto future = transfer_submitter_->submitVSegment(
+            plan, TransferRequest::READ);
+        return future ? future->get() : ErrorCode::TRANSFER_FAIL;
     }
 
     auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
@@ -4395,6 +4493,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     } else if (replica_descriptor.is_local_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
         total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_vsegment_replica()) {
+        total_size = replica_descriptor.get_vsegment_descriptor().length;
     }
 
     size_t slices_size = CalculateSliceSize(slices);

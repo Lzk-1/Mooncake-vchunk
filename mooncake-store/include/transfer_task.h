@@ -18,6 +18,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
+#include "vsegment/vsegment_transfer.h"
 #include "rpc_types.h"
 #include "storage_backend.h"
 #include "client_metric.h"
@@ -595,6 +596,10 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
+        TransferRequest::OpCode op_code);
+
+    std::optional<TransferFuture> submitVSegment(
+        const vsegment::VSegmentTransferPlan& plan,
         TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(

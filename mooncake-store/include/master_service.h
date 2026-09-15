@@ -48,6 +48,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "vsegment/vsegment_service.h"
 
 namespace mooncake {
 
@@ -197,6 +198,13 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
+    void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
+        vsegment_service_ = std::move(service);
+    }
+    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& partition_id, const std::string& vsegment_id);
+    tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
 
     // vsegment 依赖注入（§12.3.8 预留）：PutStart/PutEnd/PutRevoke 的两阶段
     // 写语义委托给 vsegment 实现方。未注入时回退旧直达写路径。
@@ -2263,6 +2271,7 @@ class MasterService {
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
+    std::shared_ptr<vsegment::VSegmentService> vsegment_service_;
 
     // vsegment 两阶段写委托（§12.3.8 预留）。nullptr 表示未启用 vsegment，
     // 回退旧直达写路径；由 vsegment 实现方经 SetVSegmentServiceDelegate 注入。

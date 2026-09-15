@@ -71,6 +71,10 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    void SetVSegmentTransferPlanner(
+        std::shared_ptr<vsegment::VSegmentTransferPlanner> planner) {
+        vsegment_transfer_planner_ = std::move(planner);
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -861,6 +865,12 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::unique_ptr<vsegment::VSegmentViewProvider> vsegment_view_provider_;
+    std::unique_ptr<vsegment::SegmentEndpointResolver>
+        vsegment_endpoint_resolver_;
+    std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
+    std::shared_ptr<vsegment::VSegmentTransferPlanner>
+        vsegment_transfer_planner_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

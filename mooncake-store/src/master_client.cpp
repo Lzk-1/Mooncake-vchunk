@@ -45,6 +45,16 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetVSegmentView> {
+    static constexpr const char* value = "GetVSegmentView";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
+    static constexpr const char* value = "GetPSegmentEndpoint";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
 };
@@ -881,6 +891,19 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
     return GetReplicaList(object_key, tenant_id_.value());
+}
+
+tl::expected<vsegment::VSegmentView, ErrorCode>
+MasterClient::GetVSegmentView(const std::string& partition_id,
+                              const std::string& vsegment_id) {
+    return invoke_rpc<&WrappedMasterService::GetVSegmentView,
+                      vsegment::VSegmentView>(partition_id, vsegment_id);
+}
+
+tl::expected<std::string, ErrorCode> MasterClient::GetPSegmentEndpoint(
+    const std::string& segment_id) {
+    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint, std::string>(
+        segment_id);
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(

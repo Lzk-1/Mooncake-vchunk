@@ -4304,6 +4304,32 @@ auto MasterService::GetReplicaList(const std::string& key,
     return GetReplicaListLocal(object_id);
 }
 
+tl::expected<vsegment::VSegmentView, ErrorCode>
+MasterService::GetVSegmentView(const std::string& partition_id,
+                               const std::string& vsegment_id) {
+    if (!vsegment_service_)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    vsegment::VSegmentView view;
+    auto result =
+        vsegment_service_->LoadView(partition_id, vsegment_id, &view);
+    if (result != ErrorCode::OK) return tl::make_unexpected(result);
+    return view;
+}
+
+tl::expected<std::string, ErrorCode> MasterService::GetPSegmentEndpoint(
+    const std::string& segment_id) {
+    UUID id;
+    if (!StringToUuid(segment_id, id))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
+    Segment segment;
+    if (!access.GetSegment(id, segment))
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    if (segment.te_endpoint.empty())
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    return segment.te_endpoint;
+}
+
 auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);

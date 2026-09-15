@@ -26,6 +26,7 @@
 #include "task_manager.h"
 #include "metadata_store.h"
 #include "partition/partition_router.h"
+#include "vsegment/vsegment.h"
 
 namespace mooncake {
 
@@ -210,6 +211,11 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<vsegment::VSegmentView, ErrorCode>
+    GetVSegmentView(const std::string& partition_id,
+                    const std::string& vsegment_id);
+    [[nodiscard]] tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
