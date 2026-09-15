@@ -116,26 +116,6 @@ ErrorCode EtcdViewStore::DeserializePartitionRoute(
     }
 }
 
-ErrorCode EtcdViewStore::SerializePSegmentAllocatorRoute(
-    const partition::PSegmentAllocatorRoute& route, std::string& out) {
-    try {
-        struct_json::to_json(route, out);
-        return ErrorCode::OK;
-    } catch (...) {
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-}
-
-ErrorCode EtcdViewStore::DeserializePSegmentAllocatorRoute(
-    const std::string& in, partition::PSegmentAllocatorRoute& out) {
-    try {
-        struct_json::from_json(out, in);
-        return ErrorCode::OK;
-    } catch (...) {
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-}
-
 ErrorCode EtcdViewStore::SavePartitionRoute(
     const std::string& ns, const partition::PartitionRoute& route) {
     if (route.partition_id.partition_id.empty() ||
@@ -158,29 +138,6 @@ ErrorCode EtcdViewStore::LoadPartitionRoute(
     auto error = EtcdHelper::Get(key.data(), key.size(), value, version);
     return error == ErrorCode::OK ? DeserializePartitionRoute(value, out)
                                   : error;
-}
-
-ErrorCode EtcdViewStore::SavePSegmentAllocatorRoute(
-    const std::string& ns, const partition::PSegmentAllocatorRoute& route) {
-    if (route.segment_id.empty() || route.allocator_submaster_id.empty() ||
-        route.allocator_epoch == 0)
-        return ErrorCode::INVALID_PARAMS;
-    std::string value;
-    auto error = SerializePSegmentAllocatorRoute(route, value);
-    if (error != ErrorCode::OK) return error;
-    const auto key = PSegmentAllocatorRouteKey(ns, route.segment_id);
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-}
-
-ErrorCode EtcdViewStore::LoadPSegmentAllocatorRoute(
-    const std::string& ns, const std::string& segment_id,
-    partition::PSegmentAllocatorRoute& out, ViewVersionId& version) {
-    const auto key = PSegmentAllocatorRouteKey(ns, segment_id);
-    std::string value;
-    auto error = EtcdHelper::Get(key.data(), key.size(), value, version);
-    return error == ErrorCode::OK
-               ? DeserializePSegmentAllocatorRoute(value, out)
-               : error;
 }
 
 ErrorCode EtcdViewStore::CASSwitchPartitionOwner(
@@ -207,29 +164,6 @@ ErrorCode EtcdViewStore::CASSwitchPartitionOwner(
                                                       : error;
 }
 
-ErrorCode EtcdViewStore::CASSwitchPSegmentAllocator(
-    const std::string& ns, const std::string& segment_id,
-    uint64_t expected_epoch, const std::string& new_owner,
-    partition::PSegmentAllocatorRoute& out) {
-    partition::PSegmentAllocatorRoute current;
-    ViewVersionId version = 0;
-    auto error = LoadPSegmentAllocatorRoute(ns, segment_id, current, version);
-    if (error != ErrorCode::OK) return error;
-    if (current.allocator_epoch != expected_epoch)
-        return ErrorCode::STALE_ALLOCATOR_EPOCH;
-    std::string old_value;
-    SerializePSegmentAllocatorRoute(current, old_value);
-    out = {segment_id, new_owner, expected_epoch + 1};
-    std::string new_value;
-    SerializePSegmentAllocatorRoute(out, new_value);
-    const auto key = PSegmentAllocatorRouteKey(ns, segment_id);
-    error = EtcdHelper::TxnCompareAndPut(
-        {{key, EtcdHelper::TxnCompareKind::kValueEquals, old_value}},
-        {{key, new_value}});
-    return error == ErrorCode::ETCD_TRANSACTION_FAIL
-               ? ErrorCode::STALE_ALLOCATOR_EPOCH
-               : error;
-}
 
 // ---- Segment neutral entity (segments/{segment_id}) ----
 

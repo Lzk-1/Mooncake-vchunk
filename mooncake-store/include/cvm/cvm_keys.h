@@ -111,18 +111,5 @@ inline std::string PartitionRouteKey(const std::string& cluster_namespace,
     return PartitionRoutePrefix(cluster_namespace) + partition_id;
 }
 
-// "/cvm/<namespace>/segment_allocator_route/"
-inline std::string PSegmentAllocatorRoutePrefix(
-    const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "segment_allocator_route/";
-}
-
-// "/cvm/<namespace>/segment_allocator_route/<segment_id>"
-// 保存 psegment 物理分配唯一写者 allocator owner + allocator_epoch。
-inline std::string PSegmentAllocatorRouteKey(
-    const std::string& cluster_namespace, const std::string& segment_id) {
-    return PSegmentAllocatorRoutePrefix(cluster_namespace) + segment_id;
-}
-
 }  // namespace cvm
 }  // namespace mooncake

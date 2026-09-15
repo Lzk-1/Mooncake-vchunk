@@ -587,23 +587,6 @@ void MasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     cvm_lease_id_ = lease_id;
 }
 
-void MasterService::SetVSegmentServiceDelegate(
-    VSegmentServiceDelegate* delegate) {
-    vsegment_service_delegate_ = delegate;
-}
-
-std::string MasterService::GeneratePutStartOperationId(
-    const std::string& key, uint64_t slice_length,
-    const ReplicateConfig& config) const {
-    if (!vsegment_service_delegate_) {
-        return {};
-    }
-    // 委托 vsegment 实现方预留逻辑区间并生成 operation_id；其内部决定该 key
-    // 是否启用 vsegment（返回空字符串表示回退旧直达写路径）。
-    return vsegment_service_delegate_->ReserveOperation(key, slice_length,
-                                                        config);
-}
-
 tl::expected<std::optional<PutStartResult>, ErrorCode>
 MasterService::TryVSegmentPutStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
@@ -5856,13 +5839,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
-    // vsegment 两阶段写：PutEnd 成功时提交预留的逻辑区间（失败路径由调用方
-    // 走 PutRevoke 触达 AbortOperation 撤销）。operation_id 为空表示旧直达写
-    // 路径，不涉及 commit。
-    if (!operation_id.empty() && committed_vsegments.empty() &&
-        vsegment_service_delegate_) {
-        vsegment_service_delegate_->CommitOperation(operation_id);
-    }
     return {};
 }
 
@@ -6010,12 +5986,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type,
                               const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
-    // vsegment 两阶段写：撤销预留的逻辑区间。AbortOperation 由 vsegment 实现方
-    // 保证幂等，故进入 PutRevoke 即触发（含对象已不存在等提前返回路径）。
-    // operation_id 为空表示旧直达写路径，不涉及 abort。
-    if (!operation_id.empty() && vsegment_service_delegate_) {
-        vsegment_service_delegate_->AbortOperation(operation_id);
-    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
 #ifdef STORE_USE_ETCD

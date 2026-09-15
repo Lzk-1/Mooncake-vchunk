@@ -521,13 +521,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    // vsegment 两阶段写：由 VSegmentServiceDelegate 预留逻辑
-                    // 区间并生成 operation_id；未注入 delegate 时回退旧直达写
-                    // （operation_id 为空）。
-                    auto operation_id =
-                        master_service_.GeneratePutStartOperationId(
-                            key, slice_length, config);
-                    return PutStartResult{std::move(operation_id),
+                    return PutStartResult{{},
                                           std::move(descriptors.value())};
                 });
         },
@@ -853,12 +847,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    // 与 PutStart 对称：由 VSegmentServiceDelegate 预留逻辑
-                    // 区间并生成 operation_id（未注入时回退旧直达写）。
-                    auto operation_id =
-                        master_service_.GeneratePutStartOperationId(
-                            key, slice_length, config);
-                    return PutStartResult{std::move(operation_id),
+                    return PutStartResult{{},
                                           std::move(descriptors.value())};
                 });
         },

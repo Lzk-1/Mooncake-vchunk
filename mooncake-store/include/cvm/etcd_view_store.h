@@ -89,10 +89,6 @@ class EtcdViewStore {
         const partition::PartitionRoute& route, std::string& out);
     static ErrorCode DeserializePartitionRoute(const std::string& in,
                                                partition::PartitionRoute& out);
-    static ErrorCode SerializePSegmentAllocatorRoute(
-        const partition::PSegmentAllocatorRoute& route, std::string& out);
-    static ErrorCode DeserializePSegmentAllocatorRoute(
-        const std::string& in, partition::PSegmentAllocatorRoute& out);
 
     static ErrorCode SavePartitionRoute(const std::string& cluster_namespace,
                                         const partition::PartitionRoute& route);
@@ -100,12 +96,6 @@ class EtcdViewStore {
                                         const std::string& partition_id,
                                         partition::PartitionRoute& out,
                                         ViewVersionId& version);
-    static ErrorCode SavePSegmentAllocatorRoute(
-        const std::string& cluster_namespace,
-        const partition::PSegmentAllocatorRoute& route);
-    static ErrorCode LoadPSegmentAllocatorRoute(
-        const std::string& cluster_namespace, const std::string& segment_id,
-        partition::PSegmentAllocatorRoute& out, ViewVersionId& version);
 
     // 原子切换 owner：仅当 etcd 中当前 epoch 与 expected 一致时成功，成功后
     // epoch = expected + 1，并把新路由写入 out。失配返回 STALE_ROUTE /
@@ -115,11 +105,6 @@ class EtcdViewStore {
         uint64_t expected_route_epoch, const std::string& new_owner_submaster_id,
         partition::PartitionState new_state,
         const std::string& target_submaster_id, partition::PartitionRoute& out);
-    static ErrorCode CASSwitchPSegmentAllocator(
-        const std::string& cluster_namespace, const std::string& segment_id,
-        uint64_t expected_allocator_epoch,
-        const std::string& new_allocator_submaster_id,
-        partition::PSegmentAllocatorRoute& out);
 
     // ---- Watch ----
     using WatchCallback = void (*)(void*, const char*, size_t, const char*,
