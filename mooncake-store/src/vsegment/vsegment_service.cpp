@@ -15,9 +15,14 @@ ErrorCode VSegmentService::AddPartition(
     const PartitionVSegmentSnapshot* recovered, std::string* detail) {
     if (partition_id.empty() || route_epoch == 0 || !committer)
         return ErrorCode::INVALID_PARAMS;
+    PartitionVSegmentConfig default_config;
+    auto result = BuildPartitionConfig(quota_snapshot_, partition_id,
+                                       quota_snapshot_.default_profile,
+                                       &default_config, detail);
+    if (result != ErrorCode::OK) return result;
     auto manager = std::make_shared<VSegmentManager>(
         quota_snapshot_, partition_id, std::move(committer));
-    auto result = manager->SetRouteEpoch(route_epoch);
+    result = manager->SetRouteEpoch(route_epoch);
     if (result != ErrorCode::OK) return result;
     if (recovered) {
         if (recovered->route_epoch > route_epoch) return ErrorCode::STALE_ROUTE;

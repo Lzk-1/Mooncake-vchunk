@@ -171,6 +171,15 @@ ErrorCode EtcdPartitionQuotaSnapshotStore::Load(
     std::string value;
     EtcdRevisionId revision = 0;
     auto result = EtcdHelper::Get(key_.data(), key_.size(), value, revision);
+    if (result == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        result = EtcdHelper::Get(
+            kLegacyPartitionQuotaSnapshotKey,
+            sizeof(kLegacyPartitionQuotaSnapshotKey) - 1, value, revision);
+        if (result == ErrorCode::OK && detail) {
+            *detail = "loaded legacy global quota snapshot; republish it "
+                      "under the cluster-scoped key";
+        }
+    }
     if (result != ErrorCode::OK) {
         if (detail) *detail = "failed to load quota snapshot from ETCD";
         return result;

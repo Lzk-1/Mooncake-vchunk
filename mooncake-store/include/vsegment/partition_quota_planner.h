@@ -9,6 +9,9 @@
 
 namespace mooncake::vsegment {
 
+inline constexpr char kLegacyPartitionQuotaSnapshotKey[] =
+    "/mooncake/vsegment/partition-quota/current";
+
 struct PartitionQuotaPlanRequest {
     uint64_t config_generation{0};
     std::string policy_digest;

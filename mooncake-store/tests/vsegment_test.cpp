@@ -364,6 +364,23 @@ TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {
     EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
 }
 
+TEST(VSegmentViewCacheTest, ComparesLayoutInsteadOfTrustingChecksum) {
+    auto original = View();
+    VSegmentViewCache cache;
+    ASSERT_EQ(cache.Insert(original), ErrorCode::OK);
+
+    auto conflicting = original;
+    conflicting.members[0].base_offset += original.stripe_size;
+    // Simulate a checksum collision or incorrectly copied checksum. Structure
+    // remains valid because checksum still matches the supplied value only
+    // after deliberately retaining the original checksum.
+    conflicting.checksum = original.checksum;
+    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::CHECKSUM_MISMATCH);
+
+    conflicting.checksum = ComputeViewChecksum(conflicting);
+    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
+}
+
 TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
     auto first = View();
     auto second = first;
@@ -880,6 +897,22 @@ TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
               ErrorCode::INVALID_VERSION);
     EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
               ErrorCode::OK);
+}
+
+TEST(VSegmentServiceTest, RejectsPartitionWithoutPublishedQuota) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    std::string detail;
+    EXPECT_EQ(service.AddPartition("partition-2", 1, Committer(), nullptr,
+                                   &detail),
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
 }
 
 }  // namespace

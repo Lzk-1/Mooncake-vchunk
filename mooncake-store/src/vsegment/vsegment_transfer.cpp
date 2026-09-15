@@ -11,6 +11,28 @@ std::string ViewCacheKey(const std::string& partition_id,
     return partition_id + '\0' + vsegment_id;
 }
 
+bool SameImmutableView(const VSegmentView& left,
+                       const VSegmentView& right) {
+    if (left.vsegment_id != right.vsegment_id ||
+        left.partition_id != right.partition_id ||
+        left.profile_name != right.profile_name ||
+        left.mapping_algorithm != right.mapping_algorithm ||
+        left.stripe_size != right.stripe_size ||
+        left.logical_capacity != right.logical_capacity ||
+        left.members.size() != right.members.size()) {
+        return false;
+    }
+    for (size_t index = 0; index < left.members.size(); ++index) {
+        const auto& a = left.members[index];
+        const auto& b = right.members[index];
+        if (a.segment_id != b.segment_id || a.base_offset != b.base_offset ||
+            a.length != b.length) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool VSegmentViewCache::Find(const std::string& partition_id,
@@ -31,8 +53,10 @@ ErrorCode VSegmentViewCache::Insert(const VSegmentView& view,
     const auto key = ViewCacheKey(view.partition_id, view.vsegment_id);
     auto found = views_.find(key);
     if (found != views_.end()) {
-        if (found->second.checksum != view.checksum) {
-            if (detail) *detail = "immutable view identity has another checksum";
+        if (!SameImmutableView(found->second, view)) {
+            if (detail) {
+                *detail = "immutable view identity has another layout";
+            }
             return ErrorCode::INVALID_VERSION;
         }
         return ErrorCode::OK;
