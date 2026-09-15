@@ -35,6 +35,10 @@ class VSegmentService final : public VSegmentViewProvider {
     ErrorCode SnapshotPartition(const std::string& partition_id,
                                 PartitionVSegmentSnapshot* snapshot);
     std::vector<PartitionVSegmentSnapshot> SnapshotAllPartitions();
+    ErrorCode ReconcileObjectReferences(
+        const std::string& partition_id,
+        const std::vector<VSegmentObjectReference>& references,
+        std::string* detail = nullptr);
     const PartitionPhysicalQuotaSnapshot& quota_snapshot() const {
         return quota_snapshot_;
     }

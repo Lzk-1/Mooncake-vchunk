@@ -119,6 +119,15 @@ VSegmentService::SnapshotAllPartitions() {
     return snapshots;
 }
 
+ErrorCode VSegmentService::ReconcileObjectReferences(
+    const std::string& partition_id,
+    const std::vector<VSegmentObjectReference>& references,
+    std::string* detail) {
+    auto manager = FindPartition(partition_id);
+    if (!manager) return ErrorCode::STALE_ROUTE;
+    return manager->ReconcileObjectReferences(references, detail);
+}
+
 VSegmentPutStartResult VSegmentService::StartPut(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,

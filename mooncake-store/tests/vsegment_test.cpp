@@ -20,11 +20,29 @@
 namespace mooncake::vsegment {
 namespace {
 
+struct LegacySlotMetadataExport {
+    uint16_t slot{0};
+    std::string source_master_id;
+    std::vector<StandbyObjectEntry> objects;
+};
+YLT_REFL(LegacySlotMetadataExport, slot, source_master_id, objects);
+
 TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
     EXPECT_EQ(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
               "/cvm/cluster-a/snapshot/vsegment_partition_quota");
     EXPECT_NE(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
               cvm::VSegmentPartitionQuotaSnapshotKey("cluster-b"));
+}
+
+TEST(VSegmentMigrationTest, SlotExportAcceptsLegacyPayload) {
+    LegacySlotMetadataExport legacy{7, "submaster-a", {}};
+    auto bytes = struct_pack::serialize(legacy);
+    SlotMetadataExport decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.slot, 7);
+    EXPECT_EQ(decoded.source_master_id, "submaster-a");
+    EXPECT_FALSE(decoded.vsegment_partition.has_value());
 }
 
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
@@ -754,6 +772,50 @@ TEST(VSegmentManagerTest, ExposesLifecycleStatsAndGcsOperationTombstone) {
     EXPECT_EQ(stats.committed_allocations, 0);
     EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OK);
     EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST(VSegmentManagerTest, RecoveryReconcileUsesObjectMetadataAsAuthority) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(
+        manager.ReservePut(allocation.view.vsegment_id, "committed-op", 64));
+    LogicalRange committed_range;
+    ASSERT_EQ(manager.CommitPut(allocation.view.vsegment_id, "committed-op",
+                                "orphan-object", &committed_range),
+              ErrorCode::OK);
+    auto pending =
+        manager.ReservePut(allocation.view.vsegment_id, "pending-op", 32);
+    ASSERT_TRUE(pending);
+
+    VSegmentDescriptor pending_descriptor{
+        "partition-1", allocation.view.vsegment_id, pending.range.offset,
+        pending.range.length, "pending-op"};
+    ASSERT_EQ(manager.ReconcileObjectReferences(
+                  {{pending_descriptor, "pending-object", false}}),
+              ErrorCode::OK);
+    EXPECT_EQ(manager.Stats().committed_allocations, 0);
+    EXPECT_EQ(manager.Stats().reservations, 1);
+
+    ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, "pending-op"),
+              ErrorCode::OK);
+    auto full = manager.ReservePut(allocation.view.vsegment_id, "full-op",
+                                   allocation.view.logical_capacity);
+    EXPECT_TRUE(full) << full.detail;
+}
+
+TEST(VSegmentManagerTest, RecoveryReconcileRestoresCommittedReleaseIdentity) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    VSegmentDescriptor descriptor{"partition-1", allocation.view.vsegment_id,
+                                  128, 64, "committed-op"};
+    ASSERT_EQ(manager.ReconcileObjectReferences(
+                  {{descriptor, "tenant/object", true}}),
+              ErrorCode::OK);
+    EXPECT_EQ(manager.ReleaseObject(allocation.view.vsegment_id,
+                                    "tenant/object", {128, 64}),
+              ErrorCode::OK);
 }
 
 TEST(VSegmentManagerTest, RetirementPersistenceFailureRollsBackExtent) {

@@ -778,6 +778,7 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
         recovered;
     for (const auto& state : recovered_vsegment_snapshots_)
         recovered[state.partition_id] = &state;
+    std::unordered_set<std::string> recovered_owned_partitions;
     std::unordered_set<std::string> partition_ids;
     for (const auto& quota : vsegment_service_->quota_snapshot().quotas)
         partition_ids.insert(quota.partition_id);
@@ -806,6 +807,47 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
             LOG(ERROR) << "Failed to reconcile Partition " << partition_id
                        << ": " << toString(error);
             complete = false;
+        } else if (state && route.owner_submaster_id == master_id_) {
+            recovered_owned_partitions.insert(partition_id);
+        }
+    }
+    if (complete && !recovered_owned_partitions.empty()) {
+        std::unordered_map<std::string,
+                           std::vector<vsegment::VSegmentObjectReference>>
+            references;
+        for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+            MetadataShardAccessorRO shard(this, shard_idx);
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (const auto& [key, metadata] : tenant_state.metadata) {
+                    const auto allocation_id = tenant_id.MakeScopedKey(key);
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        if (!replica.is_vsegment_replica()) continue;
+                        const auto& descriptor =
+                            replica.get_vsegment_descriptor();
+                        if (!recovered_owned_partitions.count(
+                                descriptor.partition_id))
+                            continue;
+                        if (replica.status() != ReplicaStatus::COMPLETE &&
+                            replica.status() != ReplicaStatus::PROCESSING &&
+                            replica.status() != ReplicaStatus::INITIALIZED)
+                            continue;
+                        references[descriptor.partition_id].push_back(
+                            {descriptor, allocation_id,
+                             replica.status() == ReplicaStatus::COMPLETE});
+                    }
+                }
+            }
+        }
+        for (const auto& partition_id : recovered_owned_partitions) {
+            std::string detail;
+            const auto error = vsegment_service_->ReconcileObjectReferences(
+                partition_id, references[partition_id], &detail);
+            if (error != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to reconcile recovered vsegment "
+                           << "allocations for Partition " << partition_id
+                           << ": " << detail;
+                complete = false;
+            }
         }
     }
     if (complete) recovered_vsegment_snapshots_.clear();
@@ -1103,6 +1145,17 @@ SlotMetadataExport MasterService::BuildSlotMetadataExport(
     SlotMetadataExport export_payload;
     export_payload.slot = slot;
     export_payload.source_master_id = master_id_;
+    const std::string partition_id = std::to_string(slot);
+    if (vsegment_service_) {
+        vsegment::PartitionVSegmentSnapshot snapshot;
+        const auto snapshot_error =
+            vsegment_service_->SnapshotPartition(partition_id, &snapshot);
+        if (snapshot_error == ErrorCode::OK) {
+            export_payload.vsegment_partition = std::move(snapshot);
+        } else if (snapshot_error != ErrorCode::STALE_ROUTE) {
+            return snapshot_error;
+        }
+    }
 
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         MetadataShardAccessorRO shard(this, shard_idx);
@@ -1230,6 +1283,64 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         return pull_result.error();
     }
     const SlotMetadataExport& export_payload = pull_result.value();
+
+    if (export_payload.vsegment_partition.has_value()) {
+        if (!vsegment_service_ || !ordered_oplog_writer_) {
+            LOG(ERROR) << "ImportSlotMetadata: vsegment state has no local "
+                          "runtime slot="
+                       << slot;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        const std::string partition_id = std::to_string(slot);
+        const auto& transferred = *export_payload.vsegment_partition;
+        if (transferred.partition_id != partition_id) {
+            LOG(ERROR) << "ImportSlotMetadata: vsegment Partition mismatch";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        partition::PartitionRoute route;
+        ViewVersionId version = 0;
+        auto route_error = cvm::EtcdViewStore::LoadPartitionRoute(
+            cluster_id_, partition_id, route, version);
+        if (route_error != ErrorCode::OK ||
+            route.owner_submaster_id != master_id_) {
+            return route_error == ErrorCode::OK ? ErrorCode::STALE_ROUTE
+                                                : route_error;
+        }
+        vsegment::PartitionVSegmentSnapshot current;
+        const auto current_error =
+            vsegment_service_->SnapshotPartition(partition_id, &current);
+        if (current_error == ErrorCode::OK && !current.vsegments.empty()) {
+            if (current.metadata_revision != transferred.metadata_revision) {
+                LOG(ERROR) << "ImportSlotMetadata: target Partition is not "
+                              "empty slot="
+                           << slot;
+                return ErrorCode::INVALID_VERSION;
+            }
+        } else {
+            if (current_error == ErrorCode::OK) {
+                auto remove_error = vsegment_service_->RemovePartition(
+                    partition_id, route.route_epoch);
+                if (remove_error != ErrorCode::OK) return remove_error;
+            } else if (current_error != ErrorCode::STALE_ROUTE) {
+                return current_error;
+            }
+            auto state = transferred;
+            state.route_epoch = route.route_epoch;
+            auto committer =
+                std::make_shared<vsegment::OrderedOpLogVSegmentCommitter>(
+                    ordered_oplog_writer_.get());
+            std::string detail;
+            auto add_error = vsegment_service_->AddPartition(
+                partition_id, route.route_epoch, std::move(committer), &state,
+                &detail);
+            if (add_error != ErrorCode::OK) {
+                LOG(ERROR) << "ImportSlotMetadata: failed to install vsegment "
+                              "state slot="
+                           << slot << ", detail=" << detail;
+                return add_error;
+            }
+        }
+    }
 
     const auto resolve = [](const StandbyObjectEntry& entry) {
         auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);

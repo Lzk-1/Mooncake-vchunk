@@ -60,6 +60,15 @@ struct VSegmentManagerStats {
     size_t pending_creations{0};
 };
 
+// ObjectMetadata is authoritative after recovery. These references are used
+// once, before serving traffic, to remove allocator state left behind by a
+// crash between the vsegment-state and object-metadata durable records.
+struct VSegmentObjectReference {
+    VSegmentDescriptor replica;
+    std::string allocation_id;
+    bool committed{false};
+};
+
 // Partition-local facade intended to be owned by the Partition's SubMaster.
 // Persistence transport is deliberately outside this class: HA Snapshot/OpLog
 // code serializes the returned state and calls Restore after failover.
@@ -108,6 +117,9 @@ class VSegmentManager {
     PartitionVSegmentSnapshot Snapshot() const;
     ErrorCode Restore(const PartitionVSegmentSnapshot& snapshot,
                       std::string* detail = nullptr);
+    ErrorCode ReconcileObjectReferences(
+        const std::vector<VSegmentObjectReference>& references,
+        std::string* detail = nullptr);
     bool FindView(const std::string& vsegment_id, VSegmentView* view) const;
     VSegmentManagerStats Stats() const;
 

@@ -91,8 +91,11 @@ struct SlotMetadataExport {
     uint16_t slot{0};
     std::string source_master_id;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<vsegment::PartitionVSegmentSnapshot, 1>
+        vsegment_partition;
 
-    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects);
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects,
+             vsegment_partition);
 };
 
 /**

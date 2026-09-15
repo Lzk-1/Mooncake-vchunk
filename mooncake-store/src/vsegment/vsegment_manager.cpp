@@ -545,6 +545,107 @@ ErrorCode VSegmentManager::Restore(
     return ErrorCode::OK;
 }
 
+ErrorCode VSegmentManager::ReconcileObjectReferences(
+    const std::vector<VSegmentObjectReference>& references,
+    std::string* detail) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_map<std::string, std::vector<VSegmentObjectReference>>
+        by_vsegment;
+    for (const auto& reference : references) {
+        if (reference.replica.partition_id != partition_id_ ||
+            reference.replica.vsegment_id.empty() ||
+            reference.allocation_id.empty() || reference.replica.length == 0) {
+            if (detail) *detail = "invalid recovered object reference";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (!vsegments_.count(reference.replica.vsegment_id)) {
+            if (detail) *detail = "object references missing vsegment";
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        }
+        if (!reference.committed && reference.replica.operation_id.empty()) {
+            if (detail) *detail = "pending object has no operation identity";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        by_vsegment[reference.replica.vsegment_id].push_back(reference);
+    }
+
+    std::unordered_map<std::string, LogicalAllocationSnapshot> before;
+    const auto operations_before = operation_vsegments_;
+    std::unordered_map<std::string, std::string> reconciled_operations;
+    for (auto& [vsegment_id, managed] : vsegments_) {
+        before.emplace(vsegment_id, managed.logical_allocator->Snapshot());
+        LogicalAllocationSnapshot desired;
+        desired.logical_capacity = managed.view.logical_capacity;
+        std::vector<LogicalRange> occupied;
+        for (const auto& reference : by_vsegment[vsegment_id]) {
+            LogicalRange range{reference.replica.logical_offset,
+                               reference.replica.length};
+            occupied.push_back(range);
+            const std::string operation_id =
+                reference.replica.operation_id.empty()
+                    ? "recovered/" + reference.allocation_id
+                    : reference.replica.operation_id;
+            if (reference.committed) {
+                desired.completed_operations.push_back(
+                    {operation_id, reference.allocation_id,
+                     OperationOutcome::COMMITTED, range});
+            } else {
+                desired.reservations.push_back({operation_id, range});
+            }
+            if (!reconciled_operations.emplace(operation_id, vsegment_id)
+                     .second) {
+                if (detail) *detail = "duplicate recovered operation identity";
+                for (auto& [id, state] : vsegments_) {
+                    auto snapshot = before.find(id);
+                    if (snapshot != before.end())
+                        state.logical_allocator->Restore(snapshot->second);
+                }
+                return ErrorCode::INVALID_PARAMS;
+            }
+        }
+        std::sort(occupied.begin(), occupied.end(), [](const auto& left,
+                                                       const auto& right) {
+            return left.offset < right.offset;
+        });
+        uint64_t cursor = 0;
+        for (const auto& range : occupied) {
+            if (range.offset < cursor ||
+                range.offset > desired.logical_capacity ||
+                range.length > desired.logical_capacity - range.offset) {
+                if (detail)
+                    *detail =
+                        "overlapping or out-of-range object reference";
+                for (auto& [id, state] : vsegments_) {
+                    auto snapshot = before.find(id);
+                    if (snapshot != before.end())
+                        state.logical_allocator->Restore(snapshot->second);
+                }
+                return ErrorCode::INVALID_PARAMS;
+            }
+            if (range.offset > cursor)
+                desired.free_ranges.push_back({cursor, range.offset - cursor});
+            cursor = range.offset + range.length;
+        }
+        if (cursor < desired.logical_capacity)
+            desired.free_ranges.push_back(
+                {cursor, desired.logical_capacity - cursor});
+        auto result = managed.logical_allocator->Restore(desired, detail);
+        if (result != ErrorCode::OK) {
+            for (auto& [id, state] : vsegments_)
+                state.logical_allocator->Restore(before.at(id));
+            return result;
+        }
+    }
+    operation_vsegments_ = std::move(reconciled_operations);
+    const auto result = PersistLocked("recovery_reconcile", detail);
+    if (result != ErrorCode::OK) {
+        for (auto& [id, state] : vsegments_)
+            state.logical_allocator->Restore(before.at(id));
+        operation_vsegments_ = operations_before;
+    }
+    return result;
+}
+
 bool VSegmentManager::FindView(const std::string& vsegment_id,
                                VSegmentView* view) const {
     std::lock_guard<std::mutex> lock(mutex_);
