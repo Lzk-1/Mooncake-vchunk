@@ -21,6 +21,9 @@ struct PartitionQuotaPlanRequest {
     // Fraction reserved outside vsegment quotas, in [0, 1).
     double reserved_ratio{0.0};
 };
+YLT_REFL(PartitionQuotaPlanRequest, config_generation, policy_digest,
+         default_profile, partition_ids, profile_specs, segments,
+         reserved_ratio);
 
 struct PartitionQuotaPlanResult {
     ErrorCode error{ErrorCode::OK};

@@ -22,6 +22,11 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
     entry.object_key = state.partition_id;
     entry.payload = std::move(payload);
     entry.checksum = ComputeOpLogChecksum(entry.payload);
+    std::string validation_detail;
+    if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
+        if (detail) *detail = std::move(validation_detail);
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     auto reservation = writer_->Reserve();
     if (!reservation) {

@@ -390,8 +390,11 @@ VSegmentAllocationResult CreationCoordinator::GetOrCreate(
         entry = iterator->second;
         creator = inserted;
         if (!creator) {
+            ++entry->users;
             entry->ready.wait(lock, [&] { return !entry->creating; });
-            return entry->result;
+            auto result = entry->result;
+            if (--entry->users == 0) entries_.erase(creation_key);
+            return result;
         }
     }
 
@@ -409,6 +412,7 @@ VSegmentAllocationResult CreationCoordinator::GetOrCreate(
         std::lock_guard<std::mutex> lock(mutex_);
         entry->result = result;
         entry->creating = false;
+        if (--entry->users == 0) entries_.erase(creation_key);
     }
     entry->ready.notify_all();
     return result;
@@ -417,7 +421,8 @@ VSegmentAllocationResult CreationCoordinator::GetOrCreate(
 void CreationCoordinator::Forget(const std::string& creation_key) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto entry = entries_.find(creation_key);
-    if (entry != entries_.end() && !entry->second->creating) {
+    if (entry != entries_.end() && !entry->second->creating &&
+        entry->second->users == 0) {
         entries_.erase(entry);
     }
 }

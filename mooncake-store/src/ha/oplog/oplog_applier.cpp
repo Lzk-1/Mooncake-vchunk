@@ -79,6 +79,13 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
             break;
+        case OpType::VSEGMENT_STATE:
+            if (!vsegment_state_handler_ || !vsegment_state_handler_(entry)) {
+                LOG(ERROR) << "OpLogApplier: vsegment state handler rejected "
+                           << "sequence_id=" << entry.sequence_id;
+                return false;
+            }
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)

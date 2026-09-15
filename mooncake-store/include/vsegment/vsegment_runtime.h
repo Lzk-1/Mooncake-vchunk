@@ -130,6 +130,7 @@ class CreationCoordinator {
    private:
     struct Entry {
         bool creating{true};
+        size_t users{1};
         VSegmentAllocationResult result;
         std::condition_variable ready;
     };

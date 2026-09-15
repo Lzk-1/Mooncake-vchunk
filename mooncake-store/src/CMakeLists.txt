@@ -353,6 +353,10 @@ check_pie_supported(LANGUAGES CXX)
 
 add_executable(mooncake_master master.cpp)
 
+add_executable(vsegment_quota_planner ../tools/vsegment_quota_planner.cpp)
+target_link_libraries(vsegment_quota_planner PRIVATE mooncake_store glog::glog
+                                                        gflags::gflags)
+
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
 
@@ -463,7 +467,8 @@ if(USE_SUNRISE)
                             ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
-install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+install(TARGETS mooncake_master mooncake_client vsegment_quota_planner
+        DESTINATION bin)
 
 # ---------------------------------------------------------------------------
 # Optional: a self-contained libmooncake_store.so exporting only the store_c.h

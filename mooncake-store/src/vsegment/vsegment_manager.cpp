@@ -71,7 +71,6 @@ VSegmentAllocationResult VSegmentManager::Create(
     auto result = profile_creation_coordinator_.GetOrCreate(
         creation_key,
         [&] { return CreateSingleFlight(profile_name); });
-    profile_creation_coordinator_.Forget(creation_key);
     return result;
 }
 
