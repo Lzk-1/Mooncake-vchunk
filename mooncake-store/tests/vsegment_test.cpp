@@ -954,5 +954,32 @@ TEST(VSegmentServiceTest, ReconcilesManagerFromPartitionRouteEpoch) {
               ErrorCode::STALE_ROUTE);
 }
 
+TEST(VSegmentServiceTest, ReleasesCommittedObjectRange) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 1, "put-release", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    ASSERT_EQ(service.CommitPut(started.replica, 1, "put-release", "object-1"),
+              ErrorCode::OK);
+    EXPECT_EQ(service.ReleaseObject(started.replica, "object-1"),
+              ErrorCode::OK);
+    EXPECT_NE(service.ReleaseObject(started.replica, "object-1"),
+              ErrorCode::OK);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment

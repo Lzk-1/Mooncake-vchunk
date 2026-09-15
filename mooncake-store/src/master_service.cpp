@@ -3058,6 +3058,21 @@ MasterService::EraseMetadata(
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
 
+    // Slot handoff transfers ownership of the same logical allocations to the
+    // destination SubMaster. All real deletion paths release vsegment ranges;
+    // a persistence failure is leak-safe and is surfaced for reconciliation.
+    if (quota_mode != QuotaEraseMode::kHandoff && vsegment_service_) {
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto result = vsegment_service_->ReleaseObject(
+                replica.get_vsegment_descriptor(), key);
+            if (result != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to release vsegment allocation, key="
+                           << key << ", error=" << toString(result);
+            }
+        }
+    }
+
     // Clean up offloading_tasks + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task

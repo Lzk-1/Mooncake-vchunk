@@ -49,6 +49,8 @@ class VSegmentService final : public VSegmentViewProvider {
                        const std::string& vsegment_id,
                        uint64_t route_epoch,
                        const std::string& operation_id);
+    ErrorCode ReleaseObject(const VSegmentDescriptor& replica,
+                            const std::string& object_id);
 
     ErrorCode LoadView(const std::string& partition_id,
                        const std::string& vsegment_id, VSegmentView* view,

@@ -82,15 +82,20 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     }
     const bool owned_here =
         route.owner_submaster_id == local_submaster_id;
-    auto current = FindPartition(route.partition_id);
     if (!owned_here) {
+        auto current = FindPartition(route.partition_id);
         if (!current) return ErrorCode::OK;
         return RemovePartition(route.partition_id, route.route_epoch);
     }
 
     // During MIGRATING the old owner remains the sole writer. The target does
     // not install a live manager until the route atomically switches owner.
-    if (current) return current->SetRouteEpoch(route.route_epoch);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto current = partitions_.find(route.partition_id);
+        if (current != partitions_.end())
+            return current->second->SetRouteEpoch(route.route_epoch);
+    }
     return AddPartition(route.partition_id, route.route_epoch,
                         std::move(committer), recovered, detail);
 }
@@ -146,6 +151,24 @@ ErrorCode VSegmentService::AbortPut(const std::string& partition_id,
     auto manager = FindPartition(partition_id);
     return manager ? manager->AbortPut(vsegment_id, operation_id, route_epoch)
                    : ErrorCode::STALE_ROUTE;
+}
+
+ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
+                                         const std::string& object_id) {
+    if (object_id.empty() || replica.partition_id.empty() ||
+        replica.vsegment_id.empty() || replica.length == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    // Keep the registry lock through release so a concurrent route reconcile
+    // cannot detach or advance this manager between ownership validation and
+    // the persistent logical-range update.
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = partitions_.find(replica.partition_id);
+    if (found == partitions_.end()) return ErrorCode::STALE_ROUTE;
+    const auto epoch = found->second->Snapshot().route_epoch;
+    return found->second->ReleaseObject(
+        replica.vsegment_id, object_id,
+        {replica.logical_offset, replica.length}, epoch);
 }
 
 ErrorCode VSegmentService::LoadView(const std::string& partition_id,
