@@ -39,9 +39,10 @@ struct CompletedOperationRecord {
     std::string allocation_id;
     OperationOutcome outcome{OperationOutcome::ABORTED};
     LogicalRange range;
+    uint64_t completion_revision{0};
 };
 YLT_REFL(CompletedOperationRecord, operation_id, allocation_id, outcome,
-         range);
+         range, completion_revision);
 
 struct LogicalAllocationSnapshot {
     uint64_t logical_capacity{0};
@@ -87,6 +88,7 @@ class LogicalRangeAllocator {
     std::unordered_map<std::string, CompletedOperationRecord>
         completed_operations_;
     std::unordered_map<std::string, LogicalRange> committed_allocations_;
+    uint64_t next_completion_revision_{1};
 };
 
 struct ClientSlice {

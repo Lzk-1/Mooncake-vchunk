@@ -3390,8 +3390,9 @@ MasterService::EraseMetadata(
     auto& metadata = it->second;
 
     // Slot handoff transfers ownership of the same logical allocations to the
-    // destination SubMaster. All real deletion paths release vsegment ranges;
-    // a persistence failure is leak-safe and is surfaced for reconciliation.
+    // destination SubMaster. A real deletion must not discard ObjectMetadata
+    // until every logical allocation has been durably released: the metadata
+    // is the recovery authority for retrying an interrupted deletion.
     if (quota_mode != QuotaEraseMode::kHandoff && vsegment_service_) {
         for (const auto& replica : metadata.GetAllReplicas()) {
             if (!replica.is_vsegment_replica()) continue;
@@ -3400,6 +3401,7 @@ MasterService::EraseMetadata(
             if (result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to release vsegment allocation, key="
                            << key << ", error=" << toString(result);
+                return std::next(it);
             }
         }
     }

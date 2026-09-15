@@ -102,7 +102,8 @@ ErrorCode LogicalRangeAllocator::Commit(const std::string& operation_id,
         operation_id,
         CompletedOperationRecord{operation_id, allocation_id,
                                  OperationOutcome::COMMITTED,
-                                 reservation->second});
+                                 reservation->second,
+                                 next_completion_revision_++});
     reservations_.erase(reservation);
     return ErrorCode::OK;
 }
@@ -138,7 +139,8 @@ ErrorCode LogicalRangeAllocator::Abort(const std::string& operation_id) {
     completed_operations_.emplace(
         operation_id,
         CompletedOperationRecord{operation_id, {}, OperationOutcome::ABORTED,
-                                 reservation->second});
+                                 reservation->second,
+                                 next_completion_revision_++});
     reservations_.erase(reservation);
     return ErrorCode::OK;
 }
@@ -170,8 +172,10 @@ ErrorCode LogicalRangeAllocator::Release(const std::string& allocation_id,
     committed_allocations_.erase(allocation);
     for (auto& [operation_id, completed] : completed_operations_) {
         if (completed.allocation_id == allocation_id &&
-            completed.outcome == OperationOutcome::COMMITTED)
+            completed.outcome == OperationOutcome::COMMITTED) {
             completed.outcome = OperationOutcome::RELEASED;
+            completed.completion_revision = next_completion_revision_++;
+        }
     }
     return ErrorCode::OK;
 }
@@ -193,6 +197,9 @@ LogicalAllocationSnapshot LogicalRangeAllocator::Snapshot() const {
     std::sort(snapshot.completed_operations.begin(),
               snapshot.completed_operations.end(),
               [](const auto& left, const auto& right) {
+                  if (left.completion_revision != right.completion_revision)
+                      return left.completion_revision <
+                             right.completion_revision;
                   return left.operation_id < right.operation_id;
               });
     return snapshot;
@@ -209,6 +216,7 @@ ErrorCode LogicalRangeAllocator::Restore(
     std::unordered_map<std::string, LogicalRange> reservations;
     std::unordered_map<std::string, CompletedOperationRecord> completed;
     std::unordered_map<std::string, LogicalRange> committed;
+    uint64_t next_completion_revision = 1;
     for (const auto& reservation : snapshot.reservations) {
         if (reservation.operation_id.empty() ||
             !reservations.emplace(reservation.operation_id, reservation.range)
@@ -233,6 +241,8 @@ ErrorCode LogicalRangeAllocator::Restore(
             }
             all_ranges.push_back(operation.range);
         }
+        if (operation.completion_revision >= next_completion_revision)
+            next_completion_revision = operation.completion_revision + 1;
     }
     std::sort(all_ranges.begin(), all_ranges.end(),
               [](const auto& left, const auto& right) {
@@ -257,6 +267,7 @@ ErrorCode LogicalRangeAllocator::Restore(
     reservations_ = std::move(reservations);
     completed_operations_ = std::move(completed);
     committed_allocations_ = std::move(committed);
+    next_completion_revision_ = next_completion_revision;
     return ErrorCode::OK;
 }
 

@@ -935,8 +935,7 @@ TEST(VSegmentManagerTest, BoundsAbortedOperationTombstones) {
     VSegmentManager manager(Config(), {Profile()}, Committer(), 2);
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
-    for (int index = 0; index < 3; ++index) {
-        const auto operation = "aborted-" + std::to_string(index);
+    for (const std::string operation : {"z-oldest", "a-middle", "b-newest"}) {
         ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, operation,
                                        8));
         ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, operation),
@@ -947,6 +946,9 @@ TEST(VSegmentManagerTest, BoundsAbortedOperationTombstones) {
     EXPECT_LE(state.vsegments[0].logical_allocation.completed_operations.size(),
               2u);
     EXPECT_LE(state.operation_vsegments.size(), 2u);
+    EXPECT_FALSE(state.operation_vsegments.contains("z-oldest"));
+    EXPECT_TRUE(state.operation_vsegments.contains("a-middle"));
+    EXPECT_TRUE(state.operation_vsegments.contains("b-newest"));
 }
 
 TEST(VSegmentManagerTest, RecoveryReconcileUsesObjectMetadataAsAuthority) {
