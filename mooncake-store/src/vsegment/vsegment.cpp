@@ -192,7 +192,6 @@ uint32_t ComputeViewChecksum(const VSegmentView& view) {
     std::string bytes;
     AppendString(bytes, view.vsegment_id);
     AppendString(bytes, view.partition_id);
-    AppendString(bytes, view.profile_name);
     AppendUint64(bytes, static_cast<uint8_t>(view.mapping_algorithm));
     AppendUint64(bytes, view.stripe_size);
     AppendUint64(bytes, view.logical_capacity);
@@ -213,8 +212,6 @@ ErrorCode ValidateView(const VSegmentView& view,
     if (result != ErrorCode::OK) return result;
     if (view.vsegment_id.empty() || view.partition_id.empty())
         return Invalid("view identity is empty", detail);
-    if (view.profile_name != profile.name)
-        return Invalid("view profile_name does not match profile", detail);
     if (view.stripe_size != profile.stripe_size)
         return Invalid("view stripe_size does not match profile", detail);
     if (view.members.size() != profile.member_count)
@@ -243,8 +240,7 @@ ErrorCode ValidateView(const VSegmentView& view,
 
 ErrorCode ValidateViewStructure(const VSegmentView& view,
                                 std::string* detail) {
-    if (view.vsegment_id.empty() || view.partition_id.empty() ||
-        view.profile_name.empty())
+    if (view.vsegment_id.empty() || view.partition_id.empty())
         return Invalid("view identity is empty", detail);
     if (view.mapping_algorithm != MappingAlgorithm::ROUND_ROBIN)
         return Invalid("unsupported mapping_algorithm", detail);
@@ -474,7 +470,6 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     VSegmentView view;
     view.vsegment_id = vsegment_id;
     view.partition_id = config->second.partition_id;
-    view.profile_name = profile.name;
     view.stripe_size = profile.stripe_size;
     view.logical_capacity = profile.member_extent_size * profile.member_count;
     for (const auto& candidate : candidates) {

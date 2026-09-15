@@ -93,6 +93,9 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
+    // Optional layout/medium policy for vsegment-backed writes. Empty uses
+    // the immutable quota snapshot's default profile.
+    std::string vsegment_profile_name{};
     // Optional per-key routing group IDs. Empty string keeps that key
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
@@ -113,6 +116,7 @@ struct ReplicateConfig {
            << ", nof_replica_num: " << config.nof_replica_num
            << ", with_soft_pin: " << config.with_soft_pin
            << ", with_hard_pin: " << config.with_hard_pin
+           << ", vsegment_profile_name: " << config.vsegment_profile_name
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];

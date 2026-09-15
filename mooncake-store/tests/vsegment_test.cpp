@@ -456,17 +456,18 @@ TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
     EXPECT_EQ(loaded.stripe_size, second.stripe_size);
 }
 
-TEST(VSegmentViewTest, PersistsCreatingProfileIdentity) {
+TEST(VSegmentViewTest, KeepsProfileIdentityOutsideImmutableView) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-profile", Profile());
     ASSERT_TRUE(allocation);
-    EXPECT_EQ(allocation.view.profile_name, "default");
     EXPECT_EQ(ValidateView(allocation.view, Profile()), ErrorCode::OK);
 
+    // A View describes only mapping. The owning manager snapshot keeps the
+    // profile identity needed for quota recovery.
     auto wrong_profile = Profile();
     wrong_profile.name = "other";
     EXPECT_EQ(ValidateView(allocation.view, wrong_profile),
-              ErrorCode::INVALID_PARAMS);
+              ErrorCode::OK);
 }
 
 TEST(VSegmentReplicaTest, RuntimeMetadataPreservesLogicalDescriptor) {
@@ -1238,6 +1239,45 @@ TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
     ASSERT_EQ(result->size(), 2u);
     EXPECT_NE((*result)[0].replica.vsegment_id,
               (*result)[1].replica.vsegment_id);
+}
+
+TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
+    const TenantId tenant = TenantId::Default();
+    const std::string key = "profile-selected-object";
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(tenant, key));
+    auto alternate = Profile();
+    alternate.name = "alternate";
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile(), alternate};
+    quota.quotas = {
+        {partition_id, "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}},
+        {partition_id, "alternate", "DRAM",
+         {{"segment-a", 512, 512}, {"segment-b", 512, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    MasterService master;
+    master.SetVSegmentService(vsegments);
+    ReplicateConfig config;
+    config.vsegment_profile_name = "alternate";
+    const UUID client = generate_uuid();
+
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, config);
+        if (started && started->has_value()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started && started->has_value());
+    const auto states = vsegments->SnapshotAllPartitions();
+    ASSERT_EQ(states.size(), 1u);
+    ASSERT_EQ(states.front().vsegments.size(), 1u);
+    EXPECT_EQ(states.front().vsegments.front().profile_name, "alternate");
 }
 
 }  // namespace

@@ -602,7 +602,8 @@ MasterService::TryVSegmentPutStart(
     std::vector<std::string> operation_ids(config.replica_num);
     for (auto& id : operation_ids) id = UuidToString(generate_uuid());
     auto reservations = vsegment_service_->StartPutReplicasOwned(
-        partition_id, operation_ids, slice_length);
+        partition_id, operation_ids, slice_length,
+        config.vsegment_profile_name);
     if (!reservations) return tl::make_unexpected(reservations.error());
 
     const auto abort = [&] {
@@ -5162,7 +5163,8 @@ auto MasterService::AllocateAndInsertMetadata(
         std::vector<std::string> operation_ids(config.replica_num);
         for (auto& id : operation_ids) id = UuidToString(generate_uuid());
         auto reserved = vsegment_service_->StartPutReplicasOwned(
-            partition_id, operation_ids, value_length);
+            partition_id, operation_ids, value_length,
+            config.vsegment_profile_name);
         if (!reserved) return tl::make_unexpected(reserved.error());
         const uint64_t quota_charge =
             RequestedMemoryQuotaCharge(value_length, config);

@@ -15,7 +15,6 @@ bool SameImmutableView(const VSegmentView& left,
                        const VSegmentView& right) {
     if (left.vsegment_id != right.vsegment_id ||
         left.partition_id != right.partition_id ||
-        left.profile_name != right.profile_name ||
         left.mapping_algorithm != right.mapping_algorithm ||
         left.stripe_size != right.stripe_size ||
         left.logical_capacity != right.logical_capacity ||

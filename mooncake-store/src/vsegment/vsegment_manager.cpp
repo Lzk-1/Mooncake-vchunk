@@ -519,10 +519,6 @@ ErrorCode VSegmentManager::Restore(
             if (detail) *detail = "snapshot view has no matching profile";
             return ErrorCode::INVALID_PARAMS;
         }
-        if (state.view.profile_name != state.profile_name) {
-            if (detail) *detail = "snapshot profile identity mismatch";
-            return ErrorCode::INVALID_VERSION;
-        }
         if (state.lifecycle == Lifecycle::PREPARING ||
             state.lifecycle == Lifecycle::RETIRED) {
             // CREATE_COMMIT was not durably observed. Its statically owned
