@@ -2632,6 +2632,7 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    ErrorCode RefreshVSegmentOwnership();
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

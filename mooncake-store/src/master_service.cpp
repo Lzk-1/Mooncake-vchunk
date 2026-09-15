@@ -60,6 +60,8 @@
 #include "master_snapshot_repository.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
+#include "vsegment/partition_quota_planner.h"
+#include "vsegment/vsegment_ha.h"
 
 namespace mooncake {
 
@@ -692,6 +694,8 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
 
     const auto initial_slots = ResolveOwnedSlotsForCvm();
     UpdateExpectedSlots(initial_slots);
+    auto vsegment_error = RefreshVSegmentOwnership();
+    if (vsegment_error != ErrorCode::OK) return vsegment_error;
 
     cvm::SlotOwnerHeartbeat::Config hb_config;
     hb_config.cluster_namespace = cluster_id_;
@@ -702,6 +706,11 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     hb_config.dynamic_slot_resolver = [this]() {
         auto slots = ResolveOwnedSlotsForCvm();
         UpdateExpectedSlots(slots);
+        const auto error = RefreshVSegmentOwnership();
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to refresh vsegment ownership: "
+                       << toString(error);
+        }
         return slots;
     };
     hb_config.lease_id = cvm_lease_id_;
@@ -728,6 +737,61 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
               << ", dynamic_partition=true"
               << ", lease_bound=" << lease_bound;
     return ErrorCode::OK;
+}
+
+ErrorCode MasterService::RefreshVSegmentOwnership() {
+    if (!ordered_oplog_writer_) return ErrorCode::OK;
+    if (!vsegment_service_) {
+        vsegment::PartitionPhysicalQuotaSnapshot quota;
+        std::string detail;
+        vsegment::EtcdPartitionQuotaSnapshotStore store(cluster_id_);
+        auto error = store.Load(&quota, &detail);
+        if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to load vsegment quota: " << detail;
+            return error;
+        }
+        vsegment_service_ =
+            std::make_shared<vsegment::VSegmentService>(std::move(quota));
+    }
+
+    std::unordered_map<std::string,
+                       const vsegment::PartitionVSegmentSnapshot*>
+        recovered;
+    for (const auto& state : recovered_vsegment_snapshots_)
+        recovered[state.partition_id] = &state;
+    std::unordered_set<std::string> partition_ids;
+    for (const auto& quota : vsegment_service_->quota_snapshot().quotas)
+        partition_ids.insert(quota.partition_id);
+    bool complete = true;
+    for (const auto& partition_id : partition_ids) {
+        partition::PartitionRoute route;
+        ViewVersionId version = 0;
+        auto error = cvm::EtcdViewStore::LoadPartitionRoute(
+            cluster_id_, partition_id, route, version);
+        if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+            if (recovered.count(partition_id)) complete = false;
+            continue;
+        }
+        if (error != ErrorCode::OK) {
+            complete = false;
+            continue;
+        }
+        const auto found = recovered.find(partition_id);
+        const auto* state = found == recovered.end() ? nullptr : found->second;
+        auto committer =
+            std::make_shared<vsegment::OrderedOpLogVSegmentCommitter>(
+                ordered_oplog_writer_.get());
+        error = vsegment_service_->ReconcilePartitionRoute(
+            route, master_id_, std::move(committer), state);
+        if (error != ErrorCode::OK && error != ErrorCode::STALE_ROUTE) {
+            LOG(ERROR) << "Failed to reconcile Partition " << partition_id
+                       << ": " << toString(error);
+            complete = false;
+        }
+    }
+    if (complete) recovered_vsegment_snapshots_.clear();
+    return complete ? ErrorCode::OK : ErrorCode::PERSISTENT_FAIL;
 }
 
 #ifdef STORE_USE_ETCD
@@ -1286,6 +1350,7 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
 }
 #else
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
+ErrorCode MasterService::RefreshVSegmentOwnership() { return ErrorCode::OK; }
 
 SlotMetadataExport MasterService::BuildSlotMetadataExport(
     uint16_t /*slot*/) const {

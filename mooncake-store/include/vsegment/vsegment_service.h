@@ -35,6 +35,9 @@ class VSegmentService final : public VSegmentViewProvider {
     ErrorCode SnapshotPartition(const std::string& partition_id,
                                 PartitionVSegmentSnapshot* snapshot);
     std::vector<PartitionVSegmentSnapshot> SnapshotAllPartitions();
+    const PartitionPhysicalQuotaSnapshot& quota_snapshot() const {
+        return quota_snapshot_;
+    }
 
     VSegmentPutStartResult StartPut(const std::string& partition_id,
                                     uint64_t route_epoch,
