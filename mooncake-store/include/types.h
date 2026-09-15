@@ -370,7 +370,6 @@ enum class ErrorCode : int32_t {
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
     K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
-    STALE_ROUTE = -1006,  ///< Request carries an obsolete Partition epoch.
     K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
     INCOMPLETE_OPLOG_CATCH_UP =
         -1007,  ///< Promotion catch-up could not prove all durable OpLog

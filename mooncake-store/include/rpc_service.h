@@ -363,11 +363,8 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
         uint16_t slot, const std::string& importer_master_id);
 
-    // ---- vsegment 预留 RPC 接口（§5.2，方法体由 vsegment 实现方落地）----
-    // 元数据面：cache miss 时拉取完整不可变 view。
-    tl::expected<partition::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& vsegment_id);
-
+    // ---- vsegment 预留物理分配 RPC 接口（§5.2）----
+    // 元数据面的 GetVSegmentView 已由上面的 partition-aware 接口实现。
     // 物理分配面（幂等，幂等键 = allocation_id + segment_id）。
     tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
     GetExtentSummary(const partition::GetExtentSummaryRequest& request);

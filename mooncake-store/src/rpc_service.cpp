@@ -2045,14 +2045,7 @@ WrappedMasterService::InterMasterAckSlotImported(
         [] {}, [] {});
 }
 
-// ---- vsegment 预留 RPC 接口占位实现（方法体由 vsegment 实现方落地）----
-tl::expected<partition::VSegmentView, ErrorCode>
-WrappedMasterService::GetVSegmentView(const std::string& vsegment_id) {
-    (void)vsegment_id;
-    throw std::runtime_error(
-        "GetVSegmentView not implemented (vsegment reserved interface)");
-}
-
+// ---- vsegment 预留物理分配 RPC 接口占位实现 ----
 tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
 WrappedMasterService::GetExtentSummary(
     const partition::GetExtentSummaryRequest& request) {
@@ -2291,9 +2284,7 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
-    // vsegment 预留 RPC 接口。
-    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
-        &wrapped_master_service);
+    // vsegment 预留物理分配 RPC 接口。
     server.register_handler<&mooncake::WrappedMasterService::GetExtentSummary>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReserveExtent>(
