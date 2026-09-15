@@ -28,10 +28,12 @@ class SegmentEndpointResolver {
 
 class VSegmentViewCache {
    public:
-    bool Find(const std::string& vsegment_id, VSegmentView* view) const;
+    bool Find(const std::string& partition_id, const std::string& vsegment_id,
+              VSegmentView* view) const;
     ErrorCode Insert(const VSegmentView& view,
                      std::string* detail = nullptr);
-    void Erase(const std::string& vsegment_id);
+    void Erase(const std::string& partition_id,
+               const std::string& vsegment_id);
 
    private:
     mutable std::mutex mutex_;

@@ -61,14 +61,15 @@ YLT_REFL(PSegmentExtent, segment, base_offset, length);
 struct VSegmentView {
     std::string vsegment_id;
     PartitionIdentity partition_id;
+    std::string profile_name;
     int32_t mapping_algorithm{0};  // MappingAlgorithm
     uint64_t stripe_size{0};
     std::vector<PSegmentExtent> members;  // 有序，至少 2 项，各贡献长度相等
     uint64_t logical_capacity{0};
     uint32_t checksum{0};
 };
-YLT_REFL(VSegmentView, vsegment_id, partition_id, mapping_algorithm,
-         stripe_size, members, logical_capacity, checksum);
+YLT_REFL(VSegmentView, vsegment_id, partition_id, profile_name,
+         mapping_algorithm, stripe_size, members, logical_capacity, checksum);
 
 // 逻辑空间分配状态。committed_ranges 不在此保存，以对象元数据中的
 // ReplicaDescriptor 为权威来源。

@@ -364,6 +364,36 @@ TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {
     EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
 }
 
+TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
+    auto first = View();
+    auto second = first;
+    second.partition_id = "partition-2";
+    second.stripe_size *= 2;
+    second.checksum = ComputeViewChecksum(second);
+
+    VSegmentViewCache cache;
+    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
+    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
+    VSegmentView loaded;
+    ASSERT_TRUE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
+    EXPECT_EQ(loaded.stripe_size, first.stripe_size);
+    ASSERT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
+    EXPECT_EQ(loaded.stripe_size, second.stripe_size);
+}
+
+TEST(VSegmentViewTest, PersistsCreatingProfileIdentity) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-profile", Profile());
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(allocation.view.profile_name, "default");
+    EXPECT_EQ(ValidateView(allocation.view, Profile()), ErrorCode::OK);
+
+    auto wrong_profile = Profile();
+    wrong_profile.name = "other";
+    EXPECT_EQ(ValidateView(allocation.view, wrong_profile),
+              ErrorCode::INVALID_PARAMS);
+}
+
 TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
     auto config = Config();
     std::swap(config.quotas[0], config.quotas[1]);
@@ -671,6 +701,29 @@ TEST(VSegmentManagerTest, ExposesLifecycleStatsAndGcsOperationTombstone) {
     EXPECT_EQ(stats.committed_allocations, 0);
     EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OK);
     EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST(VSegmentManagerTest, RetirementPersistenceFailureRollsBackExtent) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                         Lifecycle::DRAINING),
+              ErrorCode::OK);
+
+    committer->fail_next = true;
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::PERSISTENT_FAIL);
+    VSegmentView view;
+    EXPECT_TRUE(manager.FindView(allocation.view.vsegment_id, &view));
+    EXPECT_EQ(manager.Stats().draining, 1);
+
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OK);
+    EXPECT_FALSE(manager.FindView(allocation.view.vsegment_id, &view));
 }
 
 TEST(VSegmentHaTest, ReplaysContinuousPartitionRevisions) {

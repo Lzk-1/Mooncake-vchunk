@@ -93,14 +93,17 @@ YLT_REFL(PartitionPhysicalQuotaSnapshot, config_generation, policy_digest,
 struct VSegmentView {
     std::string vsegment_id;
     std::string partition_id;
+    // Immutable layout profile used to create this view. Recovery validates
+    // against this exact profile instead of relying on a mutable default.
+    std::string profile_name;
     MappingAlgorithm mapping_algorithm{MappingAlgorithm::ROUND_ROBIN};
     uint64_t stripe_size{0};
     uint64_t logical_capacity{0};
     std::vector<PSegmentExtent> members;
     uint32_t checksum{0};
 };
-YLT_REFL(VSegmentView, vsegment_id, partition_id, mapping_algorithm,
-         stripe_size, logical_capacity, members, checksum);
+YLT_REFL(VSegmentView, vsegment_id, partition_id, profile_name,
+         mapping_algorithm, stripe_size, logical_capacity, members, checksum);
 
 struct VSegmentAllocationResult {
     ErrorCode error{ErrorCode::OK};

@@ -4,10 +4,20 @@
 
 namespace mooncake::vsegment {
 
-bool VSegmentViewCache::Find(const std::string& vsegment_id,
+namespace {
+
+std::string ViewCacheKey(const std::string& partition_id,
+                         const std::string& vsegment_id) {
+    return partition_id + '\0' + vsegment_id;
+}
+
+}  // namespace
+
+bool VSegmentViewCache::Find(const std::string& partition_id,
+                             const std::string& vsegment_id,
                              VSegmentView* view) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto found = views_.find(vsegment_id);
+    auto found = views_.find(ViewCacheKey(partition_id, vsegment_id));
     if (found == views_.end()) return false;
     if (view) *view = found->second;
     return true;
@@ -18,7 +28,8 @@ ErrorCode VSegmentViewCache::Insert(const VSegmentView& view,
     auto validation = ValidateViewStructure(view, detail);
     if (validation != ErrorCode::OK) return validation;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto found = views_.find(view.vsegment_id);
+    const auto key = ViewCacheKey(view.partition_id, view.vsegment_id);
+    auto found = views_.find(key);
     if (found != views_.end()) {
         if (found->second.checksum != view.checksum) {
             if (detail) *detail = "immutable view identity has another checksum";
@@ -26,13 +37,14 @@ ErrorCode VSegmentViewCache::Insert(const VSegmentView& view,
         }
         return ErrorCode::OK;
     }
-    views_.emplace(view.vsegment_id, view);
+    views_.emplace(key, view);
     return ErrorCode::OK;
 }
 
-void VSegmentViewCache::Erase(const std::string& vsegment_id) {
+void VSegmentViewCache::Erase(const std::string& partition_id,
+                              const std::string& vsegment_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    views_.erase(vsegment_id);
+    views_.erase(ViewCacheKey(partition_id, vsegment_id));
 }
 
 VSegmentTransferPlan VSegmentTransferPlanner::Plan(
@@ -47,7 +59,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
         return plan;
     }
     VSegmentView view;
-    if (!cache_->Find(replica.vsegment_id, &view)) {
+    if (!cache_->Find(replica.partition_id, replica.vsegment_id, &view)) {
         auto result = provider_->LoadView(replica.partition_id,
                                           replica.vsegment_id, &view,
                                           &plan.detail);

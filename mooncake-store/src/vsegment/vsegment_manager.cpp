@@ -392,20 +392,27 @@ ErrorCode VSegmentManager::TransitionLifecycle(
         }
     }
     managed->second.lifecycle = target;
+    bool released_extent = false;
+    if (target == Lifecycle::RETIRED) {
+        const auto released = physical_allocator_.Release(managed->second.view);
+        if (released != ErrorCode::OK) {
+            managed->second.lifecycle = current;
+            operation_vsegments_.insert(retired_operations.begin(),
+                                        retired_operations.end());
+            return released;
+        }
+        released_extent = true;
+    }
     const auto persisted = PersistLocked("lifecycle_transition");
     if (persisted != ErrorCode::OK) {
         managed->second.lifecycle = current;
         operation_vsegments_.insert(retired_operations.begin(),
                                     retired_operations.end());
-    }
-    if (persisted == ErrorCode::OK && target == Lifecycle::RETIRED) {
-        auto released = physical_allocator_.Release(managed->second.view);
-        if (released != ErrorCode::OK) return released;
-        persisted = PersistLocked("vsegment_extent_release");
-        if (persisted != ErrorCode::OK) {
+        if (released_extent) {
             std::string ignored;
             physical_allocator_.Restore(managed->second.view,
-                                         profiles_.at(managed->second.profile_name),
+                                         profiles_.at(
+                                             managed->second.profile_name),
                                          &ignored);
         }
     }
@@ -484,6 +491,10 @@ ErrorCode VSegmentManager::Restore(
         if (profile == profiles_.end()) {
             if (detail) *detail = "snapshot view has no matching profile";
             return ErrorCode::INVALID_PARAMS;
+        }
+        if (state.view.profile_name != state.profile_name) {
+            if (detail) *detail = "snapshot profile identity mismatch";
+            return ErrorCode::INVALID_VERSION;
         }
         if (state.lifecycle == Lifecycle::PREPARING ||
             state.lifecycle == Lifecycle::RETIRED) {
