@@ -102,7 +102,8 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
 
 VSegmentPutStartResult VSegmentManager::StartPut(
     const std::string& operation_id, uint64_t length,
-    const std::string& requested_profile, uint64_t expected_route_epoch) {
+    const std::string& requested_profile, uint64_t expected_route_epoch,
+    const std::vector<std::string>& excluded_vsegments) {
     const auto& profile_name =
         requested_profile.empty() ? default_profile_ : requested_profile;
     if (operation_id.empty() || length == 0 || !profiles_.count(profile_name))
@@ -130,10 +131,15 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 return {ErrorCode::OK,
                         operation_id,
                         {partition_id_, existing_operation->second,
-                         reservation.range.offset, reservation.range.length},
+                         reservation.range.offset, reservation.range.length,
+                         operation_id},
                         {}};
             }
             for (auto& [id, managed] : vsegments_) {
+                if (std::find(excluded_vsegments.begin(),
+                              excluded_vsegments.end(), id) !=
+                    excluded_vsegments.end())
+                    continue;
                 if (managed.lifecycle != Lifecycle::ACTIVE ||
                     managed.profile_name != profile_name)
                     continue;
@@ -157,7 +163,7 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 return {ErrorCode::OK,
                         operation_id,
                         {partition_id_, id, reservation.range.offset,
-                         reservation.range.length},
+                         reservation.range.length, operation_id},
                         {}};
             }
         }

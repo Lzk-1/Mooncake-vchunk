@@ -721,11 +721,12 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     "serialize_msgpack Replica missing VSegmentReplicaData"));
             }
             const auto &descriptor = vsegment_data->descriptor;
-            packer.pack_array(4);
+            packer.pack_array(5);
             packer.pack(descriptor.partition_id);
             packer.pack(descriptor.vsegment_id);
             packer.pack(descriptor.logical_offset);
             packer.pack(descriptor.length);
+            packer.pack(descriptor.operation_id);
             break;
         }
         default:
@@ -831,11 +832,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::VSEGMENT): {
             const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 4) {
+                (payload.via.array.size != 4 &&
+                 payload.via.array.size != 5)) {
                 return tl::unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,
                     "deserialize_msgpack Replica VSEGMENT payload is not "
-                    "valid array[4]"));
+                    "valid array[4..5]"));
             }
             auto *items = payload.via.array.ptr;
             VSegmentDescriptor descriptor;
@@ -843,6 +845,8 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             descriptor.vsegment_id = items[1].as<std::string>();
             descriptor.logical_offset = items[2].as<uint64_t>();
             descriptor.length = items[3].as<uint64_t>();
+            if (payload.via.array.size == 5)
+                descriptor.operation_id = items[4].as<std::string>();
             if (descriptor.partition_id.empty() ||
                 descriptor.vsegment_id.empty() || descriptor.length == 0) {
                 return tl::unexpected(SerializationError(

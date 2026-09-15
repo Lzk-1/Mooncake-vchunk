@@ -609,23 +609,33 @@ MasterService::TryVSegmentPutStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t slice_length, const ReplicateConfig& config) {
     if (!vsegment_service_) return std::optional<PutStartResult>{};
-    if (config.replica_num != 1 || config.nof_replica_num != 0) {
+    if (config.replica_num == 0 || config.nof_replica_num != 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto normalized = ResolveTenantIdForWrite(tenant_id);
     if (!normalized) return tl::make_unexpected(normalized.error());
     const std::string partition_id =
         std::to_string(cvm::KeySlot(*normalized, key));
-    const std::string operation_id = UuidToString(generate_uuid());
-    auto reservation = vsegment_service_->StartPutOwned(
-        partition_id, operation_id, slice_length);
-    if (!reservation) return tl::make_unexpected(reservation.error);
+    std::vector<std::string> operation_ids(config.replica_num);
+    for (auto& id : operation_ids) id = UuidToString(generate_uuid());
+    auto reservations = vsegment_service_->StartPutReplicasOwned(
+        partition_id, operation_ids, slice_length);
+    if (!reservations) return tl::make_unexpected(reservations.error());
 
     const auto abort = [&] {
-        vsegment_service_->AbortPutOwned(
-            reservation.replica.partition_id,
-            reservation.replica.vsegment_id, operation_id);
+        for (const auto& reservation : *reservations)
+            vsegment_service_->AbortPutOwned(
+                reservation.replica.partition_id,
+                reservation.replica.vsegment_id,
+                reservation.operation_id);
     };
+    const uint64_t quota_charge =
+        RequestedMemoryQuotaCharge(slice_length, config);
+    auto quota_result = ReserveTenantQuota(*normalized, quota_charge);
+    if (!quota_result) {
+        abort();
+        return tl::make_unexpected(quota_result.error());
+    }
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     const auto shard_idx = getShardIndex(*normalized, key);
     MetadataShardAccessorRW shard(this, shard_idx);
@@ -633,12 +643,16 @@ MasterService::TryVSegmentPutStart(
     if (tenant_state.metadata.contains(key) ||
         GetGroupRoute(*normalized, key).has_value()) {
         abort();
+        AbortTenantQuota(*normalized, quota_charge);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     std::vector<Replica> replicas;
-    replicas.emplace_back(reservation.replica, ReplicaStatus::PROCESSING);
+    for (const auto& reservation : *reservations)
+        replicas.emplace_back(reservation.replica,
+                              ReplicaStatus::PROCESSING);
     std::vector<Replica::Descriptor> descriptors;
-    descriptors.push_back(replicas.front().get_descriptor());
+    for (const auto& replica : replicas)
+        descriptors.push_back(replica.get_descriptor());
     const std::string group_id =
         config.group_ids && !config.group_ids->empty()
             ? config.group_ids->front()
@@ -651,13 +665,17 @@ MasterService::TryVSegmentPutStart(
             config.data_type, group_id, *normalized, key));
     if (!inserted) {
         abort();
+        AbortTenantQuota(*normalized, quota_charge);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     IncrementTenantMetadataObjectCount(*normalized);
+    it->second.reserved_quota_charge_bytes = quota_charge;
     RegisterGroupMember(tenant_state, *normalized, key, group_id);
     tenant_state.processing_keys.insert(key);
     return std::optional<PutStartResult>(
-        PutStartResult{operation_id, std::move(descriptors)});
+        PutStartResult{operation_ids.size() == 1 ? operation_ids.front()
+                                                : std::string{},
+                       std::move(descriptors)});
 }
 
 void MasterService::StopSlotOwnerHeartbeat() {
@@ -3186,7 +3204,7 @@ MasterService::EraseMetadata(
         for (const auto& replica : metadata.GetAllReplicas()) {
             if (!replica.is_vsegment_replica()) continue;
             const auto result = vsegment_service_->ReleaseObject(
-                replica.get_vsegment_descriptor(), key);
+                replica.get_vsegment_descriptor(), tenant_id.MakeScopedKey(key));
             if (result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to release vsegment allocation, key="
                            << key << ", error=" << toString(result);
@@ -4943,6 +4961,53 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
+    if (vsegment_service_) {
+        if (config.replica_num == 0 || config.nof_replica_num != 0)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        const std::string partition_id =
+            std::to_string(cvm::KeySlot(tenant_id, key));
+        std::vector<std::string> operation_ids(config.replica_num);
+        for (auto& id : operation_ids) id = UuidToString(generate_uuid());
+        auto reserved = vsegment_service_->StartPutReplicasOwned(
+            partition_id, operation_ids, value_length);
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        const uint64_t quota_charge =
+            RequestedMemoryQuotaCharge(value_length, config);
+        auto quota_result = ReserveTenantQuota(tenant_id, quota_charge);
+        if (!quota_result) {
+            for (const auto& item : *reserved)
+                vsegment_service_->AbortPutOwned(
+                    partition_id, item.replica.vsegment_id,
+                    item.operation_id);
+            return tl::make_unexpected(quota_result.error());
+        }
+        std::vector<Replica> replicas;
+        for (const auto& item : *reserved)
+            replicas.emplace_back(item.replica, ReplicaStatus::PROCESSING);
+        std::vector<Replica::Descriptor> descriptors;
+        for (const auto& replica : replicas)
+            descriptors.push_back(replica.get_descriptor());
+        auto [it, inserted] = tenant_state.metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(key),
+            std::forward_as_tuple(
+                client_id, now, value_length, std::move(replicas),
+                config.with_soft_pin, config.with_hard_pin, config.data_type,
+                group_id, tenant_id, key));
+        if (!inserted) {
+            AbortTenantQuota(tenant_id, quota_charge);
+            for (const auto& item : *reserved)
+                vsegment_service_->AbortPutOwned(
+                    partition_id, item.replica.vsegment_id,
+                    item.operation_id);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        IncrementTenantMetadataObjectCount(tenant_id);
+        it->second.reserved_quota_charge_bytes = quota_charge;
+        RegisterGroupMember(tenant_state, tenant_id, key, group_id);
+        tenant_state.processing_keys.insert(key);
+        return descriptors;
+    }
+
     const uint64_t reserved_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
     auto quota_result = ReserveTenantQuota(tenant_id, reserved_quota_charge);
@@ -5452,17 +5517,31 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    const Replica* vsegment_replica = metadata.GetFirstReplica(
-        &Replica::fn_is_vsegment_replica);
-    if (vsegment_replica != nullptr) {
-        if (operation_id.empty() || !vsegment_service_) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const auto committed = vsegment_service_->CommitPutOwned(
-            vsegment_replica->get_vsegment_descriptor(), operation_id, key);
-        if (committed != ErrorCode::OK) {
-            return tl::make_unexpected(committed);
-        }
+    std::vector<vsegment::VSegmentDescriptor> committed_vsegments;
+    ErrorCode vsegment_commit_error = ErrorCode::OK;
+    metadata.VisitReplicas(
+        &Replica::fn_is_vsegment_replica,
+        [&](const Replica& replica) {
+            if (vsegment_commit_error != ErrorCode::OK) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            const std::string effective_operation_id =
+                descriptor.operation_id.empty() ? operation_id
+                                                : descriptor.operation_id;
+            if (effective_operation_id.empty() || !vsegment_service_) {
+                vsegment_commit_error = ErrorCode::INVALID_PARAMS;
+                return;
+            }
+            vsegment_commit_error = vsegment_service_->CommitPutOwned(
+                descriptor, effective_operation_id,
+                object_id.tenant_id.MakeScopedKey(key));
+            if (vsegment_commit_error == ErrorCode::OK)
+                committed_vsegments.push_back(descriptor);
+        });
+    if (vsegment_commit_error != ErrorCode::OK) {
+        // Already committed replicas remain invisible with PROCESSING status.
+        // Retrying PutEnd is idempotent and commits the remaining replicas;
+        // releasing the prefix here would invalidate that retry contract.
+        return tl::make_unexpected(vsegment_commit_error);
     }
 
     metadata.VisitReplicas(
@@ -5564,7 +5643,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // vsegment 两阶段写：PutEnd 成功时提交预留的逻辑区间（失败路径由调用方
     // 走 PutRevoke 触达 AbortOperation 撤销）。operation_id 为空表示旧直达写
     // 路径，不涉及 commit。
-    if (!operation_id.empty() && vsegment_replica == nullptr &&
+    if (!operation_id.empty() && committed_vsegments.empty() &&
         vsegment_service_delegate_) {
         vsegment_service_delegate_->CommitOperation(operation_id);
     }
@@ -5735,18 +5814,25 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                    << key << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
-    auto pending_vsegment = metadata.GetFirstReplica(
-        &Replica::fn_is_vsegment_replica);
-    if (pending_vsegment != nullptr) {
-        if (operation_id.empty() || !vsegment_service_) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const auto aborted = vsegment_service_->AbortPutOwned(
-            pending_vsegment->get_vsegment_descriptor().partition_id,
-            pending_vsegment->get_vsegment_descriptor().vsegment_id,
-            operation_id);
-        if (aborted != ErrorCode::OK) return tl::make_unexpected(aborted);
-    }
+    ErrorCode vsegment_abort_error = ErrorCode::OK;
+    metadata.VisitReplicas(
+        &Replica::fn_is_vsegment_replica,
+        [&](const Replica& replica) {
+            if (vsegment_abort_error != ErrorCode::OK) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            const std::string effective_operation_id =
+                descriptor.operation_id.empty() ? operation_id
+                                                : descriptor.operation_id;
+            if (effective_operation_id.empty() || !vsegment_service_) {
+                vsegment_abort_error = ErrorCode::INVALID_PARAMS;
+                return;
+            }
+            vsegment_abort_error = vsegment_service_->AbortPutOwned(
+                descriptor.partition_id, descriptor.vsegment_id,
+                effective_operation_id);
+        });
+    if (vsegment_abort_error != ErrorCode::OK)
+        return tl::make_unexpected(vsegment_abort_error);
 
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {

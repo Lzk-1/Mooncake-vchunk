@@ -214,8 +214,9 @@ struct VSegmentDescriptor {
     std::string vsegment_id;
     uint64_t logical_offset{0};
     uint64_t length{0};
+    std::string operation_id;
     YLT_REFL(VSegmentDescriptor, partition_id, vsegment_id, logical_offset,
-             length);
+             length, operation_id);
 };
 
 struct VSegmentReplicaData {

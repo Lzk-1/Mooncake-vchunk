@@ -47,6 +47,11 @@ class VSegmentService final : public VSegmentViewProvider {
     VSegmentPutStartResult StartPutOwned(
         const std::string& partition_id, const std::string& operation_id,
         uint64_t length, const std::string& profile_name = {});
+    tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode>
+    StartPutReplicasOwned(const std::string& partition_id,
+                          const std::vector<std::string>& operation_ids,
+                          uint64_t length,
+                          const std::string& profile_name = {});
     ErrorCode CommitPut(const VSegmentDescriptor& replica,
                         uint64_t route_epoch,
                         const std::string& operation_id,

@@ -69,7 +69,8 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     const std::string& local_submaster_id,
     std::shared_ptr<VSegmentStateCommitter> committer,
     const PartitionVSegmentSnapshot* recovered, std::string* detail) {
-    if (route.partition_id.empty() || local_submaster_id.empty() ||
+    const auto& partition_id = route.partition_id.partition_id;
+    if (partition_id.empty() || local_submaster_id.empty() ||
         route.route_epoch == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -83,20 +84,20 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     const bool owned_here =
         route.owner_submaster_id == local_submaster_id;
     if (!owned_here) {
-        auto current = FindPartition(route.partition_id);
+        auto current = FindPartition(partition_id);
         if (!current) return ErrorCode::OK;
-        return RemovePartition(route.partition_id, route.route_epoch);
+        return RemovePartition(partition_id, route.route_epoch);
     }
 
     // During MIGRATING the old owner remains the sole writer. The target does
     // not install a live manager until the route atomically switches owner.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto current = partitions_.find(route.partition_id);
+        auto current = partitions_.find(partition_id);
         if (current != partitions_.end())
             return current->second->SetRouteEpoch(route.route_epoch);
     }
-    return AddPartition(route.partition_id, route.route_epoch,
+    return AddPartition(partition_id, route.route_epoch,
                         std::move(committer), recovered, detail);
 }
 
@@ -138,6 +139,32 @@ VSegmentPutStartResult VSegmentService::StartPutOwned(
                 "Partition is not owned by this SubMaster"};
     return manager->StartPut(operation_id, length, profile_name,
                              manager->Snapshot().route_epoch);
+}
+
+tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode>
+VSegmentService::StartPutReplicasOwned(
+    const std::string& partition_id,
+    const std::vector<std::string>& operation_ids, uint64_t length,
+    const std::string& profile_name) {
+    auto manager = FindPartition(partition_id);
+    if (!manager) return tl::make_unexpected(ErrorCode::STALE_ROUTE);
+    const auto epoch = manager->Snapshot().route_epoch;
+    std::vector<VSegmentPutStartResult> results;
+    std::vector<std::string> selected;
+    results.reserve(operation_ids.size());
+    for (const auto& operation_id : operation_ids) {
+        auto result = manager->StartPut(operation_id, length, profile_name,
+                                        epoch, selected);
+        if (!result) {
+            for (const auto& prior : results)
+                manager->AbortPut(prior.replica.vsegment_id,
+                                  prior.operation_id, epoch);
+            return tl::make_unexpected(result.error);
+        }
+        selected.push_back(result.replica.vsegment_id);
+        results.push_back(std::move(result));
+    }
+    return results;
 }
 
 ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,

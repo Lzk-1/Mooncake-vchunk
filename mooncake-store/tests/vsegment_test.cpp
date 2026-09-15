@@ -29,7 +29,7 @@ TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
 
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
     partition::PartitionRoute route{
-        "partition-7", "submaster-a", 9,
+        {"partition-7"}, "submaster-a", 9,
         static_cast<int32_t>(partition::PartitionState::kMigrating),
         "submaster-b"};
     std::string encoded;
@@ -38,7 +38,8 @@ TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
     partition::PartitionRoute decoded;
     ASSERT_EQ(cvm::EtcdViewStore::DeserializePartitionRoute(encoded, decoded),
               ErrorCode::OK);
-    EXPECT_EQ(decoded.partition_id, route.partition_id);
+    EXPECT_EQ(decoded.partition_id.partition_id,
+              route.partition_id.partition_id);
     EXPECT_EQ(decoded.owner_submaster_id, route.owner_submaster_id);
     EXPECT_EQ(decoded.route_epoch, route.route_epoch);
     EXPECT_EQ(decoded.state, route.state);
@@ -946,7 +947,7 @@ TEST(VSegmentServiceTest, ReconcilesManagerFromPartitionRouteEpoch) {
          {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
     VSegmentService service(snapshot);
     partition::PartitionRoute route;
-    route.partition_id = "partition-1";
+    route.partition_id.partition_id = "partition-1";
     route.owner_submaster_id = "submaster-a";
     route.route_epoch = 3;
     route.state = static_cast<int32_t>(partition::PartitionState::kActive);
@@ -1045,6 +1046,31 @@ TEST(VSegmentIntegrationTest, OrdinaryPutReturnsAndCommitsVSegmentReplica) {
     ASSERT_TRUE(loaded.has_value());
     ASSERT_EQ(loaded->replicas.size(), 1u);
     EXPECT_TRUE(loaded->replicas.front().is_vsegment_replica());
+}
+
+TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+    tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode> result;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        result = service.StartPutReplicasOwned(
+            "partition-1", {"replica-op-1", "replica-op-2"}, 64);
+        if (result || result.error() != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 2u);
+    EXPECT_NE((*result)[0].replica.vsegment_id,
+              (*result)[1].replica.vsegment_id);
 }
 
 }  // namespace

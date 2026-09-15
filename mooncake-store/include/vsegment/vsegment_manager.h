@@ -80,7 +80,9 @@ class VSegmentManager {
     VSegmentPutStartResult StartPut(const std::string& operation_id,
                                     uint64_t length,
                                     const std::string& profile_name = {},
-                                    uint64_t expected_route_epoch = 0);
+                                    uint64_t expected_route_epoch = 0,
+                                    const std::vector<std::string>&
+                                        excluded_vsegments = {});
     ErrorCode SetRouteEpoch(uint64_t route_epoch);
     ReservationResult ReservePut(const std::string& vsegment_id,
                                  const std::string& operation_id,

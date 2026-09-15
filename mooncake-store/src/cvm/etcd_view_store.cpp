@@ -138,13 +138,15 @@ ErrorCode EtcdViewStore::DeserializePSegmentAllocatorRoute(
 
 ErrorCode EtcdViewStore::SavePartitionRoute(
     const std::string& ns, const partition::PartitionRoute& route) {
-    if (route.partition_id.empty() || route.owner_submaster_id.empty() ||
+    if (route.partition_id.partition_id.empty() ||
+        route.owner_submaster_id.empty() ||
         route.route_epoch == 0)
         return ErrorCode::INVALID_PARAMS;
     std::string value;
     auto error = SerializePartitionRoute(route, value);
     if (error != ErrorCode::OK) return error;
-    const auto key = PartitionRouteKey(ns, route.partition_id);
+    const auto key =
+        PartitionRouteKey(ns, route.partition_id.partition_id);
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
@@ -193,7 +195,7 @@ ErrorCode EtcdViewStore::CASSwitchPartitionOwner(
     if (current.route_epoch != expected_epoch) return ErrorCode::STALE_ROUTE;
     std::string old_value;
     SerializePartitionRoute(current, old_value);
-    out = {partition_id, new_owner, expected_epoch + 1,
+    out = {{partition_id}, new_owner, expected_epoch + 1,
            static_cast<int32_t>(state), target};
     std::string new_value;
     SerializePartitionRoute(out, new_value);
