@@ -73,6 +73,7 @@ class LogicalRangeAllocator {
     size_t ReservationCount() const;
     size_t CommittedCount() const;
     bool Empty() const;
+    ErrorCode ForgetCompleted(const std::string& operation_id);
 
    private:
     static void InsertAndMerge(std::vector<LogicalRange>& ranges,

@@ -2,6 +2,7 @@
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
 #include "vsegment/vsegment_ha.h"
+#include "vsegment/vsegment_service.h"
 #include "vsegment/vsegment_manager.h"
 #include "vsegment/partition_quota_planner.h"
 
@@ -649,6 +650,21 @@ TEST(VSegmentManagerTest, FencesStalePartitionOwnerRequests) {
     EXPECT_EQ(manager.SetRouteEpoch(6), ErrorCode::STALE_ROUTE);
 }
 
+TEST(VSegmentManagerTest, ExposesLifecycleStatsAndGcsOperationTombstone) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
+    ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, "put-1"),
+              ErrorCode::OK);
+    auto stats = manager.Stats();
+    EXPECT_EQ(stats.active, 1);
+    EXPECT_EQ(stats.reservations, 0);
+    EXPECT_EQ(stats.committed_allocations, 0);
+    EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OK);
+    EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OBJECT_NOT_FOUND);
+}
+
 TEST(VSegmentHaTest, ReplaysContinuousPartitionRevisions) {
     PartitionVSegmentSnapshot base;
     base.partition_id = "partition-1";
@@ -698,6 +714,40 @@ TEST(VSegmentHaTest, RejectsRevisionGapAndStaleEpoch) {
     struct_json::to_json(record, entry.payload);
     entry.checksum = ComputeOpLogChecksum(entry.payload);
     EXPECT_EQ(ReplayVSegmentState(base, {entry}, &recovered),
+              ErrorCode::STALE_ROUTE);
+}
+
+TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+    VSegmentView view;
+    EXPECT_EQ(service.LoadView("partition-1", started.replica.vsegment_id,
+                               &view),
+              ErrorCode::OK);
+    EXPECT_EQ(view.partition_id, "partition-1");
+    EXPECT_EQ(service.StartPut("partition-1", 7, "put-2", 16).error,
+              ErrorCode::STALE_ROUTE);
+    EXPECT_EQ(service.RemovePartition("partition-1", 9), ErrorCode::OK);
+    EXPECT_EQ(service.LoadView("partition-1", view.vsegment_id, &view),
               ErrorCode::STALE_ROUTE);
 }
 

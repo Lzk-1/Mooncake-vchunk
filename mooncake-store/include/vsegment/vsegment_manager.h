@@ -49,6 +49,16 @@ struct VSegmentPutStartResult {
     explicit operator bool() const { return error == ErrorCode::OK; }
 };
 
+struct VSegmentManagerStats {
+    size_t preparing{0};
+    size_t active{0};
+    size_t draining{0};
+    size_t retired{0};
+    size_t reservations{0};
+    size_t committed_allocations{0};
+    size_t pending_creations{0};
+};
+
 // Partition-local facade intended to be owned by the Partition's SubMaster.
 // Persistence transport is deliberately outside this class: HA Snapshot/OpLog
 // code serializes the returned state and calls Restore after failover.
@@ -87,6 +97,7 @@ class VSegmentManager {
                             const std::string& allocation_id,
                             LogicalRange range,
                             uint64_t expected_route_epoch = 0);
+    ErrorCode ForgetOperation(const std::string& operation_id);
     ErrorCode TransitionLifecycle(const std::string& vsegment_id,
                                   Lifecycle target);
 
@@ -94,6 +105,7 @@ class VSegmentManager {
     ErrorCode Restore(const PartitionVSegmentSnapshot& snapshot,
                       std::string* detail = nullptr);
     bool FindView(const std::string& vsegment_id, VSegmentView* view) const;
+    VSegmentManagerStats Stats() const;
 
    private:
     struct ManagedVSegment {
@@ -120,7 +132,7 @@ class VSegmentManager {
     uint64_t route_epoch_{0};
     uint64_t metadata_revision_{0};
     std::shared_ptr<VSegmentStateCommitter> committer_;
-    std::mutex pending_mutex_;
+    mutable std::mutex pending_mutex_;
     std::unordered_map<std::string,
                        std::shared_future<VSegmentAllocationResult>>
         pending_creations_;

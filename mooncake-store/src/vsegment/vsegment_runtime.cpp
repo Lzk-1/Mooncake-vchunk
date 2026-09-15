@@ -282,6 +282,18 @@ bool LogicalRangeAllocator::Empty() const {
     return reservations_.empty() && committed_allocations_.empty();
 }
 
+ErrorCode LogicalRangeAllocator::ForgetCompleted(
+    const std::string& operation_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto completed = completed_operations_.find(operation_id);
+    if (completed == completed_operations_.end())
+        return ErrorCode::OBJECT_NOT_FOUND;
+    if (completed->second.outcome == OperationOutcome::COMMITTED)
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    completed_operations_.erase(completed);
+    return ErrorCode::OK;
+}
+
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
                               const std::vector<ClientSlice>& slices) {

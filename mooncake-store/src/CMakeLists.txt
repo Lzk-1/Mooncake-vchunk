@@ -28,6 +28,7 @@ set(MOONCAKE_STORE_SOURCES
     vsegment/vsegment_runtime.cpp
     vsegment/vsegment_transfer.cpp
     vsegment/vsegment_ha.cpp
+    vsegment/vsegment_service.cpp
     vsegment/vsegment_manager.cpp
     segment.cpp
     transfer_task.cpp

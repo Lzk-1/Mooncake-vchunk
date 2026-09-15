@@ -321,6 +321,27 @@ ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
     return persisted;
 }
 
+ErrorCode VSegmentManager::ForgetOperation(const std::string& operation_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto operation = operation_vsegments_.find(operation_id);
+    if (operation == operation_vsegments_.end())
+        return ErrorCode::OBJECT_NOT_FOUND;
+    auto managed = vsegments_.find(operation->second);
+    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+    const auto before = managed->second.logical_allocator->Snapshot();
+    auto result =
+        managed->second.logical_allocator->ForgetCompleted(operation_id);
+    if (result != ErrorCode::OK) return result;
+    const auto vsegment_id = operation->second;
+    operation_vsegments_.erase(operation);
+    result = PersistLocked("operation_gc");
+    if (result != ErrorCode::OK) {
+        managed->second.logical_allocator->Restore(before);
+        operation_vsegments_.emplace(operation_id, vsegment_id);
+    }
+    return result;
+}
+
 ErrorCode VSegmentManager::TransitionLifecycle(
     const std::string& vsegment_id, Lifecycle target) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -490,8 +511,41 @@ bool VSegmentManager::FindView(const std::string& vsegment_id,
     std::lock_guard<std::mutex> lock(mutex_);
     auto vsegment = vsegments_.find(vsegment_id);
     if (vsegment == vsegments_.end()) return false;
+    if (vsegment->second.lifecycle != Lifecycle::ACTIVE &&
+        vsegment->second.lifecycle != Lifecycle::DRAINING)
+        return false;
     if (view) *view = vsegment->second.view;
     return true;
+}
+
+VSegmentManagerStats VSegmentManager::Stats() const {
+    VSegmentManagerStats stats;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, managed] : vsegments_) {
+            switch (managed.lifecycle) {
+                case Lifecycle::PREPARING:
+                    ++stats.preparing;
+                    break;
+                case Lifecycle::ACTIVE:
+                    ++stats.active;
+                    break;
+                case Lifecycle::DRAINING:
+                    ++stats.draining;
+                    break;
+                case Lifecycle::RETIRED:
+                    ++stats.retired;
+                    break;
+            }
+            stats.reservations +=
+                managed.logical_allocator->ReservationCount();
+            stats.committed_allocations +=
+                managed.logical_allocator->CommittedCount();
+        }
+    }
+    std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+    stats.pending_creations = pending_creations_.size();
+    return stats;
 }
 
 }  // namespace mooncake::vsegment
