@@ -829,6 +829,13 @@ class MasterClient {
     // SLOT_NOT_OWNED. The caller remains responsible for a bounded retry.
     [[nodiscard]] ErrorCode RefreshSubmasterRouting();
 
+    // Resolves a vsegment Partition to its owner. Decimal partition ids map
+    // directly to the existing KV slot table; named partitions use the
+    // cluster-scoped PartitionRoute record. An empty address denotes the
+    // legacy single-master mode.
+    [[nodiscard]] tl::expected<std::string, ErrorCode>
+    ResolveVSegmentSubmaster(const std::string& partition_id);
+
     /**
      * @brief 带 slot 迁移重试语义的单 RPC 调用（Phase 6）。
      * 对「已 SwitchToSubmaster 的 key」执行一次 RPC，并按错误码闭环处理：

@@ -48,6 +48,27 @@ inline std::string ClusterMetaKey(const std::string& cluster_namespace) {
     return CvmNamespaceRoot(cluster_namespace) + "cluster_meta";
 }
 
+// "/cvm/<namespace>/snapshot/"
+inline std::string SnapshotPrefix(const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "snapshot/";
+}
+
+// "/cvm/<namespace>/snapshot/kv_view"
+inline std::string KvViewSnapshotKey(const std::string& cluster_namespace) {
+    return SnapshotPrefix(cluster_namespace) + "kv_view";
+}
+
+// "/cvm/<namespace>/snapshot/segment_view"
+inline std::string SegmentViewSnapshotKey(const std::string& cluster_namespace) {
+    return SnapshotPrefix(cluster_namespace) + "segment_view";
+}
+
+// "/cvm/<namespace>/snapshot/vsegment_partition_quota"
+inline std::string VSegmentPartitionQuotaSnapshotKey(
+    const std::string& cluster_namespace) {
+    return SnapshotPrefix(cluster_namespace) + "vsegment_partition_quota";
+}
+
 // ---- Segment neutral entity + per-master mount keys (§3 view layout) ----
 
 // "/cvm/<namespace>/segments/"
@@ -60,11 +81,6 @@ inline std::string SegmentNeutralEntityPrefix(
 inline std::string SegmentNeutralEntityKey(const std::string& cluster_namespace,
                                            const std::string& segment_id) {
     return SegmentNeutralEntityPrefix(cluster_namespace) + segment_id;
-}
-
-// "/cvm/<namespace>/snapshot/"
-inline std::string SnapshotPrefix(const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "snapshot/";
 }
 
 // "/cvm/<namespace>/snapshot/<master_id>/segments/"

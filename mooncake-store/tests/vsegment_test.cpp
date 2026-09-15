@@ -1,6 +1,7 @@
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
+#include "cvm/cvm_keys.h"
 #include "vsegment/vsegment_ha.h"
 #include "vsegment/vsegment_service.h"
 #include "vsegment/vsegment_manager.h"
@@ -16,6 +17,13 @@
 
 namespace mooncake::vsegment {
 namespace {
+
+TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
+    EXPECT_EQ(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
+              "/cvm/cluster-a/snapshot/vsegment_partition_quota");
+    EXPECT_NE(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
+              cvm::VSegmentPartitionQuotaSnapshotKey("cluster-b"));
+}
 
 class TestStateCommitter : public VSegmentStateCommitter {
    public:

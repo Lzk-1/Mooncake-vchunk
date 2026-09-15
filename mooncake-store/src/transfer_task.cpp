@@ -999,51 +999,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
-std::vector<Replica::Descriptor> TransferSubmitter::expandLogicalRange(
-    const Replica::Descriptor& /*replica*/,
-    const partition::VSegmentView& /*view*/) const {
-    // TODO(vsegment): 实现条带映射展开逻辑。
-    return {};
-}
-
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size) {
     std::optional<TransferFuture> future;
-
-    if (replica.is_vsegment_replica()) {
-        // vsegment 副本（§12.3.8 预留）：经 VSegmentViewCache 查 view 后由
-        // expandLogicalRange 展开为成员 psegment 的物理 extent 再落地。展开与
-        // 条带切分逻辑由 vsegment 实现方填充，就绪前返回失败关闭，不落旧直达写。
-        const auto& vseg_desc = replica.get_vsegment_descriptor();
-        MC_LOG(INFO) << "VSegmentSubmit vsegment_id=" << vseg_desc.vsegment_id
-                     << " logical_offset=" << vseg_desc.logical_offset
-                     << " length=" << vseg_desc.length
-                     << " op=" << static_cast<int>(op_code)
-                     << " slices=" << slices.size();
-
-        auto view = vsegment_view_cache_.Find(vseg_desc.vsegment_id);
-        if (!view) {
-            MC_LOG(WARNING) << "VSegmentViewMiss vsegment_id="
-                            << vseg_desc.vsegment_id;
-            return std::nullopt;
-        }
-        auto physical_replicas = expandLogicalRange(replica, *view);
-        if (physical_replicas.empty()) {
-            MC_LOG(ERROR) << "VSegmentExpandEmpty vsegment_id="
-                          << vseg_desc.vsegment_id
-                          << " logical_offset=" << vseg_desc.logical_offset
-                          << " length=" << vseg_desc.length;
-            return std::nullopt;
-        }
-        MC_LOG(INFO) << "VSegmentExpand vsegment_id=" << vseg_desc.vsegment_id
-                     << " physical_replicas=" << physical_replicas.size();
-        // TODO(vsegment): 将 slices 按条带切分并与 physical_replicas 对应后经
-        // submit_batch 落地到物理 extent。
-        MC_LOG(WARNING) << "VSegmentSubmitNotImplemented vsegment_id="
-                        << vseg_desc.vsegment_id;
-        return std::nullopt;
-    }
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();

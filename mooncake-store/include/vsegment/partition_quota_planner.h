@@ -4,12 +4,10 @@
 #include <string>
 #include <vector>
 
+#include "cvm/cvm_keys.h"
 #include "vsegment/vsegment.h"
 
 namespace mooncake::vsegment {
-
-inline constexpr char kPartitionQuotaSnapshotKey[] =
-    "/mooncake/vsegment/partition-quota/current";
 
 struct PartitionQuotaPlanRequest {
     uint64_t config_generation{0};
@@ -51,8 +49,8 @@ class EtcdPartitionQuotaSnapshotStore final
     : public PartitionQuotaSnapshotStore {
    public:
     explicit EtcdPartitionQuotaSnapshotStore(
-        std::string key = kPartitionQuotaSnapshotKey)
-        : key_(std::move(key)) {}
+        const std::string& cluster_namespace)
+        : key_(cvm::VSegmentPartitionQuotaSnapshotKey(cluster_namespace)) {}
 
     ErrorCode Create(const PartitionPhysicalQuotaSnapshot& snapshot,
                      size_t max_serialized_bytes,

@@ -10,6 +10,7 @@
 
 DEFINE_string(input, "", "Path to a JSON PartitionQuotaPlanRequest");
 DEFINE_string(etcd_endpoints, "", "Semicolon-separated ETCD endpoints");
+DEFINE_string(cluster_namespace, "", "CVM cluster namespace");
 DEFINE_uint64(max_etcd_value_bytes, 1500000,
               "Maximum serialized ETCD value size");
 DEFINE_bool(dry_run, false, "Print the candidate snapshot without publishing");
@@ -50,10 +51,15 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "--etcd_endpoints is required unless --dry_run is set";
         return 2;
     }
+    if (FLAGS_cluster_namespace.empty()) {
+        LOG(ERROR) << "--cluster_namespace is required unless --dry_run is set";
+        return 2;
+    }
     auto error = mooncake::EtcdHelper::ConnectToEtcdStoreClient(
         FLAGS_etcd_endpoints);
     if (error != mooncake::ErrorCode::OK) return 4;
-    mooncake::vsegment::EtcdPartitionQuotaSnapshotStore store;
+    mooncake::vsegment::EtcdPartitionQuotaSnapshotStore store(
+        FLAGS_cluster_namespace);
     std::string detail;
     error = store.Create(result.snapshot, FLAGS_max_etcd_value_bytes, &detail);
     if (error != mooncake::ErrorCode::OK) {

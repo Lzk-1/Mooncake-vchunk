@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <csignal>
+#include <charconv>
 #include <future>
 #include <string>
 #include <thread>
@@ -19,12 +20,31 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "etcd_helper.h"
+#include "cvm/etcd_view_store.h"
+#include "cvm/slot_hash.h"
 #include "partition/kv_hash_map.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
 namespace mooncake {
+
+namespace {
+
+std::optional<uint16_t> ParsePartitionSlot(
+    const std::string& partition_id) {
+    uint32_t value = 0;
+    const char* begin = partition_id.data();
+    const char* end = begin + partition_id.size();
+    const auto [ptr, error] = std::from_chars(begin, end, value);
+    if (partition_id.empty() || error != std::errc{} || ptr != end ||
+        value >= cvm::kSlotCount) {
+        return std::nullopt;
+    }
+    return static_cast<uint16_t>(value);
+}
+
+}  // namespace
 
 template <auto Method>
 struct RpcNameTraits;
@@ -765,6 +785,41 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
     return ErrorCode::OK;
 }
 
+tl::expected<std::string, ErrorCode>
+MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
+    if (partition_router_.Size() == 0) return std::string{};
+
+    if (auto slot = ParsePartitionSlot(partition_id)) {
+        auto target = partition_router_.ResolveSubmaster(*slot);
+        if (!target) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return *target;
+    }
+
+    std::string cluster_namespace;
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        cluster_namespace = routing_cluster_namespace_;
+    }
+    if (cluster_namespace.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    partition::PartitionRoute route;
+    ViewVersionId version = 0;
+    auto error = cvm::EtcdViewStore::LoadPartitionRoute(
+        cluster_namespace, partition_id, route, version);
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    if (route.owner_submaster_id.empty() ||
+        route.state !=
+            static_cast<int32_t>(partition::PartitionState::kActive)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    return route.owner_submaster_id;
+}
+
 std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
     std::map<std::string, std::vector<size_t>> groups;
@@ -911,6 +966,13 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
 tl::expected<vsegment::VSegmentView, ErrorCode>
 MasterClient::GetVSegmentView(const std::string& partition_id,
                               const std::string& vsegment_id) {
+    auto target = ResolveVSegmentSubmaster(partition_id);
+    if (!target) return tl::make_unexpected(target.error());
+    if (!target->empty()) {
+        return invoke_rpc_to<&WrappedMasterService::GetVSegmentView,
+                             vsegment::VSegmentView>(*target, partition_id,
+                                                     vsegment_id);
+    }
     return invoke_rpc<&WrappedMasterService::GetVSegmentView,
                       vsegment::VSegmentView>(partition_id, vsegment_id);
 }
@@ -925,10 +987,22 @@ vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,
     const std::string& profile_name) {
-    auto result =
-        invoke_rpc<&WrappedMasterService::VSegmentPutStart,
-                   vsegment::VSegmentPutStartResult>(
-            partition_id, route_epoch, operation_id, length, profile_name);
+    auto invoke = [&]()
+        -> tl::expected<vsegment::VSegmentPutStartResult, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutStart,
+                              vsegment::VSegmentPutStartResult>(
+                partition_id, route_epoch, operation_id, length,
+                profile_name);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutStart,
+                             vsegment::VSegmentPutStartResult>(
+            *target, partition_id, route_epoch, operation_id, length,
+            profile_name);
+    };
+    auto result = invoke();
     if (result) return std::move(result.value());
     return {result.error(), operation_id, {}, "vsegment PutStart RPC failed"};
 }
@@ -936,17 +1010,37 @@ vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
 ErrorCode MasterClient::VSegmentPutEnd(
     const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
     const std::string& operation_id, const std::string& object_id) {
-    auto result = invoke_rpc<&WrappedMasterService::VSegmentPutEnd, ErrorCode>(
-        replica, route_epoch, operation_id, object_id);
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(replica.partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutEnd,
+                              ErrorCode>(replica, route_epoch, operation_id,
+                                         object_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutEnd, ErrorCode>(
+            *target, replica, route_epoch, operation_id, object_id);
+    };
+    auto result = invoke();
     return result ? result.value() : result.error();
 }
 
 ErrorCode MasterClient::VSegmentPutRevoke(
     const std::string& partition_id, const std::string& vsegment_id,
     uint64_t route_epoch, const std::string& operation_id) {
-    auto result =
-        invoke_rpc<&WrappedMasterService::VSegmentPutRevoke, ErrorCode>(
-            partition_id, vsegment_id, route_epoch, operation_id);
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutRevoke,
+                              ErrorCode>(partition_id, vsegment_id,
+                                         route_epoch, operation_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutRevoke,
+                             ErrorCode>(*target, partition_id, vsegment_id,
+                                        route_epoch, operation_id);
+    };
+    auto result = invoke();
     return result ? result.value() : result.error();
 }
 
