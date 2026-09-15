@@ -71,6 +71,8 @@ class LogicalRangeAllocator {
 
     uint64_t FreeBytes() const;
     size_t ReservationCount() const;
+    size_t CommittedCount() const;
+    bool Empty() const;
 
    private:
     static void InsertAndMerge(std::vector<LogicalRange>& ranges,

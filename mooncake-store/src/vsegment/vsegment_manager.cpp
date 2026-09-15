@@ -1,6 +1,8 @@
 #include "vsegment/vsegment_manager.h"
 
 #include <algorithm>
+#include <chrono>
+#include <future>
 #include <set>
 
 namespace mooncake::vsegment {
@@ -20,119 +22,141 @@ ReservationResult ReservationError(ErrorCode error, std::string detail) {
     return result;
 }
 
+std::vector<PartitionVSegmentConfig> ConfigsForPartition(
+    const PartitionPhysicalQuotaSnapshot& snapshot,
+    const std::string& partition_id) {
+    std::vector<PartitionVSegmentConfig> configs;
+    for (const auto& profile : snapshot.profile_specs) {
+        PartitionVSegmentConfig config;
+        if (BuildPartitionConfig(snapshot, partition_id, profile.name,
+                                 &config) == ErrorCode::OK)
+            configs.push_back(std::move(config));
+    }
+    return configs;
+}
+
 }  // namespace
 
 VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
                                  std::vector<VSegmentProfile> profiles,
                                  std::shared_ptr<VSegmentStateCommitter> committer)
-    : config_(std::move(config)),
-      physical_allocator_(config_),
+    : partition_id_(config.partition_id),
+      config_generation_(config.config_generation),
+      quota_configs_{std::move(config)},
+      physical_allocator_(quota_configs_),
       committer_(std::move(committer)) {
     for (auto& profile : profiles) {
-        next_creation_slots_.emplace(profile.name, 0);
         profiles_.emplace(profile.name, std::move(profile));
     }
 }
 
+VSegmentManager::VSegmentManager(
+    const PartitionPhysicalQuotaSnapshot& quota_snapshot,
+    std::string partition_id,
+    std::shared_ptr<VSegmentStateCommitter> committer)
+    : partition_id_(std::move(partition_id)),
+      config_generation_(quota_snapshot.config_generation),
+      quota_configs_(ConfigsForPartition(quota_snapshot, partition_id_)),
+      physical_allocator_(quota_configs_),
+      committer_(std::move(committer)) {
+    for (const auto& profile : quota_snapshot.profile_specs)
+        profiles_.emplace(profile.name, profile);
+}
+
 VSegmentAllocationResult VSegmentManager::Create(
     const std::string& profile_name) {
+    const auto creation_key = partition_id_ + "/" + profile_name;
     auto result = profile_creation_coordinator_.GetOrCreate(
-        profile_name, [&] {
-            uint64_t slot = 0;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto next = next_creation_slots_.find(profile_name);
-                if (next == next_creation_slots_.end())
-                    return ManagerError(
-                        ErrorCode::INVALID_PARAMS,
-                        "unknown vsegment profile: " + profile_name);
-                slot = next->second++;
-                std::string detail;
-                auto persisted =
-                    PersistLocked("creation_slot_advanced", &detail);
-                if (persisted != ErrorCode::OK) {
-                    --next->second;
-                    return ManagerError(persisted, std::move(detail));
-                }
-            }
-            return GetOrCreate(profile_name, slot);
-        });
-    profile_creation_coordinator_.Forget(profile_name);
+        creation_key,
+        [&] { return CreateSingleFlight(profile_name); });
+    profile_creation_coordinator_.Forget(creation_key);
     return result;
 }
 
-std::string VSegmentManager::CreationKey(const std::string& partition_id,
-                                         const std::string& profile_name,
-                                         uint64_t creation_slot) {
-    return partition_id + "/" + profile_name + "/" +
-           std::to_string(creation_slot);
+VSegmentAllocationResult VSegmentManager::RequestCreate(
+    const std::string& profile_name, uint64_t retry_after_ms) {
+    if (!profiles_.count(profile_name))
+        return ManagerError(ErrorCode::INVALID_PARAMS,
+                            "unknown vsegment profile: " + profile_name);
+    const auto key = partition_id_ + "/" + profile_name;
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    auto pending = pending_creations_.find(key);
+    if (pending != pending_creations_.end()) {
+        if (pending->second.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready) {
+            auto result = pending->second.get();
+            pending_creations_.erase(pending);
+            return result;
+        }
+    } else {
+        pending_creations_.emplace(
+            key, std::async(std::launch::async,
+                            [this, profile_name] { return Create(profile_name); })
+                     .share());
+    }
+    return ManagerError(ErrorCode::VSEGMENT_CREATING,
+                        "vsegment creation is in progress; retry_after_ms=" +
+                            std::to_string(retry_after_ms));
 }
 
-VSegmentAllocationResult VSegmentManager::GetOrCreate(
-    const std::string& profile_name, uint64_t creation_slot) {
+VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
+    const std::string& profile_name) {
     auto profile = profiles_.find(profile_name);
     if (profile == profiles_.end()) {
         return ManagerError(ErrorCode::INVALID_PARAMS,
                             "unknown vsegment profile: " + profile_name);
     }
-    const auto key =
-        CreationKey(config_.partition_id, profile_name, creation_slot);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto result = creation_results_.find(key);
-        if (result != creation_results_.end()) {
-            auto existing = vsegments_.find(result->second);
-            if (existing != vsegments_.end())
-                return {ErrorCode::OK, existing->second.view, {}};
-        }
-    }
-
-    auto creation = creation_coordinator_.GetOrCreate(key, [&] {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto result = creation_results_.find(key);
-        if (result != creation_results_.end()) {
-            auto existing = vsegments_.find(result->second);
-            if (existing != vsegments_.end())
-                return VSegmentAllocationResult{ErrorCode::OK,
-                                                existing->second.view, {}};
-        }
-        const std::string vsegment_id = UuidToString(generate_uuid());
-        auto logical = std::make_unique<LogicalRangeAllocator>(
-            profile->second.member_extent_size * profile->second.member_count);
-        auto allocation =
-            physical_allocator_.Allocate(vsegment_id, profile->second);
-        if (!allocation) return allocation;
-        try {
-            creation_results_.emplace(key, vsegment_id);
-            vsegments_.emplace(
-                vsegment_id,
-                ManagedVSegment{profile_name, key, Lifecycle::PREPARING,
-                                     allocation.view,
-                                     std::move(logical)});
-        } catch (...) {
-            creation_results_.erase(key);
-            vsegments_.erase(vsegment_id);
-            physical_allocator_.Release(allocation.view);
-            throw;
-        }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [id, pending] : vsegments_) {
+        if (pending.profile_name != profile_name ||
+            pending.lifecycle != Lifecycle::PREPARING)
+            continue;
+        pending.lifecycle = Lifecycle::ACTIVE;
         std::string detail;
-        auto persisted = PersistLocked("vsegment_create_begin", &detail);
+        auto persisted = PersistLocked("vsegment_create_commit", &detail);
         if (persisted != ErrorCode::OK) {
-            creation_results_.erase(key);
-            vsegments_.erase(vsegment_id);
-            physical_allocator_.Release(allocation.view);
+            pending.lifecycle = Lifecycle::PREPARING;
             return ManagerError(persisted, std::move(detail));
         }
-        vsegments_.at(vsegment_id).lifecycle = Lifecycle::ACTIVE;
-        persisted = PersistLocked("vsegment_create_commit", &detail);
-        if (persisted != ErrorCode::OK) {
-            vsegments_.at(vsegment_id).lifecycle = Lifecycle::PREPARING;
-            return ManagerError(persisted, std::move(detail));
-        }
-        return allocation;
-    });
-    creation_coordinator_.Forget(key);
-    return creation;
+        return {ErrorCode::OK, pending.view, {}};
+    }
+    const std::string vsegment_id = UuidToString(generate_uuid());
+    auto logical = std::make_unique<LogicalRangeAllocator>(
+        profile->second.member_extent_size * profile->second.member_count);
+    auto allocation = physical_allocator_.Allocate(vsegment_id, profile->second);
+    if (!allocation) return allocation;
+    try {
+        vsegments_.emplace(
+            vsegment_id,
+            ManagedVSegment{profile_name, Lifecycle::PREPARING,
+                            allocation.view, std::move(logical)});
+    } catch (...) {
+        vsegments_.erase(vsegment_id);
+        physical_allocator_.Release(allocation.view);
+        throw;
+    }
+    std::string detail;
+    auto persisted = PersistLocked("vsegment_create_begin", &detail);
+    if (persisted != ErrorCode::OK) {
+        vsegments_.erase(vsegment_id);
+        physical_allocator_.Release(allocation.view);
+        return ManagerError(persisted, std::move(detail));
+    }
+    vsegments_.at(vsegment_id).lifecycle = Lifecycle::ACTIVE;
+    persisted = PersistLocked("vsegment_create_commit", &detail);
+    if (persisted != ErrorCode::OK) {
+        vsegments_.at(vsegment_id).lifecycle = Lifecycle::PREPARING;
+        return ManagerError(persisted, std::move(detail));
+    }
+    return allocation;
+}
+
+ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch == 0 || route_epoch < route_epoch_)
+        return ErrorCode::STALE_ROUTE;
+    route_epoch_ = route_epoch;
+    return ErrorCode::OK;
 }
 
 ReservationResult VSegmentManager::ReservePut(
@@ -216,21 +240,35 @@ ErrorCode VSegmentManager::TransitionLifecycle(
         (current == Lifecycle::ACTIVE && target == Lifecycle::DRAINING) ||
         (current == Lifecycle::DRAINING && target == Lifecycle::RETIRED);
     if (!valid) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    if (target == Lifecycle::RETIRED &&
+        !managed->second.logical_allocator->Empty())
+        return ErrorCode::OBJECT_REPLICA_BUSY;
     managed->second.lifecycle = target;
     const auto persisted = PersistLocked("lifecycle_transition");
     if (persisted != ErrorCode::OK) managed->second.lifecycle = current;
+    if (persisted == ErrorCode::OK && target == Lifecycle::RETIRED) {
+        auto released = physical_allocator_.Release(managed->second.view);
+        if (released != ErrorCode::OK) return released;
+        persisted = PersistLocked("vsegment_extent_release");
+        if (persisted != ErrorCode::OK) {
+            std::string ignored;
+            physical_allocator_.Restore(managed->second.view,
+                                         profiles_.at(managed->second.profile_name),
+                                         &ignored);
+        }
+    }
     return persisted;
 }
 
 PartitionVSegmentSnapshot VSegmentManager::SnapshotLocked() const {
     PartitionVSegmentSnapshot snapshot;
-    snapshot.partition_id = config_.partition_id;
-    snapshot.config_generation = config_.config_generation;
-    snapshot.next_creation_slots = next_creation_slots_;
+    snapshot.partition_id = partition_id_;
+    snapshot.config_generation = config_generation_;
+    snapshot.route_epoch = route_epoch_;
+    snapshot.metadata_revision = metadata_revision_;
     for (const auto& [id, managed] : vsegments_) {
         snapshot.vsegments.push_back(
-            {managed.profile_name, managed.creation_key, managed.lifecycle,
-             managed.view,
+            {managed.profile_name, managed.lifecycle, managed.view,
              managed.logical_allocator->Snapshot()});
     }
     std::sort(snapshot.vsegments.begin(), snapshot.vsegments.end(),
@@ -251,41 +289,37 @@ ErrorCode VSegmentManager::PersistLocked(const std::string& mutation,
         if (detail) *detail = "vsegment state committer is not configured";
         return ErrorCode::PERSISTENT_FAIL;
     }
-    return committer_->Commit(SnapshotLocked(), mutation, detail);
+    ++metadata_revision_;
+    auto result = committer_->Commit(SnapshotLocked(), mutation, detail);
+    if (result != ErrorCode::OK) --metadata_revision_;
+    return result;
 }
 
 ErrorCode VSegmentManager::Restore(
     const PartitionVSegmentSnapshot& snapshot, std::string* detail) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto config_validation = ValidatePartitionConfig(config_, detail);
-    if (config_validation != ErrorCode::OK) return config_validation;
+    if (quota_configs_.empty()) {
+        if (detail) *detail = "Partition has no profile quota";
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    }
+    for (const auto& config : quota_configs_) {
+        auto validation = ValidatePartitionConfig(config, detail);
+        if (validation != ErrorCode::OK) return validation;
+    }
     if (!vsegments_.empty()) {
         if (detail) *detail = "restore requires an empty manager";
         return ErrorCode::INVALID_PARAMS;
     }
-    if (snapshot.partition_id != config_.partition_id ||
-        snapshot.config_generation != config_.config_generation) {
+    if (snapshot.partition_id != partition_id_ ||
+        snapshot.config_generation != config_generation_) {
         if (detail) *detail = "snapshot Partition or generation mismatch";
         return ErrorCode::INVALID_VERSION;
     }
-    for (const auto& [profile, slot] : snapshot.next_creation_slots) {
-        if (!profiles_.count(profile)) {
-            if (detail) *detail = "creation cursor has unknown profile";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    }
-
-    PartitionQuotaAllocator verifier(config_);
+    PartitionQuotaAllocator verifier(quota_configs_);
     std::vector<std::unique_ptr<LogicalRangeAllocator>> logical_allocators;
     std::vector<VSegmentProfile> matching_profiles;
     std::vector<bool> restore_view;
-    std::set<std::string> creation_keys;
     for (const auto& state : snapshot.vsegments) {
-        if (state.creation_key.empty() ||
-            !creation_keys.insert(state.creation_key).second) {
-            if (detail) *detail = "duplicate or empty creation_key";
-            return ErrorCode::INVALID_PARAMS;
-        }
         if (state.lifecycle != Lifecycle::PREPARING &&
             state.lifecycle != Lifecycle::ACTIVE &&
             state.lifecycle != Lifecycle::DRAINING &&
@@ -298,7 +332,8 @@ ErrorCode VSegmentManager::Restore(
             if (detail) *detail = "snapshot view has no matching profile";
             return ErrorCode::INVALID_PARAMS;
         }
-        if (state.lifecycle == Lifecycle::PREPARING) {
+        if (state.lifecycle == Lifecycle::PREPARING ||
+            state.lifecycle == Lifecycle::RETIRED) {
             // CREATE_COMMIT was not durably observed. Its statically owned
             // extents are safe to roll back locally during recovery.
             logical_allocators.push_back(nullptr);
@@ -325,15 +360,11 @@ ErrorCode VSegmentManager::Restore(
         if (restored != ErrorCode::OK) return restored;
         vsegments_.emplace(
             state.view.vsegment_id,
-            ManagedVSegment{state.profile_name, state.creation_key,
-                            state.lifecycle, state.view,
+            ManagedVSegment{state.profile_name, state.lifecycle, state.view,
                             std::move(logical_allocators[index])});
-        creation_results_.emplace(state.creation_key,
-                                  state.view.vsegment_id);
     }
-    next_creation_slots_ = snapshot.next_creation_slots;
-    for (const auto& [profile, definition] : profiles_)
-        next_creation_slots_.try_emplace(profile, 0);
+    route_epoch_ = snapshot.route_epoch;
+    metadata_revision_ = snapshot.metadata_revision;
     return ErrorCode::OK;
 }
 

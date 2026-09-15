@@ -272,6 +272,16 @@ size_t LogicalRangeAllocator::ReservationCount() const {
     return reservations_.size();
 }
 
+size_t LogicalRangeAllocator::CommittedCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return committed_allocations_.size();
+}
+
+bool LogicalRangeAllocator::Empty() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reservations_.empty() && committed_allocations_.empty();
+}
+
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
                               const std::vector<ClientSlice>& slices) {

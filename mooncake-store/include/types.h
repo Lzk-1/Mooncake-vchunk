@@ -311,6 +311,8 @@ enum class ErrorCode : int32_t {
     CLIENT_NOT_FOUND = -103,          ///< Client not found.
     VSEGMENT_STATIC_QUOTA_INSUFFICIENT =
         -104,  ///< Partition quota cannot satisfy the configured layout.
+    VSEGMENT_CREATING =
+        -105,  ///< A single-flight vsegment creation is in progress.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
@@ -368,6 +370,7 @@ enum class ErrorCode : int32_t {
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
     K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    STALE_ROUTE = -1006,  ///< Request carries an obsolete Partition epoch.
     K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
     INCOMPLETE_OPLOG_CATCH_UP =
         -1007,  ///< Promotion catch-up could not prove all durable OpLog

@@ -148,6 +148,8 @@ uint32_t ComputeViewChecksum(const VSegmentView& view);
 class PartitionQuotaAllocator {
    public:
     explicit PartitionQuotaAllocator(PartitionVSegmentConfig config);
+    explicit PartitionQuotaAllocator(
+        std::vector<PartitionVSegmentConfig> configs);
 
     VSegmentAllocationResult Allocate(const std::string& vsegment_id,
                                       const VSegmentProfile& profile);
@@ -157,7 +159,8 @@ class PartitionQuotaAllocator {
     ErrorCode Release(const VSegmentView& view);
 
     uint64_t FreeBytes(const std::string& segment_id) const;
-    const PartitionVSegmentConfig& config() const { return config_; }
+    uint64_t FreeBytes(const std::string& profile_name,
+                       const std::string& segment_id) const;
 
    private:
     struct Range {
@@ -167,10 +170,15 @@ class PartitionQuotaAllocator {
 
     static void InsertAndMerge(std::vector<Range>& ranges, Range range);
 
-    PartitionVSegmentConfig config_;
+    struct AllocationRecord {
+        std::string profile_name;
+        VSegmentView view;
+    };
+    std::unordered_map<std::string, PartitionVSegmentConfig> configs_;
     mutable std::mutex mutex_;
-    std::map<std::string, std::vector<Range>> free_ranges_;
-    std::unordered_map<std::string, VSegmentView> allocations_;
+    std::map<std::string, std::map<std::string, std::vector<Range>>>
+        free_ranges_;
+    std::unordered_map<std::string, AllocationRecord> allocations_;
 };
 
 }  // namespace mooncake::vsegment

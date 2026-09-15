@@ -173,8 +173,7 @@ TEST(VSegmentViewTest, LifecycleDoesNotChangeImmutableViewChecksum) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    VSegmentStateSnapshot state{"default", "partition-1/default/0",
-                                Lifecycle::ACTIVE,
+    VSegmentStateSnapshot state{"default", Lifecycle::ACTIVE,
                                 allocation.view, {}};
     const auto checksum = state.view.checksum;
     state.lifecycle = Lifecycle::DRAINING;
@@ -377,6 +376,64 @@ TEST(VSegmentManagerTest, EnforcesLifecycleTransitions) {
               ErrorCode::OK);
 }
 
+TEST(VSegmentManagerTest, RefusesToRetireReferencedVSegment) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, "put-1", 64));
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::DRAINING),
+              ErrorCode::OK);
+    EXPECT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OBJECT_REPLICA_BUSY);
+}
+
+TEST(VSegmentManagerTest, RetireReturnsExtentsToPartitionQuota) {
+    auto config = Config();
+    config.quotas[0].length = 256;
+    config.quotas[1].length = 256;
+    VSegmentManager manager(config, {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(manager.Create("default").error,
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::DRAINING),
+              ErrorCode::OK);
+    ASSERT_EQ(manager.TransitionLifecycle(allocation.view.vsegment_id,
+                                          Lifecycle::RETIRED),
+              ErrorCode::OK);
+    EXPECT_TRUE(manager.Create("default"));
+}
+
+TEST(VSegmentManagerTest, ConsumesMultipleProfilesFromPublishedSnapshot) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 3;
+    snapshot.policy_digest = "policy-v3";
+    snapshot.default_profile = "dram";
+    auto dram = Profile();
+    dram.name = "dram";
+    auto nvme = Profile();
+    nvme.name = "nvme";
+    nvme.required_medium = "NVMe";
+    snapshot.profile_specs = {dram, nvme};
+    snapshot.quotas = {
+        {"partition-1", "dram", "DRAM",
+         {{"dram-a", 0, 256}, {"dram-b", 0, 256}}},
+        {"partition-1", "nvme", "NVMe",
+         {{"nvme-a", 0, 256}, {"nvme-b", 0, 256}}}};
+
+    VSegmentManager manager(snapshot, "partition-1", Committer());
+    auto dram_view = manager.Create("dram");
+    auto nvme_view = manager.Create("nvme");
+    ASSERT_TRUE(dram_view);
+    ASSERT_TRUE(nvme_view);
+    EXPECT_EQ(dram_view.view.members[0].segment_id, "dram-a");
+    EXPECT_EQ(nvme_view.view.members[0].segment_id, "nvme-a");
+    EXPECT_EQ(manager.Snapshot().vsegments.size(), 2);
+}
+
 TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
     VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
@@ -415,10 +472,9 @@ TEST(VSegmentManagerTest, PersistsCreationBeforePublishingActive) {
     VSegmentManager manager(Config(), {Profile()}, committer);
     auto allocation = manager.Create("default");
     ASSERT_TRUE(allocation);
-    ASSERT_EQ(committer->mutations.size(), 3);
-    EXPECT_EQ(committer->mutations[0], "creation_slot_advanced");
-    EXPECT_EQ(committer->mutations[1], "vsegment_create_begin");
-    EXPECT_EQ(committer->mutations[2], "vsegment_create_commit");
+    ASSERT_EQ(committer->mutations.size(), 2);
+    EXPECT_EQ(committer->mutations[0], "vsegment_create_begin");
+    EXPECT_EQ(committer->mutations[1], "vsegment_create_commit");
     ASSERT_EQ(committer->last_state.vsegments.size(), 1);
     EXPECT_EQ(committer->last_state.vsegments[0].lifecycle,
               Lifecycle::ACTIVE);
@@ -472,6 +528,27 @@ TEST(VSegmentManagerTest, ConcurrentProfileCreationSharesOneVSegment) {
         ASSERT_TRUE(result);
         EXPECT_EQ(result.view.vsegment_id, results[0].view.vsegment_id);
     }
+    EXPECT_EQ(std::count(committer->mutations.begin(),
+                         committer->mutations.end(),
+                         "vsegment_create_begin"),
+              1);
+}
+
+TEST(VSegmentManagerTest, AsyncCreationReturnsRetryableStatus) {
+    auto committer = Committer();
+    committer->delay_create_begin = true;
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    auto first = manager.RequestCreate("default", 25);
+    EXPECT_EQ(first.error, ErrorCode::VSEGMENT_CREATING);
+    EXPECT_NE(first.detail.find("retry_after_ms=25"), std::string::npos);
+
+    VSegmentAllocationResult completed;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        completed = manager.RequestCreate("default");
+        if (completed.error != ErrorCode::VSEGMENT_CREATING) break;
+    }
+    ASSERT_TRUE(completed) << completed.detail;
     EXPECT_EQ(std::count(committer->mutations.begin(),
                          committer->mutations.end(),
                          "vsegment_create_begin"),

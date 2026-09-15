@@ -396,10 +396,18 @@ ErrorCode BuildPartitionConfig(
 
 PartitionQuotaAllocator::PartitionQuotaAllocator(
     PartitionVSegmentConfig config)
-    : config_(std::move(config)) {
-    for (const auto& quota : config_.quotas) {
-        InsertAndMerge(free_ranges_[quota.segment_id],
-                       {quota.base_offset, quota.length});
+    : PartitionQuotaAllocator(
+          std::vector<PartitionVSegmentConfig>{std::move(config)}) {}
+
+PartitionQuotaAllocator::PartitionQuotaAllocator(
+    std::vector<PartitionVSegmentConfig> configs) {
+    for (auto& config : configs) {
+        const auto profile_name = config.profile_name;
+        for (const auto& quota : config.quotas) {
+            InsertAndMerge(free_ranges_[profile_name][quota.segment_id],
+                           {quota.base_offset, quota.length});
+        }
+        configs_.emplace(profile_name, std::move(config));
     }
 }
 
@@ -408,7 +416,13 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     std::lock_guard<std::mutex> lock(mutex_);
     VSegmentAllocationResult result;
     std::string detail;
-    if (ValidatePartitionConfig(config_, &detail) != ErrorCode::OK ||
+    auto config = configs_.find(profile.name);
+    if (config == configs_.end()) {
+        result.error = ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+        result.detail = "Partition has no quota for profile " + profile.name;
+        return result;
+    }
+    if (ValidatePartitionConfig(config->second, &detail) != ErrorCode::OK ||
         ValidateProfile(profile, &detail) != ErrorCode::OK ||
         vsegment_id.empty()) {
         result.error = ErrorCode::INVALID_PARAMS;
@@ -428,9 +442,10 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     };
     std::vector<Candidate> candidates;
     std::set<std::string> visited_segments;
-    for (const auto& quota : config_.quotas) {
+    auto& profile_ranges = free_ranges_.at(profile.name);
+    for (const auto& quota : config->second.quotas) {
         if (!visited_segments.insert(quota.segment_id).second) continue;
-        const auto& ranges = free_ranges_.at(quota.segment_id);
+        const auto& ranges = profile_ranges.at(quota.segment_id);
         auto range = std::find_if(ranges.begin(), ranges.end(), [&](const auto& r) {
             return r.length >= profile.member_extent_size;
         });
@@ -444,7 +459,7 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     if (candidates.size() != profile.member_count) {
         result.error = ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
         std::ostringstream message;
-        message << "partition " << config_.partition_id << " requires "
+        message << "partition " << config->second.partition_id << " requires "
                 << profile.member_count << " psegments with "
                 << profile.member_extent_size << " free bytes each, but only "
                 << candidates.size() << " are available";
@@ -454,11 +469,11 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
 
     VSegmentView view;
     view.vsegment_id = vsegment_id;
-    view.partition_id = config_.partition_id;
+    view.partition_id = config->second.partition_id;
     view.stripe_size = profile.stripe_size;
     view.logical_capacity = profile.member_extent_size * profile.member_count;
     for (const auto& candidate : candidates) {
-        auto& ranges = free_ranges_.at(candidate.segment);
+        auto& ranges = profile_ranges.at(candidate.segment);
         auto& range = ranges[candidate.range_index];
         view.members.push_back(
             {candidate.segment, range.offset, profile.member_extent_size});
@@ -467,7 +482,8 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
         if (range.length == 0) ranges.erase(ranges.begin() + candidate.range_index);
     }
     view.checksum = ComputeViewChecksum(view);
-    allocations_.emplace(vsegment_id, view);
+    allocations_.emplace(vsegment_id,
+                         AllocationRecord{profile.name, view});
     result.view = std::move(view);
     return result;
 }
@@ -476,9 +492,12 @@ ErrorCode PartitionQuotaAllocator::Restore(const VSegmentView& view,
                                            const VSegmentProfile& profile,
                                            std::string* detail) {
     std::lock_guard<std::mutex> lock(mutex_);
+    auto config = configs_.find(profile.name);
+    if (config == configs_.end())
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
     auto validation = ValidateView(view, profile, detail);
     if (validation != ErrorCode::OK) return validation;
-    if (view.partition_id != config_.partition_id)
+    if (view.partition_id != config->second.partition_id)
         return Invalid("view belongs to another partition", detail);
     if (allocations_.count(view.vsegment_id))
         return Invalid("duplicate vsegment in restore state", detail);
@@ -490,8 +509,9 @@ ErrorCode PartitionQuotaAllocator::Restore(const VSegmentView& view,
     };
     std::vector<Match> matches;
     for (const auto& member : view.members) {
-        auto segment = free_ranges_.find(member.segment_id);
-        if (segment == free_ranges_.end())
+        auto& profile_ranges = free_ranges_.at(profile.name);
+        auto segment = profile_ranges.find(member.segment_id);
+        if (segment == profile_ranges.end())
             return Invalid("member is outside Partition quota", detail);
         auto range = std::find_if(
             segment->second.begin(), segment->second.end(), [&](const auto& r) {
@@ -506,7 +526,7 @@ ErrorCode PartitionQuotaAllocator::Restore(const VSegmentView& view,
     }
 
     for (const auto& match : matches) {
-        auto& ranges = free_ranges_.at(match.segment);
+        auto& ranges = free_ranges_.at(profile.name).at(match.segment);
         const auto original = ranges[match.range_index];
         const auto original_end = original.offset + original.length;
         const auto member_end =
@@ -524,7 +544,8 @@ ErrorCode PartitionQuotaAllocator::Restore(const VSegmentView& view,
                       return a.offset < b.offset;
                   });
     }
-    allocations_.emplace(view.vsegment_id, view);
+    allocations_.emplace(view.vsegment_id,
+                         AllocationRecord{profile.name, view});
     return ErrorCode::OK;
 }
 
@@ -549,10 +570,11 @@ ErrorCode PartitionQuotaAllocator::Release(const VSegmentView& view) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto allocation = allocations_.find(view.vsegment_id);
     if (allocation == allocations_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-    if (allocation->second.checksum != view.checksum)
+    if (allocation->second.view.checksum != view.checksum)
         return ErrorCode::INVALID_VERSION;
-    for (const auto& member : allocation->second.members) {
-        InsertAndMerge(free_ranges_[member.segment_id],
+    for (const auto& member : allocation->second.view.members) {
+        InsertAndMerge(free_ranges_[allocation->second.profile_name]
+                                   [member.segment_id],
                        {member.base_offset, member.length});
     }
     allocations_.erase(allocation);
@@ -562,21 +584,25 @@ ErrorCode PartitionQuotaAllocator::Release(const VSegmentView& view) {
 uint64_t PartitionQuotaAllocator::FreeBytes(
     const std::string& segment_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto ranges = free_ranges_.find(segment_id);
-    if (ranges == free_ranges_.end()) return 0;
+    uint64_t total = 0;
+    for (const auto& [profile, segments] : free_ranges_) {
+        auto ranges = segments.find(segment_id);
+        if (ranges == segments.end()) continue;
+        for (const auto& range : ranges->second) total += range.length;
+    }
+    return total;
+}
+
+uint64_t PartitionQuotaAllocator::FreeBytes(
+    const std::string& profile_name, const std::string& segment_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto profile = free_ranges_.find(profile_name);
+    if (profile == free_ranges_.end()) return 0;
+    auto ranges = profile->second.find(segment_id);
+    if (ranges == profile->second.end()) return 0;
     uint64_t total = 0;
     for (const auto& range : ranges->second) total += range.length;
     return total;
 }
 
 }  // namespace mooncake::vsegment
-    if (profile.io_alignment == 0)
-        return Invalid("io_alignment must be positive", detail);
-    if (profile.stripe_size % profile.io_alignment != 0 ||
-        profile.member_extent_size % profile.io_alignment != 0) {
-        return Invalid("stripe and extent must satisfy io_alignment", detail);
-    }
-    if (config.profile_name.empty())
-        return Invalid("profile_name is empty", detail);
-    if (config.initial_vsegment_count == 0)
-        return Invalid("initial_vsegment_count must be positive", detail);
