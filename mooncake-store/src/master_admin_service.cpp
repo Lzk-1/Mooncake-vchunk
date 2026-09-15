@@ -299,6 +299,10 @@ bool MasterAdminServer::Start() {
                         << ", view_version="
                         << snapshot.leader_view->view_version;
                 }
+                log_stream << ", owned_slots="
+                           << (snapshot.service
+                                   ? snapshot.service->GetOwnedSlotCount()
+                                   : 0u);
                 LOG(INFO) << log_stream.str();
                 if (metric_report_stop_sem_.try_acquire_for(
                         std::chrono::seconds(kMetricReportIntervalSeconds))) {

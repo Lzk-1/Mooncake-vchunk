@@ -2342,6 +2342,9 @@ class MasterService {
     std::vector<uint16_t> ResolveOwnedSlotsForCvm();
     // sticky 缓存：最近一次成功解析的 owned slot 集合（etcd 抖动时沿用）。
     std::vector<uint16_t> cvm_last_resolved_owned_slots_;
+    // 归属变更日志（P1）：缓存最近一次解析到的 primary 成员列表（已排序去重），
+    // 用于在成员增删时打印 joined/left 根因，仅变化时打印一次。
+    std::vector<std::string> cvm_last_primary_ids_;
     mutable std::mutex cvm_resolver_mutex_;
     // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
     // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再

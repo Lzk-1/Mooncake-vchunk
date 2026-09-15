@@ -306,6 +306,11 @@ class WrappedMasterService {
     tl::expected<InterMasterHandshakeResponse, ErrorCode>
     InterMasterHandshake();
 
+    // Current number of CVM slots owned by this submaster (0 until the
+    // ownership resolver has populated the local lookup). Forwarded to the
+    // wrapped MasterService for use by periodic admin metrics reporting.
+    uint32_t GetOwnedSlotCount() const;
+
     // Inter-master allocation forwarding (CVM plan B): allocate memory
     // replicas in this submaster's locally mounted segments on behalf of a
     // slot-owning peer. Strictly within `preferred_segments` when given.

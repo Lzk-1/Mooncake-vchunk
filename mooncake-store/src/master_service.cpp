@@ -1229,9 +1229,6 @@ ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
         }
     }
 
-    LOG(INFO) << "Exported slot metadata: slot=" << slot
-              << ", objects=" << export_payload.objects.size()
-              << ", bytes=" << value.size() << ", source=" << master_id_;
     return ErrorCode::OK;
 }
 
@@ -1380,10 +1377,6 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         }
     }
 
-    LOG(INFO) << "Imported slot metadata: slot=" << slot
-              << ", objects=" << imported
-              << ", source=" << export_payload.source_master_id;
-
     // 技术债 3.3：一次性交接完成后删除 slot_meta 键，避免二进制导出残留。
     // 删除失败仅告警不阻断——残留键会在下次 acquire 时被幂等重导。
     const std::string end = cvm::PrefixEnd(key);
@@ -1529,6 +1522,44 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
 
     {
         std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        const std::size_t new_count = slots.size();
+        if (!owned_slot_count_logged_ || new_count != last_logged_owned_count_) {
+            LOG(INFO) << "ResolveOwnedSlotsForCvm: owned slot count changed"
+                      << ", master_id=" << master_id_
+                      << ", primaries=" << ids.size()
+                      << ", owned_slots=" << new_count
+                      << ", previous=" << last_logged_owned_count_;
+            owned_slot_count_logged_ = true;
+            last_logged_owned_count_ = new_count;
+        }
+
+        // P1：成员增删（根因）变化时才打印一次，避免心跳周期刷屏。
+        if (cvm_last_primary_ids_ != ids) {
+            std::vector<std::string> joined;
+            std::vector<std::string> left;
+            std::set_difference(ids.begin(), ids.end(),
+                                cvm_last_primary_ids_.begin(),
+                                cvm_last_primary_ids_.end(),
+                                std::back_inserter(joined));
+            std::set_difference(cvm_last_primary_ids_.begin(),
+                                cvm_last_primary_ids_.end(), ids.begin(),
+                                ids.end(), std::back_inserter(left));
+            auto join = [](const std::vector<std::string>& v) {
+                std::string s;
+                for (const auto& e : v) {
+                    if (!s.empty()) s += ",";
+                    s += e;
+                }
+                return s;
+            };
+            LOG(INFO) << "ResolveOwnedSlotsForCvm: membership changed"
+                      << ", master_id=" << master_id_
+                      << ", joined=[" << join(joined) << "]"
+                      << ", left=[" << join(left) << "]"
+                      << ", primaries=" << ids.size();
+            cvm_last_primary_ids_ = ids;
+        }
+
         cvm_last_resolved_owned_slots_ = slots;
     }
     return slots;

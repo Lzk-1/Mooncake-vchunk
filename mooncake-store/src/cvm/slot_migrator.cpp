@@ -12,6 +12,34 @@
 namespace mooncake {
 namespace cvm {
 
+namespace {
+
+// 把升序 slot 列表压缩成区间串，如 {0,1,2,5,7,8} -> "0-2,5,7-8"。
+std::string FormatSlotRanges(const std::vector<uint16_t>& slots) {
+    if (slots.empty()) {
+        return "[]";
+    }
+    std::string out;
+    size_t i = 0;
+    while (i < slots.size()) {
+        size_t j = i;
+        while (j + 1 < slots.size() && slots[j + 1] == slots[j] + 1) {
+            ++j;
+        }
+        if (!out.empty()) {
+            out += ",";
+        }
+        out += std::to_string(slots[i]);
+        if (j != i) {
+            out += "-" + std::to_string(slots[j]);
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
 SlotMigrator::SlotMigrator(Config config) : config_(std::move(config)) {}
 
 ErrorCode SlotMigrator::PublishMigrating(uint16_t slot) {
@@ -72,8 +100,9 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
     }
     // 释放成功的聚合记录：仅在 owned 集合变化时打印一条，便于确认交接完成。
     if (!released.empty()) {
-        LOG(INFO) << "SlotMigrator released " << released.size()
-                  << " slot(s), master_id=" << config_.master_id;
+        LOG(INFO) << "SlotMigrator released master_id=" << config_.master_id
+                  << ", slot_count=" << released.size()
+                  << ", slots=[" << FormatSlotRanges(released) << "]";
     }
 
     // 获得：原语义为 kMigrating -> on_acquire -> kStable 两段式交接。
@@ -198,16 +227,19 @@ ErrorCode SlotMigrator::Reconcile(const std::vector<uint16_t>& owned_slots) {
         settle_per_slot(gained);
     }
     if (!gained.empty()) {
-        size_t acquired = gained.size();
-        if (acquired >= fenced.size()) {
-            acquired -= fenced.size();  // 仅统计真正落盘的 slot
-        } else {
-            acquired = 0;
-        }
-        if (acquired > 0) {
+        // 真正落盘的 acquired = gained - fenced（fenced 先排序用于集合差）。
+        std::vector<uint16_t> acquired_slots;
+        std::vector<uint16_t> sorted_fenced = fenced;
+        std::sort(sorted_fenced.begin(), sorted_fenced.end());
+        std::set_difference(gained.begin(), gained.end(),
+                            sorted_fenced.begin(), sorted_fenced.end(),
+                            std::back_inserter(acquired_slots));
+
+        if (!acquired_slots.empty()) {
             // 获得成功的聚合记录：确认所有权已全部落盘。
-            LOG(INFO) << "SlotMigrator acquired " << acquired
-                      << " slot(s), master_id=" << config_.master_id;
+            LOG(INFO) << "SlotMigrator acquired master_id=" << config_.master_id
+                      << ", slot_count=" << acquired_slots.size()
+                      << ", slots=[" << FormatSlotRanges(acquired_slots) << "]";
         }
         if (!fenced.empty()) {
             // fencing / 写失败汇总：这些 slot 仍由其他存活 master 持有，或

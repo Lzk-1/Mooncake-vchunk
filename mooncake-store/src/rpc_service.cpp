@@ -1955,6 +1955,10 @@ void WrappedMasterService::StopInterMasterRpc() {
     master_service_.StopInterMasterRpc();
 }
 
+uint32_t WrappedMasterService::GetOwnedSlotCount() const {
+    return master_service_.GetOwnedSlotCount();
+}
+
 tl::expected<InterMasterHandshakeResponse, ErrorCode>
 WrappedMasterService::InterMasterHandshake() {
     return execute_rpc(
