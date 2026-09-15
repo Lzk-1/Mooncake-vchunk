@@ -915,5 +915,44 @@ TEST(VSegmentServiceTest, RejectsPartitionWithoutPublishedQuota) {
               ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
 }
 
+TEST(VSegmentServiceTest, ReconcilesManagerFromPartitionRouteEpoch) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    partition::PartitionRoute route;
+    route.partition_id = "partition-1";
+    route.owner_submaster_id = "submaster-a";
+    route.route_epoch = 3;
+    route.state = static_cast<int32_t>(partition::PartitionState::kActive);
+
+    EXPECT_EQ(service.ReconcilePartitionRoute(route, "submaster-a",
+                                              Committer()),
+              ErrorCode::OK);
+    route.state =
+        static_cast<int32_t>(partition::PartitionState::kMigrating);
+    route.target_submaster_id = "submaster-b";
+    route.route_epoch = 4;
+    EXPECT_EQ(service.ReconcilePartitionRoute(route, "submaster-a",
+                                              Committer()),
+              ErrorCode::OK);
+    EXPECT_EQ(service.StartPut("partition-1", 3, "stale", 16).error,
+              ErrorCode::STALE_ROUTE);
+
+    route.owner_submaster_id = "submaster-b";
+    route.target_submaster_id.clear();
+    route.state = static_cast<int32_t>(partition::PartitionState::kActive);
+    route.route_epoch = 5;
+    EXPECT_EQ(service.ReconcilePartitionRoute(route, "submaster-a", nullptr),
+              ErrorCode::OK);
+    EXPECT_EQ(service.StartPut("partition-1", 5, "not-owner", 16).error,
+              ErrorCode::STALE_ROUTE);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment

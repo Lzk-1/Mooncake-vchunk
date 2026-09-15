@@ -8,6 +8,7 @@
 
 #include "vsegment/vsegment_manager.h"
 #include "vsegment/vsegment_transfer.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake::vsegment {
 
@@ -25,6 +26,12 @@ class VSegmentService final : public VSegmentViewProvider {
         std::string* detail = nullptr);
     ErrorCode RemovePartition(const std::string& partition_id,
                               uint64_t route_epoch);
+    ErrorCode ReconcilePartitionRoute(
+        const partition::PartitionRoute& route,
+        const std::string& local_submaster_id,
+        std::shared_ptr<VSegmentStateCommitter> committer,
+        const PartitionVSegmentSnapshot* recovered = nullptr,
+        std::string* detail = nullptr);
     ErrorCode SnapshotPartition(const std::string& partition_id,
                                 PartitionVSegmentSnapshot* snapshot);
     std::vector<PartitionVSegmentSnapshot> SnapshotAllPartitions();

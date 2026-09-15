@@ -64,6 +64,37 @@ ErrorCode VSegmentService::SnapshotPartition(
     return ErrorCode::OK;
 }
 
+ErrorCode VSegmentService::ReconcilePartitionRoute(
+    const partition::PartitionRoute& route,
+    const std::string& local_submaster_id,
+    std::shared_ptr<VSegmentStateCommitter> committer,
+    const PartitionVSegmentSnapshot* recovered, std::string* detail) {
+    if (route.partition_id.empty() || local_submaster_id.empty() ||
+        route.route_epoch == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (route.state !=
+            static_cast<int32_t>(partition::PartitionState::kActive) &&
+        route.state !=
+            static_cast<int32_t>(partition::PartitionState::kMigrating)) {
+        if (detail) *detail = "unknown PartitionRoute state";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const bool owned_here =
+        route.owner_submaster_id == local_submaster_id;
+    auto current = FindPartition(route.partition_id);
+    if (!owned_here) {
+        if (!current) return ErrorCode::OK;
+        return RemovePartition(route.partition_id, route.route_epoch);
+    }
+
+    // During MIGRATING the old owner remains the sole writer. The target does
+    // not install a live manager until the route atomically switches owner.
+    if (current) return current->SetRouteEpoch(route.route_epoch);
+    return AddPartition(route.partition_id, route.route_epoch,
+                        std::move(committer), recovered, detail);
+}
+
 std::vector<PartitionVSegmentSnapshot>
 VSegmentService::SnapshotAllPartitions() {
     std::vector<std::shared_ptr<VSegmentManager>> managers;
