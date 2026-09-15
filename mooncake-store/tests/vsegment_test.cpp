@@ -254,6 +254,33 @@ TEST(PartitionQuotaPlannerTest, ExcludesUnhealthySegments) {
               ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
 }
 
+TEST(PartitionQuotaPlannerTest, AppliesReservedRatioAndAlignment) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 2;
+    request.policy_digest = "policy";
+    request.default_profile = "default";
+    request.partition_ids = {"partition-b", "partition-a"};
+    request.profile_specs = {Profile(2)};
+    request.segments = {{"segment-a", 1000, 16, "DRAM"},
+                        {"segment-b", 1000, 16, "DRAM"}};
+    request.reserved_ratio = 0.1;
+
+    auto result = PartitionQuotaPlanner().Plan(request);
+    ASSERT_TRUE(result) << result.detail;
+    ASSERT_EQ(result.snapshot.quotas.size(), 2u);
+    for (const auto& quota : result.snapshot.quotas) {
+        ASSERT_EQ(quota.extents.size(), 2u);
+        for (const auto& extent : quota.extents) {
+            EXPECT_EQ(extent.length, 448u);
+            EXPECT_EQ(extent.base_offset % 16, 0u);
+        }
+    }
+    EXPECT_EQ(result.snapshot.quotas[0].partition_id, "partition-a");
+    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 0u);
+    EXPECT_EQ(result.snapshot.quotas[1].partition_id, "partition-b");
+    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 448u);
+}
+
 TEST(VSegmentViewTest, ChecksumCoversOrderedMembers) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -357,6 +384,15 @@ TEST(LogicalRangeAllocatorTest, CommitKeepsRangeAllocatedUntilRelease) {
               ErrorCode::OBJECT_NOT_FOUND);
 }
 
+TEST(LogicalRangeAllocatorTest, RejectsLengthChangeOnIdempotentRetry) {
+    LogicalRangeAllocator allocator(1024);
+    ASSERT_TRUE(allocator.Reserve("put-1", 128));
+    EXPECT_EQ(allocator.Reserve("put-1", 64).error,
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(allocator.FreeBytes(), 896u);
+    EXPECT_EQ(allocator.ReservationCount(), 1u);
+}
+
 TEST(VSegmentResolverTest, SplitsAtStripeAndClientSliceBoundaries) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -387,6 +423,20 @@ TEST(VSegmentResolverTest, RejectsViewWithInvalidChecksum) {
     allocation.view.members[0].base_offset += 8;
     auto resolved = ResolveTransfer(allocation.view, 0, 8, {{1000, 8}});
     EXPECT_EQ(resolved.error, ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(VSegmentResolverTest, RejectsBufferLengthMismatchAndLogicalOverflow) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+
+    EXPECT_EQ(ResolveTransfer(allocation.view, 0, 16, {{1000, 8}}).error,
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ResolveTransfer(allocation.view,
+                              allocation.view.logical_capacity - 8, 16,
+                              {{1000, 16}})
+                  .error,
+              ErrorCode::INVALID_PARAMS);
 }
 
 TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
@@ -1106,6 +1156,116 @@ TEST(VSegmentServiceTest, ReleasesCommittedObjectRange) {
               ErrorCode::OK);
     EXPECT_EQ(service.ReleaseObject(started.replica, "object-1"),
               ErrorCode::OK);
+}
+
+TEST(VSegmentServiceTest, AbortReturnsReservedLogicalRange) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 256}, {"segment-b", 0, 256}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 1, "put-abort", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    ASSERT_EQ(service.AbortPut("partition-1", started.replica.vsegment_id, 1,
+                               "put-abort"),
+              ErrorCode::OK);
+
+    PartitionVSegmentSnapshot state;
+    ASSERT_EQ(service.SnapshotPartition("partition-1", &state),
+              ErrorCode::OK);
+    ASSERT_EQ(state.vsegments.size(), 1u);
+    EXPECT_TRUE(state.vsegments[0].logical_allocation.reservations.empty());
+    ASSERT_EQ(state.vsegments[0].logical_allocation.free_ranges.size(), 1u);
+    EXPECT_EQ(state.vsegments[0].logical_allocation.free_ranges[0],
+              (LogicalRange{0, state.vsegments[0].view.logical_capacity}));
+}
+
+TEST(VSegmentServiceTest, ReplicaAllocationFailureAbortsEarlierReservations) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    // Exactly one vsegment can be created, while the request needs two
+    // distinct vsegments.
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 256}, {"segment-b", 0, 256}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode> result;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        result = service.StartPutReplicasOwned(
+            "partition-1", {"replica-1", "replica-2"}, 64);
+        if (result || result.error() != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(),
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+
+    PartitionVSegmentSnapshot state;
+    ASSERT_EQ(service.SnapshotPartition("partition-1", &state),
+              ErrorCode::OK);
+    ASSERT_EQ(state.vsegments.size(), 1u);
+    EXPECT_TRUE(state.vsegments[0].logical_allocation.reservations.empty());
+}
+
+TEST(VSegmentServiceTest, RestoresMigratedPartitionAtNewRouteEpoch) {
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService source(quota);
+    ASSERT_EQ(source.AddPartition("partition-1", 3, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = source.StartPut("partition-1", 3, "put-before-move", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    ASSERT_EQ(source.CommitPut(started.replica, 3, "put-before-move",
+                               "object-1"),
+              ErrorCode::OK);
+    PartitionVSegmentSnapshot recovered;
+    ASSERT_EQ(source.SnapshotPartition("partition-1", &recovered),
+              ErrorCode::OK);
+
+    VSegmentService target(quota);
+    ASSERT_EQ(target.AddPartition("partition-1", 4, Committer(), &recovered),
+              ErrorCode::OK);
+    VSegmentView restored_view;
+    EXPECT_EQ(target.LoadView("partition-1", started.replica.vsegment_id,
+                              &restored_view),
+              ErrorCode::OK);
+    EXPECT_EQ(target.StartPut("partition-1", 3, "stale", 16).error,
+              ErrorCode::STALE_ROUTE);
+    auto next = target.StartPut("partition-1", 4, "put-after-move", 16);
+    ASSERT_TRUE(next) << next.detail;
+    EXPECT_EQ(next.replica.vsegment_id, started.replica.vsegment_id);
+    EXPECT_EQ(next.replica.logical_offset,
+              started.replica.logical_offset + started.replica.length);
 }
 
 TEST(VSegmentIntegrationTest, OrdinaryPutReturnsAndCommitsVSegmentReplica) {
