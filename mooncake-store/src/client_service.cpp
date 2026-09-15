@@ -170,7 +170,7 @@ struct ReplicaTransferSummary {
     ErrorCode first_error = ErrorCode::OK;
 
     void RecordAllocatedReplica(const Replica::Descriptor& replica) {
-        if (replica.is_memory_replica()) {
+        if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
             ++allocated_memory_replicas;
         } else if (replica.is_nof_replica()) {
             ++allocated_nof_replicas;
@@ -1704,8 +1704,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         }
         return tl::unexpected(err);
     }
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "Range read only supported for memory replicas, key="
+    if (!replica.is_memory_replica() && !replica.is_vsegment_replica()) {
+        LOG(ERROR) << "Range read only supported for memory or vsegment "
+                      "replicas, key="
                    << object_key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
@@ -1894,6 +1895,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return results;
     }
     if (prefer_alloc_in_same_node) {
+        // The same-node fast path batches direct memory handles by endpoint.
+        // VSegment replicas need view expansion first, so use the general
+        // parallel path when a batch contains one.
+        for (const auto& query_result : query_results) {
+            Replica::Descriptor replica;
+            if (FindFirstCompleteReplica(query_result.replicas, replica) ==
+                    ErrorCode::OK &&
+                replica.is_vsegment_replica()) {
+                prefer_alloc_in_same_node = false;
+                break;
+            }
+        }
+    }
+    if (prefer_alloc_in_same_node) {
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
@@ -1943,7 +1958,26 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_nof_replica()) {
+        if (replica.is_vsegment_replica()) {
+            if (!vsegment_transfer_planner_) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            std::vector<vsegment::ClientSlice> client_slices;
+            client_slices.reserve(slices_it->second.size());
+            for (const auto& slice : slices_it->second) {
+                client_slices.push_back(
+                    {reinterpret_cast<uint64_t>(slice.ptr), slice.size});
+            }
+            auto plan = vsegment_transfer_planner_->Plan(
+                replica.get_vsegment_descriptor(), client_slices);
+            if (!plan) {
+                results[i] = tl::unexpected(plan.error);
+                continue;
+            }
+            future = transfer_submitter_->submitVSegment(
+                plan, TransferRequest::READ);
+        } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
@@ -2148,9 +2182,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     for (const auto& replica : put_start.replicas) {
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            replica.is_vsegment_replica()) {
             // Transfer data using allocated handles from all replicas
             const auto replica_type = replica.is_memory_replica()
+                                          ? ReplicaType::MEMORY
+                                      : replica.is_vsegment_replica()
                                           ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
             ErrorCode transfer_err = TransferWrite(replica, slices);
@@ -2267,9 +2304,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
-    // Transfer to memory replicas
+    // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
-        if (replica.is_memory_replica()) {
+        if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 auto revoke_result = master_client_.UpsertRevoke(
@@ -2629,11 +2666,20 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     // Process individual responses with robust error handling
     for (size_t i = 0; i < active_indices.size(); ++i) {
         auto& op = ops[active_indices[i]];
+        op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
             op.SetError(start_responses[i].error(),
                         "Master failed to start upsert operation");
         } else {
             op.replicas = start_responses[i].value();
+            op.RecordAllocatedReplicas();
+            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+                op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                    PutOperationState::MASTER_FAILED,
+                                    "Allocated replicas do not satisfy "
+                                    "requested replica policy");
+                continue;
+            }
             VLOG(1) << "Successfully started upsert for key " << op.key
                     << " with " << op.replicas.size() << " replicas";
         }
@@ -2689,12 +2735,40 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_memory_replica() || replica.is_nof_replica()) {
+            if (replica.is_memory_replica() || replica.is_nof_replica() ||
+                replica.is_vsegment_replica()) {
                 const auto replica_type = replica.is_memory_replica()
+                                              ? ReplicaType::MEMORY
+                                          : replica.is_vsegment_replica()
                                               ? ReplicaType::MEMORY
                                               : ReplicaType::NOF_SSD;
                 std::optional<TransferFuture> submit_result;
-                if (replica.is_nof_replica()) {
+                if (replica.is_vsegment_replica()) {
+                    if (!vsegment_transfer_planner_) {
+                        op.transfer_summary.RecordFailure(
+                            replica_type, ErrorCode::INVALID_PARAMS);
+                        op.AppendFailureContext(
+                            "VSegmentTransferPlanner not initialized");
+                        continue;
+                    }
+                    std::vector<vsegment::ClientSlice> client_slices;
+                    client_slices.reserve(op.slices.size());
+                    for (const auto& slice : op.slices) {
+                        client_slices.push_back(
+                            {reinterpret_cast<uint64_t>(slice.ptr),
+                             slice.size});
+                    }
+                    auto plan = vsegment_transfer_planner_->Plan(
+                        replica.get_vsegment_descriptor(), client_slices);
+                    if (!plan) {
+                        op.transfer_summary.RecordFailure(replica_type,
+                                                          plan.error);
+                        op.AppendFailureContext(plan.detail);
+                        continue;
+                    }
+                    submit_result = transfer_submitter_->submitVSegment(
+                        plan, TransferRequest::WRITE);
+                } else if (replica.is_nof_replica()) {
                     auto contiguous_range = GetContiguousSliceRange(op.slices);
                     if (!contiguous_range.has_value()) {
                         std::string failure_context =
@@ -2981,13 +3055,24 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
 
-        if (!op.IsResolved() && !op.replicas.empty() &&
-            !op.pending_transfers.empty()) {
+        if (op.IsResolved() || op.replicas.empty()) {
+            if (!op.replicas.empty()) {
+                failed_keys.emplace_back(op.key);
+                failed_indices.emplace_back(i);
+            }
+            continue;
+        }
+        const auto decision = DetermineFinalizeDecision(
+            op.ToReplicateConfig(), op.transfer_summary);
+        if (decision.success) {
             successful_object_metas.emplace_back(
                 ObjectMeta{op.key, op.object_checksum});
             successful_indices.emplace_back(i);
-        } else if (op.state != PutOperationState::PENDING &&
-                   !op.replicas.empty()) {
+        } else {
+            op.SetTerminalError(decision.error,
+                                PutOperationState::TRANSFER_FAILED,
+                                op.failure_context.value_or(
+                                    "Replica transfer failed before finalize"));
             failed_keys.emplace_back(op.key);
             failed_indices.emplace_back(i);
         }
@@ -3246,6 +3331,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
+        const bool contains_vsegment = std::any_of(
+            ops.begin(), ops.end(), [](const PutOperation& op) {
+                return !op.IsResolved() &&
+                       std::any_of(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_vsegment_replica();
+                                   });
+            });
+        if (contains_vsegment) {
+            SubmitTransfers(ops);
+            WaitForTransfers(ops);
+            FinalizeBatchPut(ops);
+            auto results = CollectResults(ops);
+            const bool any_succeeded = std::any_of(
+                results.begin(), results.end(),
+                [](const auto& result) { return result.has_value(); });
+            pt_full.End(any_succeeded ? 0 : -1);
+            return results;
+        }
         auto results = BatchPutWhenPreferSameNode(ops);
         const bool any_succeeded =
             std::any_of(results.begin(), results.end(),
