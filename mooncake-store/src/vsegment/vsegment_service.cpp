@@ -77,13 +77,12 @@ ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
     auto manager = FindPartition(replica.partition_id);
     if (!manager) return ErrorCode::STALE_ROUTE;
     LogicalRange committed;
+    const LogicalRange expected{replica.logical_offset, replica.length};
     auto result = manager->CommitPut(replica.vsegment_id, operation_id,
-                                     object_id, &committed, route_epoch);
+                                     object_id, &committed, route_epoch,
+                                     &expected);
     if (result != ErrorCode::OK) return result;
-    return committed.offset == replica.logical_offset &&
-                   committed.length == replica.length
-               ? ErrorCode::OK
-               : ErrorCode::INVALID_VERSION;
+    return ErrorCode::OK;
 }
 
 ErrorCode VSegmentService::AbortPut(const std::string& partition_id,

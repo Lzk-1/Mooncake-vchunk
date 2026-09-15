@@ -90,7 +90,8 @@ class VSegmentManager {
                         const std::string& operation_id,
                         const std::string& allocation_id,
                         LogicalRange* range = nullptr,
-                        uint64_t expected_route_epoch = 0);
+                        uint64_t expected_route_epoch = 0,
+                        const LogicalRange* expected_range = nullptr);
     ErrorCode AbortPut(const std::string& vsegment_id,
                        const std::string& operation_id,
                        uint64_t expected_route_epoch = 0);

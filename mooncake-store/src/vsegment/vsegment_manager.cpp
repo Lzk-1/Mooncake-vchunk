@@ -268,13 +268,36 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
                                      const std::string& operation_id,
                                      const std::string& allocation_id,
                                      LogicalRange* range,
-                                     uint64_t expected_route_epoch) {
+                                     uint64_t expected_route_epoch,
+                                     const LogicalRange* expected_range) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
         return ErrorCode::STALE_ROUTE;
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
     const auto before = managed->second.logical_allocator->Snapshot();
+    if (expected_range) {
+        auto reservation = std::find_if(
+            before.reservations.begin(), before.reservations.end(),
+            [&](const auto& candidate) {
+                return candidate.operation_id == operation_id;
+            });
+        auto completed = std::find_if(
+            before.completed_operations.begin(),
+            before.completed_operations.end(), [&](const auto& candidate) {
+                return candidate.operation_id == operation_id &&
+                       candidate.outcome == OperationOutcome::COMMITTED;
+            });
+        const LogicalRange* actual =
+            reservation != before.reservations.end()
+                ? &reservation->range
+                : (completed != before.completed_operations.end()
+                       ? &completed->range
+                       : nullptr);
+        if (!actual || actual->offset != expected_range->offset ||
+            actual->length != expected_range->length)
+            return ErrorCode::INVALID_VERSION;
+    }
     const auto result = managed->second.logical_allocator->Commit(
         operation_id, allocation_id, range);
     if (result != ErrorCode::OK) return result;

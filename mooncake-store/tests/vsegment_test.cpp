@@ -751,5 +751,33 @@ TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
               ErrorCode::STALE_ROUTE);
 }
 
+TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    auto mismatched = started.replica;
+    ++mismatched.logical_offset;
+    EXPECT_EQ(service.CommitPut(mismatched, 8, "put-1", "object-1"),
+              ErrorCode::INVALID_VERSION);
+    EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment
