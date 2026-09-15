@@ -201,6 +201,13 @@ class MasterService {
     void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
         vsegment_service_ = std::move(service);
     }
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+    recovered_vsegment_snapshots() const {
+        return recovered_vsegment_snapshots_;
+    }
+    void ClearRecoveredVSegmentSnapshots() {
+        recovered_vsegment_snapshots_.clear();
+    }
     tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
         const std::string& partition_id, const std::string& vsegment_id);
     tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
@@ -993,7 +1000,9 @@ class MasterService {
     void RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<vsegment::PartitionVSegmentSnapshot>&
+            vsegment_partitions = {});
 
     /**
      * @brief Query the status of a task
@@ -2284,6 +2293,10 @@ class MasterService {
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
     std::shared_ptr<vsegment::VSegmentService> vsegment_service_;
+    // Decoded before Partition ownership is activated. The route lifecycle
+    // consumes the matching state when it creates each local manager.
+    std::vector<vsegment::PartitionVSegmentSnapshot>
+        recovered_vsegment_snapshots_;
 
     // vsegment 两阶段写委托（§12.3.8 预留）。nullptr 表示未启用 vsegment，
     // 回退旧直达写路径；由 vsegment 实现方经 SetVSegmentServiceDelegate 注入。

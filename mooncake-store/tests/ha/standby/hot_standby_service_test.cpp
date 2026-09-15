@@ -17,6 +17,7 @@
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_types.h"
+#include "vsegment/vsegment_ha.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -618,6 +619,22 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
     return batch;
 }
 
+OpLogBatchRecord MakeVSegmentBatch(
+    const vsegment::PartitionVSegmentSnapshot& state) {
+    vsegment::VSegmentOpLogRecord record{
+        state.partition_id, state.route_epoch, state.metadata_revision,
+        "test", state};
+    std::string payload;
+    struct_json::to_json(record, payload);
+    OpLogBatchRecord batch;
+    batch.batch_id = 1;
+    batch.first_seq = 1;
+    batch.last_seq = 1;
+    batch.entries.push_back(
+        MakeEntry(1, OpType::VSEGMENT_STATE, state.partition_id, payload));
+    return batch;
+}
+
 }  // namespace
 
 TEST_F(HotStandbyServiceTest,
@@ -648,6 +665,45 @@ TEST_F(HotStandbyServiceTest,
 
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
     EXPECT_EQ(1u, service->GetLatestAppliedSequenceId());
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, ReplaysAndExportsVSegmentState) {
+    const std::string cluster_id = "standby-vsegment-state";
+    vsegment::PartitionVSegmentSnapshot state;
+    state.partition_id = "partition-1";
+    state.route_epoch = 4;
+    state.metadata_revision = 1;
+
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id),
+                           EncodeDurablePrefix(
+                               {.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                           EncodeOpLogBatchRecord(
+                               MakeVSegmentBatch(state))));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 1;
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 1;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    StandbySnapshot snapshot;
+    ASSERT_TRUE(service->ExportStandbySnapshot(snapshot));
+    ASSERT_EQ(snapshot.vsegment_partitions.size(), 1u);
+    EXPECT_EQ(snapshot.vsegment_partitions.front().partition_id,
+              state.partition_id);
+    EXPECT_EQ(snapshot.vsegment_partitions.front().metadata_revision, 1u);
     service->Stop();
 }
 

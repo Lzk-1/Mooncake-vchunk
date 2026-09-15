@@ -3680,9 +3680,12 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 void MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+        vsegment_partitions) {
     // The ordered writer initializes its sequence from durable_prefix.
     (void)initial_oplog_sequence_id;
+    recovered_vsegment_snapshots_ = vsegment_partitions;
 
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
@@ -11046,9 +11049,9 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+    // Vsegment state is embedded in the metadata payload so the existing
+    // snapshot repository remains wire-compatible (no fourth required file).
+    packer.pack_map(4);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -11129,6 +11132,18 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
+    // 4. Serialize all owner-Partition vsegment states. Old readers ignore
+    // this unknown map key; new readers accept old snapshots without it.
+    packer.pack("vsegment_partitions");
+    const auto snapshots = service_->vsegment_service_
+                               ? service_->vsegment_service_
+                                     ->SnapshotAllPartitions()
+                               : service_->recovered_vsegment_snapshots_;
+    const auto serialized_snapshots = struct_pack::serialize(snapshots);
+    packer.pack_bin(serialized_snapshots.size());
+    packer.pack_bin_body(serialized_snapshots.data(),
+                         serialized_snapshots.size());
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -11162,6 +11177,7 @@ MasterService::MetadataSerializer::Deserialize(
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
     const msgpack::object* replica_next_id_obj = nullptr;
+    const msgpack::object* vsegment_partitions_obj = nullptr;
 
     // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
@@ -11174,6 +11190,8 @@ MasterService::MetadataSerializer::Deserialize(
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
             } else if (key == "replica_next_id") {
                 replica_next_id_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "vsegment_partitions") {
+                vsegment_partitions_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -11255,6 +11273,24 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+
+    service_->recovered_vsegment_snapshots_.clear();
+    if (vsegment_partitions_obj != nullptr) {
+        if (vsegment_partitions_obj->type != msgpack::type::BIN) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid vsegment_partitions snapshot payload"));
+        }
+        const std::string_view encoded(vsegment_partitions_obj->via.bin.ptr,
+                                       vsegment_partitions_obj->via.bin.size);
+        if (struct_pack::deserialize_to(
+                service_->recovered_vsegment_snapshots_, encoded) !=
+            struct_pack::errc{}) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Failed to deserialize vsegment_partitions"));
+        }
+    }
     service_->RebuildGroupRoutingIndex();
     service_->ClearCandidatesForReload();
     return {};

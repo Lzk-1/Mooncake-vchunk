@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "vsegment/vsegment_manager.h"
 #include "types.h"
 #include "partition/vsegment_types.h"
 
@@ -103,8 +104,10 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             vsegment_partitions);
 };
 
 // ---------------------------------------------------------------------------

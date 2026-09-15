@@ -64,6 +64,24 @@ ErrorCode VSegmentService::SnapshotPartition(
     return ErrorCode::OK;
 }
 
+std::vector<PartitionVSegmentSnapshot>
+VSegmentService::SnapshotAllPartitions() {
+    std::vector<std::shared_ptr<VSegmentManager>> managers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        managers.reserve(partitions_.size());
+        for (const auto& [partition_id, manager] : partitions_) {
+            (void)partition_id;
+            managers.push_back(manager);
+        }
+    }
+
+    std::vector<PartitionVSegmentSnapshot> snapshots;
+    snapshots.reserve(managers.size());
+    for (const auto& manager : managers) snapshots.push_back(manager->Snapshot());
+    return snapshots;
+}
+
 VSegmentPutStartResult VSegmentService::StartPut(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,

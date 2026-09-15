@@ -12,6 +12,7 @@
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
+#include "vsegment/vsegment_ha.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha/oplog/oplog_types.h"
 
@@ -357,6 +358,13 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     // Load segment registry from snapshot; applied to each per-source applier
     // when OpLog following starts.
     baseline_segments_ = snapshot.segments;
+    {
+        std::lock_guard<std::mutex> lock(vsegment_mutex_);
+        vsegment_partitions_.clear();
+        for (const auto& partition : snapshot.vsegment_partitions) {
+            vsegment_partitions_[partition.partition_id] = partition;
+        }
+    }
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
@@ -375,6 +383,10 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         auto applier =
             std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
         applier->LoadSegmentRegistry(baseline_segments_);
+        applier->SetVSegmentStateHandler(
+            [this](const OpLogEntry& entry) {
+                return ApplyVSegmentState(entry);
+            });
         auto reader = std::make_unique<OpLogBatchStandbyReader>(
             cluster_id_, *batch_standby_kv_backend_, *applier, source.master_id);
         sources_.emplace(
@@ -746,6 +758,7 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         out.objects.clear();
     }
     CollectSegmentsLocked(out.segments);
+    CollectVSegmentPartitions(out.vsegment_partitions);
 
     lock.unlock();
     Stop();
@@ -798,8 +811,53 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 
     // Export segments merged across per-source appliers
     CollectSegmentsLocked(out.segments);
+    CollectVSegmentPartitions(out.vsegment_partitions);
 
     return true;
+}
+
+bool HotStandbyService::ApplyVSegmentState(const OpLogEntry& entry) {
+    vsegment::VSegmentOpLogRecord record;
+    try {
+        struct_json::from_json(record, entry.payload);
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to decode vsegment state: " << error.what();
+        return false;
+    }
+    if (record.partition_id.empty() ||
+        record.state.partition_id != record.partition_id ||
+        record.state.route_epoch != record.route_epoch ||
+        record.state.metadata_revision != record.metadata_revision) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(vsegment_mutex_);
+    auto found = vsegment_partitions_.find(record.partition_id);
+    if (found != vsegment_partitions_.end()) {
+        const auto& current = found->second;
+        if (record.metadata_revision <= current.metadata_revision) return true;
+        if (record.metadata_revision != current.metadata_revision + 1 ||
+            record.route_epoch < current.route_epoch) {
+            return false;
+        }
+        found->second = std::move(record.state);
+    } else {
+        if (record.metadata_revision != 1) return false;
+        vsegment_partitions_.emplace(record.partition_id,
+                                     std::move(record.state));
+    }
+    return true;
+}
+
+void HotStandbyService::CollectVSegmentPartitions(
+    std::vector<vsegment::PartitionVSegmentSnapshot>& out) const {
+    std::lock_guard<std::mutex> lock(vsegment_mutex_);
+    out.clear();
+    out.reserve(vsegment_partitions_.size());
+    for (const auto& [partition_id, state] : vsegment_partitions_) {
+        (void)partition_id;
+        out.push_back(state);
+    }
 }
 
 void HotStandbyService::SetSnapshotProvider(

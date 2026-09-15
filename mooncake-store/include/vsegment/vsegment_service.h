@@ -4,6 +4,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "vsegment/vsegment_manager.h"
 #include "vsegment/vsegment_transfer.h"
@@ -26,6 +27,7 @@ class VSegmentService final : public VSegmentViewProvider {
                               uint64_t route_epoch);
     ErrorCode SnapshotPartition(const std::string& partition_id,
                                 PartitionVSegmentSnapshot* snapshot);
+    std::vector<PartitionVSegmentSnapshot> SnapshotAllPartitions();
 
     VSegmentPutStartResult StartPut(const std::string& partition_id,
                                     uint64_t route_epoch,
