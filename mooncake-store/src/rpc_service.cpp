@@ -510,6 +510,11 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_id, master_service_.IsTenantQuotaEnabled(),
                 [&](const TenantId& resolved_tenant_id)
                     -> tl::expected<PutStartResult, ErrorCode> {
+                    auto vsegment = master_service_.TryVSegmentPutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!vsegment) return tl::make_unexpected(vsegment.error());
+                    if (vsegment->has_value()) return std::move(**vsegment);
                     auto descriptors = master_service_.PutStart(
                         client_id, key, resolved_tenant_id, slice_length,
                         config);

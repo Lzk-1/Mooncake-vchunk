@@ -129,6 +129,17 @@ VSegmentPutStartResult VSegmentService::StartPut(
     return manager->StartPut(operation_id, length, profile_name, route_epoch);
 }
 
+VSegmentPutStartResult VSegmentService::StartPutOwned(
+    const std::string& partition_id, const std::string& operation_id,
+    uint64_t length, const std::string& profile_name) {
+    auto manager = FindPartition(partition_id);
+    if (!manager)
+        return {ErrorCode::STALE_ROUTE, operation_id, {},
+                "Partition is not owned by this SubMaster"};
+    return manager->StartPut(operation_id, length, profile_name,
+                             manager->Snapshot().route_epoch);
+}
+
 ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
                                      uint64_t route_epoch,
                                      const std::string& operation_id,
@@ -144,12 +155,30 @@ ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
     return ErrorCode::OK;
 }
 
+ErrorCode VSegmentService::CommitPutOwned(
+    const VSegmentDescriptor& replica, const std::string& operation_id,
+    const std::string& object_id) {
+    auto manager = FindPartition(replica.partition_id);
+    return manager ? CommitPut(replica, manager->Snapshot().route_epoch,
+                               operation_id, object_id)
+                   : ErrorCode::STALE_ROUTE;
+}
+
 ErrorCode VSegmentService::AbortPut(const std::string& partition_id,
                                     const std::string& vsegment_id,
                                     uint64_t route_epoch,
                                     const std::string& operation_id) {
     auto manager = FindPartition(partition_id);
     return manager ? manager->AbortPut(vsegment_id, operation_id, route_epoch)
+                   : ErrorCode::STALE_ROUTE;
+}
+
+ErrorCode VSegmentService::AbortPutOwned(
+    const std::string& partition_id, const std::string& vsegment_id,
+    const std::string& operation_id) {
+    auto manager = FindPartition(partition_id);
+    return manager ? AbortPut(partition_id, vsegment_id,
+                              manager->Snapshot().route_epoch, operation_id)
                    : ErrorCode::STALE_ROUTE;
 }
 
@@ -166,9 +195,10 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
     auto found = partitions_.find(replica.partition_id);
     if (found == partitions_.end()) return ErrorCode::STALE_ROUTE;
     const auto epoch = found->second->Snapshot().route_epoch;
-    return found->second->ReleaseObject(
+    const auto result = found->second->ReleaseObject(
         replica.vsegment_id, object_id,
         {replica.logical_offset, replica.length}, epoch);
+    return result == ErrorCode::OBJECT_NOT_FOUND ? ErrorCode::OK : result;
 }
 
 ErrorCode VSegmentService::LoadView(const std::string& partition_id,

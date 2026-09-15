@@ -41,14 +41,23 @@ class VSegmentService final : public VSegmentViewProvider {
                                     const std::string& operation_id,
                                     uint64_t length,
                                     const std::string& profile_name = {});
+    VSegmentPutStartResult StartPutOwned(
+        const std::string& partition_id, const std::string& operation_id,
+        uint64_t length, const std::string& profile_name = {});
     ErrorCode CommitPut(const VSegmentDescriptor& replica,
                         uint64_t route_epoch,
                         const std::string& operation_id,
                         const std::string& object_id);
+    ErrorCode CommitPutOwned(const VSegmentDescriptor& replica,
+                             const std::string& operation_id,
+                             const std::string& object_id);
     ErrorCode AbortPut(const std::string& partition_id,
                        const std::string& vsegment_id,
                        uint64_t route_epoch,
                        const std::string& operation_id);
+    ErrorCode AbortPutOwned(const std::string& partition_id,
+                            const std::string& vsegment_id,
+                            const std::string& operation_id);
     ErrorCode ReleaseObject(const VSegmentDescriptor& replica,
                             const std::string& object_id);
 

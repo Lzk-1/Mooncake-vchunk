@@ -602,6 +602,62 @@ std::string MasterService::GeneratePutStartOperationId(
                                                         config);
 }
 
+tl::expected<std::optional<PutStartResult>, ErrorCode>
+MasterService::TryVSegmentPutStart(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    uint64_t slice_length, const ReplicateConfig& config) {
+    if (!vsegment_service_) return std::optional<PutStartResult>{};
+    if (config.replica_num != 1 || config.nof_replica_num != 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto normalized = ResolveTenantIdForWrite(tenant_id);
+    if (!normalized) return tl::make_unexpected(normalized.error());
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(*normalized, key));
+    const std::string operation_id = UuidToString(generate_uuid());
+    auto reservation = vsegment_service_->StartPutOwned(
+        partition_id, operation_id, slice_length);
+    if (!reservation) return tl::make_unexpected(reservation.error);
+
+    const auto abort = [&] {
+        vsegment_service_->AbortPutOwned(
+            reservation.replica.partition_id,
+            reservation.replica.vsegment_id, operation_id);
+    };
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    const auto shard_idx = getShardIndex(*normalized, key);
+    MetadataShardAccessorRW shard(this, shard_idx);
+    auto& tenant_state = shard->tenants[*normalized];
+    if (tenant_state.metadata.contains(key) ||
+        GetGroupRoute(*normalized, key).has_value()) {
+        abort();
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    std::vector<Replica> replicas;
+    replicas.emplace_back(reservation.replica, ReplicaStatus::PROCESSING);
+    std::vector<Replica::Descriptor> descriptors;
+    descriptors.push_back(replicas.front().get_descriptor());
+    const std::string group_id =
+        config.group_ids && !config.group_ids->empty()
+            ? config.group_ids->front()
+            : std::string{};
+    auto [it, inserted] = tenant_state.metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(
+            client_id, std::chrono::system_clock::now(), slice_length,
+            std::move(replicas), config.with_soft_pin, config.with_hard_pin,
+            config.data_type, group_id, *normalized, key));
+    if (!inserted) {
+        abort();
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    IncrementTenantMetadataObjectCount(*normalized);
+    RegisterGroupMember(tenant_state, *normalized, key, group_id);
+    tenant_state.processing_keys.insert(key);
+    return std::optional<PutStartResult>(
+        PutStartResult{operation_id, std::move(descriptors)});
+}
+
 void MasterService::StopSlotOwnerHeartbeat() {
     if (slot_owner_heartbeat_) {
         slot_owner_heartbeat_->Stop();
@@ -5331,6 +5387,19 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    const Replica* vsegment_replica = metadata.GetFirstReplica(
+        &Replica::fn_is_vsegment_replica);
+    if (vsegment_replica != nullptr) {
+        if (operation_id.empty() || !vsegment_service_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto committed = vsegment_service_->CommitPutOwned(
+            vsegment_replica->get_vsegment_descriptor(), operation_id, key);
+        if (committed != ErrorCode::OK) {
+            return tl::make_unexpected(committed);
+        }
+    }
+
     metadata.VisitReplicas(
         [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
@@ -5430,7 +5499,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // vsegment 两阶段写：PutEnd 成功时提交预留的逻辑区间（失败路径由调用方
     // 走 PutRevoke 触达 AbortOperation 撤销）。operation_id 为空表示旧直达写
     // 路径，不涉及 commit。
-    if (!operation_id.empty() && vsegment_service_delegate_) {
+    if (!operation_id.empty() && vsegment_replica == nullptr &&
+        vsegment_service_delegate_) {
         vsegment_service_delegate_->CommitOperation(operation_id);
     }
     return {};
@@ -5600,11 +5670,24 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                    << key << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
+    auto pending_vsegment = metadata.GetFirstReplica(
+        &Replica::fn_is_vsegment_replica);
+    if (pending_vsegment != nullptr) {
+        if (operation_id.empty() || !vsegment_service_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto aborted = vsegment_service_->AbortPutOwned(
+            pending_vsegment->get_vsegment_descriptor().partition_id,
+            pending_vsegment->get_vsegment_descriptor().vsegment_id,
+            operation_id);
+        if (aborted != ErrorCode::OK) return tl::make_unexpected(aborted);
+    }
 
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
+            return (replica.is_memory_replica() || replica.is_nof_replica() ||
+                    replica.is_vsegment_replica()) &&
                    !replica.is_processing();
         }
         return replica.type() == replica_type && !replica.is_processing();
@@ -5617,7 +5700,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto target_pred = [replica_type](const Replica& r) {
         if (replica_type == ReplicaType::ALL) {
-            return r.is_memory_replica() || r.is_nof_replica();
+            return r.is_memory_replica() || r.is_nof_replica() ||
+                   r.is_vsegment_replica();
         }
         return r.type() == replica_type;
     };

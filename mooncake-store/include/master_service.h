@@ -237,6 +237,10 @@ class MasterService {
     std::string GeneratePutStartOperationId(
         const std::string& key, uint64_t slice_length,
         const ReplicateConfig& config) const;
+    tl::expected<std::optional<PutStartResult>, ErrorCode>
+    TryVSegmentPutStart(const UUID& client_id, const std::string& key,
+                        const TenantId& tenant_id, uint64_t slice_length,
+                        const ReplicateConfig& config);
 
     // Inter-master allocation forwarding (CVM plan B phase 2). Called by
     // WrappedMasterService when a slot-owning peer asks this submaster
