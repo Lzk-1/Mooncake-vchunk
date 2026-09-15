@@ -60,14 +60,29 @@ ErrorCode VSegmentViewCache::Insert(const VSegmentView& view,
         }
         return ErrorCode::OK;
     }
+    while (views_.size() >= max_entries_ && !insertion_order_.empty()) {
+        const auto oldest = std::move(insertion_order_.front());
+        insertion_order_.pop_front();
+        views_.erase(oldest);
+    }
     views_.emplace(key, view);
+    insertion_order_.push_back(key);
     return ErrorCode::OK;
 }
 
 void VSegmentViewCache::Erase(const std::string& partition_id,
                               const std::string& vsegment_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    views_.erase(ViewCacheKey(partition_id, vsegment_id));
+    const auto key = ViewCacheKey(partition_id, vsegment_id);
+    views_.erase(key);
+    insertion_order_.erase(
+        std::remove(insertion_order_.begin(), insertion_order_.end(), key),
+        insertion_order_.end());
+}
+
+size_t VSegmentViewCache::Size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return views_.size();
 }
 
 VSegmentTransferPlan VSegmentTransferPlanner::Plan(

@@ -124,12 +124,14 @@ ErrorCode ValidatePublishedConfig(
         uint64_t length;
     };
     std::unordered_map<std::string, std::vector<OwnedQuota>> all_quotas;
-    std::set<std::string> partition_ids;
+    std::set<std::pair<std::string, std::string>> partition_profiles;
     for (const auto& partition : partitions) {
         auto validation = ValidatePartitionConfig(partition, detail);
         if (validation != ErrorCode::OK) return validation;
-        if (!partition_ids.insert(partition.partition_id).second)
-            return Invalid("duplicate partition config", detail);
+        if (!partition_profiles
+                 .emplace(partition.partition_id, partition.profile_name)
+                 .second)
+            return Invalid("duplicate partition/profile config", detail);
         auto current = current_generations.find(partition.partition_id);
         if (current != current_generations.end() &&
             partition.config_generation <= current->second)
@@ -385,7 +387,7 @@ ErrorCode BuildPartitionConfig(
     PartitionVSegmentConfig output;
     output.partition_id = partition_id;
     output.profile_name = profile_name;
-    output.initial_vsegment_count = 1;
+    output.initial_vsegment_count = profile->initial_vsegment_count;
     output.config_generation = snapshot.config_generation;
     for (const auto& extent : quota->extents)
         output.quotas.push_back(

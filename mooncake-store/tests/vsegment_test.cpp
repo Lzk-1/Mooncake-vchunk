@@ -74,8 +74,10 @@ class TestStateCommitter : public VSegmentStateCommitter {
         last_state = state;
         if (delay_create_begin && mutation == "vsegment_create_begin")
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (fail_next) {
+        if (fail_next || (!fail_mutation.empty() &&
+                          mutation == fail_mutation)) {
             fail_next = false;
+            fail_mutation.clear();
             if (detail) *detail = "injected persistence failure";
             return ErrorCode::PERSISTENT_FAIL;
         }
@@ -84,6 +86,7 @@ class TestStateCommitter : public VSegmentStateCommitter {
 
     bool fail_next{false};
     bool delay_create_begin{false};
+    std::string fail_mutation;
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
 };
@@ -134,6 +137,12 @@ PartitionVSegmentConfig Config() {
             .initial_vsegment_count = 1,
             .config_generation = 1,
             .quotas = {{"segment-a", 0, 512}, {"segment-b", 1024, 512}}};
+}
+
+VSegmentView View() {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    return allocation.view;
 }
 
 TEST(VSegmentConfigTest, RejectsInvalidLayoutAndOverlappingQuota) {
@@ -220,6 +229,28 @@ TEST(PartitionQuotaPlannerTest, RejectsInsufficientMemberSegments) {
     auto result = PartitionQuotaPlanner().Plan(request);
     EXPECT_EQ(result.error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
     EXPECT_NE(result.detail.find("requires 2 psegments"), std::string::npos);
+}
+
+TEST(VSegmentConfigTest, AllowsMultipleProfilesForOnePartition) {
+    auto dram = Profile();
+    dram.name = "dram";
+    auto nvme = Profile();
+    nvme.name = "nvme";
+    nvme.required_medium = "NVMe";
+    auto dram_config = Config();
+    dram_config.profile_name = "dram";
+    auto nvme_config = Config();
+    nvme_config.profile_name = "nvme";
+    nvme_config.quotas = {{"nvme-a", 0, 512}, {"nvme-b", 0, 512}};
+    std::vector<PSegmentGeometry> segments = {
+        {"segment-a", 2048, 8, "DRAM"},
+        {"segment-b", 2048, 8, "DRAM"},
+        {"nvme-a", 2048, 8, "NVMe"},
+        {"nvme-b", 2048, 8, "NVMe"}};
+    EXPECT_EQ(ValidatePublishedConfig({dram, nvme},
+                                      {dram_config, nvme_config}, segments,
+                                      {}),
+              ErrorCode::OK);
 }
 
 TEST(PartitionQuotaPlannerTest, RejectsOverlappingBalancedProfilePools) {
@@ -522,6 +553,26 @@ TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
     EXPECT_EQ(loaded.stripe_size, first.stripe_size);
     ASSERT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
     EXPECT_EQ(loaded.stripe_size, second.stripe_size);
+}
+
+TEST(VSegmentViewCacheTest, EvictsOldestViewAtCapacity) {
+    VSegmentViewCache cache(2);
+    auto first = View();
+    auto second = first;
+    second.vsegment_id = "vs-2";
+    second.checksum = ComputeViewChecksum(second);
+    auto third = first;
+    third.vsegment_id = "vs-3";
+    third.checksum = ComputeViewChecksum(third);
+
+    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
+    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
+    ASSERT_EQ(cache.Insert(third), ErrorCode::OK);
+    EXPECT_EQ(cache.Size(), 2u);
+    VSegmentView loaded;
+    EXPECT_FALSE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
+    EXPECT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
+    EXPECT_TRUE(cache.Find(third.partition_id, third.vsegment_id, &loaded));
 }
 
 TEST(VSegmentViewTest, KeepsProfileIdentityOutsideImmutableView) {
@@ -868,6 +919,36 @@ TEST(VSegmentManagerTest, ExposesLifecycleStatsAndGcsOperationTombstone) {
     EXPECT_EQ(manager.ForgetOperation("put-1"), ErrorCode::OBJECT_NOT_FOUND);
 }
 
+TEST(VSegmentManagerTest, RetriesIncompleteInitialPrecreation) {
+    auto committer = Committer();
+    committer->fail_mutation = "vsegment_create_commit";
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    EXPECT_EQ(manager.EnsureInitialVSegments(), ErrorCode::PERSISTENT_FAIL);
+    EXPECT_EQ(manager.Stats().preparing, 1u);
+
+    EXPECT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    EXPECT_EQ(manager.Stats().preparing, 0u);
+    EXPECT_EQ(manager.Stats().active, 1u);
+}
+
+TEST(VSegmentManagerTest, BoundsAbortedOperationTombstones) {
+    VSegmentManager manager(Config(), {Profile()}, Committer(), 2);
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    for (int index = 0; index < 3; ++index) {
+        const auto operation = "aborted-" + std::to_string(index);
+        ASSERT_TRUE(manager.ReservePut(allocation.view.vsegment_id, operation,
+                                       8));
+        ASSERT_EQ(manager.AbortPut(allocation.view.vsegment_id, operation),
+                  ErrorCode::OK);
+    }
+    const auto state = manager.Snapshot();
+    ASSERT_EQ(state.vsegments.size(), 1u);
+    EXPECT_LE(state.vsegments[0].logical_allocation.completed_operations.size(),
+              2u);
+    EXPECT_LE(state.operation_vsegments.size(), 2u);
+}
+
 TEST(VSegmentManagerTest, RecoveryReconcileUsesObjectMetadataAsAuthority) {
     VSegmentManager manager(Config(), {Profile()}, Committer());
     auto allocation = manager.Create("default");
@@ -1092,6 +1173,31 @@ TEST(VSegmentServiceTest, RejectsPartitionWithoutPublishedQuota) {
               ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
 }
 
+TEST(VSegmentServiceTest, PrecreatesConfiguredInitialVSegments) {
+    auto profile = Profile();
+    profile.initial_vsegment_count = 2;
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {profile};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    PartitionVSegmentSnapshot state;
+    ASSERT_EQ(service.SnapshotPartition("partition-1", &state),
+              ErrorCode::OK);
+    ASSERT_EQ(state.vsegments.size(), 2u);
+    EXPECT_TRUE(std::all_of(state.vsegments.begin(), state.vsegments.end(),
+                            [](const auto& item) {
+                                return item.lifecycle == Lifecycle::ACTIVE;
+                            }));
+}
+
 TEST(VSegmentServiceTest, ReconcilesManagerFromPartitionRouteEpoch) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;
@@ -1188,8 +1294,10 @@ TEST(VSegmentServiceTest, AbortReturnsReservedLogicalRange) {
     ASSERT_EQ(state.vsegments.size(), 1u);
     EXPECT_TRUE(state.vsegments[0].logical_allocation.reservations.empty());
     ASSERT_EQ(state.vsegments[0].logical_allocation.free_ranges.size(), 1u);
-    EXPECT_EQ(state.vsegments[0].logical_allocation.free_ranges[0],
-              (LogicalRange{0, state.vsegments[0].view.logical_capacity}));
+    EXPECT_EQ(state.vsegments[0].logical_allocation.free_ranges[0].offset,
+              0u);
+    EXPECT_EQ(state.vsegments[0].logical_allocation.free_ranges[0].length,
+              state.vsegments[0].view.logical_capacity);
 }
 
 TEST(VSegmentServiceTest, ReplicaAllocationFailureAbortsEarlierReservations) {
@@ -1209,8 +1317,10 @@ TEST(VSegmentServiceTest, ReplicaAllocationFailureAbortsEarlierReservations) {
 
     tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode> result;
     for (int attempt = 0; attempt < 40; ++attempt) {
+        const auto suffix = std::to_string(attempt);
         result = service.StartPutReplicasOwned(
-            "partition-1", {"replica-1", "replica-2"}, 64);
+            "partition-1",
+            {"replica-1-" + suffix, "replica-2-" + suffix}, 64);
         if (result || result.error() != ErrorCode::VSEGMENT_CREATING) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -1223,6 +1333,33 @@ TEST(VSegmentServiceTest, ReplicaAllocationFailureAbortsEarlierReservations) {
               ErrorCode::OK);
     ASSERT_EQ(state.vsegments.size(), 1u);
     EXPECT_TRUE(state.vsegments[0].logical_allocation.reservations.empty());
+}
+
+TEST(VSegmentServiceTest, SurfacesReplicaRollbackPersistenceFailure) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 256}, {"segment-b", 0, 256}}}};
+    auto committer = Committer();
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, committer),
+              ErrorCode::OK);
+    committer->fail_mutation = "logical_abort";
+
+    auto result = service.StartPutReplicasOwned(
+        "partition-1", {"rollback-1", "rollback-2"}, 64);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::PERSISTENT_FAIL);
+
+    PartitionVSegmentSnapshot state;
+    ASSERT_EQ(service.SnapshotPartition("partition-1", &state),
+              ErrorCode::OK);
+    ASSERT_EQ(state.vsegments.size(), 1u);
+    EXPECT_EQ(state.vsegments[0].logical_allocation.reservations.size(), 1u);
 }
 
 TEST(VSegmentServiceTest, RestoresMigratedPartitionAtNewRouteEpoch) {
@@ -1454,8 +1591,13 @@ TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
     ASSERT_TRUE(started && started->has_value());
     const auto states = vsegments->SnapshotAllPartitions();
     ASSERT_EQ(states.size(), 1u);
-    ASSERT_EQ(states.front().vsegments.size(), 1u);
-    EXPECT_EQ(states.front().vsegments.front().profile_name, "alternate");
+    ASSERT_EQ(states.front().vsegments.size(), 2u);
+    EXPECT_EQ(std::count_if(states.front().vsegments.begin(),
+                            states.front().vsegments.end(),
+                            [](const auto& state) {
+                                return state.profile_name == "alternate";
+                            }),
+              1);
 }
 
 }  // namespace

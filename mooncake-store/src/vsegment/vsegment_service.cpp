@@ -31,11 +31,16 @@ ErrorCode VSegmentService::AddPartition(
         result = manager->Restore(state, detail);
         if (result != ErrorCode::OK) return result;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (partitions_.count(partition_id))
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
-    partitions_.emplace(partition_id, std::move(manager));
-    return ErrorCode::OK;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (partitions_.count(partition_id))
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        partitions_.emplace(partition_id, manager);
+    }
+    // Keep the manager installed if precreation persistence fails. Its
+    // already-durable views must remain reserved, and the next ownership
+    // reconciliation can safely retry only the missing count.
+    return manager->EnsureInitialVSegments(detail);
 }
 
 ErrorCode VSegmentService::RemovePartition(const std::string& partition_id,
@@ -93,9 +98,12 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     // not install a live manager until the route atomically switches owner.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto current = partitions_.find(partition_id);
-        if (current != partitions_.end())
-            return current->second->SetRouteEpoch(route.route_epoch);
+        auto found = partitions_.find(partition_id);
+        if (found != partitions_.end()) {
+            auto result = found->second->SetRouteEpoch(route.route_epoch);
+            if (result != ErrorCode::OK) return result;
+            return found->second->EnsureInitialVSegments(detail);
+        }
     }
     return AddPartition(partition_id, route.route_epoch,
                         std::move(committer), recovered, detail);
@@ -165,9 +173,12 @@ VSegmentService::StartPutReplicasOwned(
         auto result = manager->StartPut(operation_id, length, profile_name,
                                         epoch, selected);
         if (!result) {
-            for (const auto& prior : results)
-                manager->AbortPut(prior.replica.vsegment_id,
-                                  prior.operation_id, epoch);
+            for (const auto& prior : results) {
+                const auto rollback = manager->AbortPut(
+                    prior.replica.vsegment_id, prior.operation_id, epoch);
+                if (rollback != ErrorCode::OK)
+                    return tl::make_unexpected(rollback);
+            }
             return tl::make_unexpected(result.error);
         }
         selected.push_back(result.replica.vsegment_id);

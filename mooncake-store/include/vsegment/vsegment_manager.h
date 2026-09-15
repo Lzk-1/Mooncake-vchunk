@@ -76,10 +76,12 @@ class VSegmentManager {
    public:
     VSegmentManager(PartitionVSegmentConfig config,
                     std::vector<VSegmentProfile> profiles,
-                    std::shared_ptr<VSegmentStateCommitter> committer);
+                    std::shared_ptr<VSegmentStateCommitter> committer,
+                    size_t max_operation_tombstones = 4096);
     VSegmentManager(const PartitionPhysicalQuotaSnapshot& quota_snapshot,
                     std::string partition_id,
-                    std::shared_ptr<VSegmentStateCommitter> committer);
+                    std::shared_ptr<VSegmentStateCommitter> committer,
+                    size_t max_operation_tombstones = 4096);
 
     VSegmentAllocationResult Create(const std::string& profile_name);
     // Hot-path API: starts at most one background creation per
@@ -93,6 +95,7 @@ class VSegmentManager {
                                     const std::vector<std::string>&
                                         excluded_vsegments = {});
     ErrorCode SetRouteEpoch(uint64_t route_epoch);
+    ErrorCode EnsureInitialVSegments(std::string* detail = nullptr);
     ReservationResult ReservePut(const std::string& vsegment_id,
                                  const std::string& operation_id,
                                  uint64_t length,
@@ -135,6 +138,8 @@ class VSegmentManager {
     PartitionVSegmentSnapshot SnapshotLocked() const;
     ErrorCode PersistLocked(const std::string& mutation,
                             std::string* detail = nullptr);
+    void TrimOperationTombstonesLocked(ManagedVSegment& managed,
+                                       size_t max_completed);
     std::string partition_id_;
     uint64_t config_generation_{0};
     std::string default_profile_;
@@ -148,6 +153,7 @@ class VSegmentManager {
     uint64_t route_epoch_{0};
     uint64_t metadata_revision_{0};
     std::shared_ptr<VSegmentStateCommitter> committer_;
+    size_t max_operation_tombstones_{4096};
     mutable std::mutex pending_mutex_;
     std::unordered_map<std::string,
                        std::shared_future<VSegmentAllocationResult>>

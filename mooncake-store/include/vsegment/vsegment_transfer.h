@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -34,16 +36,21 @@ class SegmentEndpointResolver {
 
 class VSegmentViewCache {
    public:
+    explicit VSegmentViewCache(size_t max_entries = 4096)
+        : max_entries_(std::max<size_t>(1, max_entries)) {}
     bool Find(const std::string& partition_id, const std::string& vsegment_id,
               VSegmentView* view) const;
     ErrorCode Insert(const VSegmentView& view,
                      std::string* detail = nullptr);
     void Erase(const std::string& partition_id,
                const std::string& vsegment_id);
+    size_t Size() const;
 
    private:
+    const size_t max_entries_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, VSegmentView> views_;
+    std::deque<std::string> insertion_order_;
 };
 
 struct EndpointTransferSubRequest {

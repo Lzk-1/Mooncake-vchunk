@@ -39,13 +39,16 @@ std::vector<PartitionVSegmentConfig> ConfigsForPartition(
 
 VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
                                  std::vector<VSegmentProfile> profiles,
-                                 std::shared_ptr<VSegmentStateCommitter> committer)
+                                 std::shared_ptr<VSegmentStateCommitter> committer,
+                                 size_t max_operation_tombstones)
     : partition_id_(config.partition_id),
       config_generation_(config.config_generation),
       default_profile_(config.profile_name),
       quota_configs_{std::move(config)},
       physical_allocator_(quota_configs_),
-      committer_(std::move(committer)) {
+      committer_(std::move(committer)),
+      max_operation_tombstones_(
+          std::max<size_t>(1, max_operation_tombstones)) {
     for (auto& profile : profiles) {
         profiles_.emplace(profile.name, std::move(profile));
     }
@@ -54,13 +57,16 @@ VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
 VSegmentManager::VSegmentManager(
     const PartitionPhysicalQuotaSnapshot& quota_snapshot,
     std::string partition_id,
-    std::shared_ptr<VSegmentStateCommitter> committer)
+    std::shared_ptr<VSegmentStateCommitter> committer,
+    size_t max_operation_tombstones)
     : partition_id_(std::move(partition_id)),
       config_generation_(quota_snapshot.config_generation),
       default_profile_(quota_snapshot.default_profile),
       quota_configs_(ConfigsForPartition(quota_snapshot, partition_id_)),
       physical_allocator_(quota_configs_),
-      committer_(std::move(committer)) {
+      committer_(std::move(committer)),
+      max_operation_tombstones_(
+          std::max<size_t>(1, max_operation_tombstones)) {
     for (const auto& profile : quota_snapshot.profile_specs)
         profiles_.emplace(profile.name, profile);
 }
@@ -237,6 +243,43 @@ ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
     return ErrorCode::OK;
 }
 
+ErrorCode VSegmentManager::EnsureInitialVSegments(std::string* detail) {
+    std::vector<std::pair<std::string, uint32_t>> targets;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& config : quota_configs_) {
+            const auto& name = config.profile_name;
+            const auto profile = profiles_.find(name);
+            if (profile == profiles_.end()) {
+                if (detail)
+                    *detail = "Partition quota references unknown profile";
+                return ErrorCode::INVALID_PARAMS;
+            }
+            uint32_t present = 0;
+            for (const auto& [id, managed] : vsegments_) {
+                (void)id;
+                if (managed.profile_name == name &&
+                    managed.lifecycle == Lifecycle::ACTIVE)
+                    ++present;
+            }
+            if (present < profile->second.initial_vsegment_count)
+                targets.emplace_back(name,
+                                     profile->second.initial_vsegment_count -
+                                         present);
+        }
+    }
+    for (const auto& [profile_name, count] : targets) {
+        for (uint32_t index = 0; index < count; ++index) {
+            auto result = Create(profile_name);
+            if (!result) {
+                if (detail) *detail = std::move(result.detail);
+                return result.error;
+            }
+        }
+    }
+    return ErrorCode::OK;
+}
+
 ReservationResult VSegmentManager::ReservePut(
     const std::string& vsegment_id, const std::string& operation_id,
     uint64_t length, uint64_t expected_route_epoch) {
@@ -324,10 +367,32 @@ ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
     const auto before = managed->second.logical_allocator->Snapshot();
     const auto result = managed->second.logical_allocator->Abort(operation_id);
     if (result != ErrorCode::OK) return result;
+    const auto operations_before = operation_vsegments_;
+    TrimOperationTombstonesLocked(managed->second,
+                                  max_operation_tombstones_);
     const auto persisted = PersistLocked("logical_abort");
-    if (persisted != ErrorCode::OK)
+    if (persisted != ErrorCode::OK) {
         managed->second.logical_allocator->Restore(before);
+        operation_vsegments_ = operations_before;
+    }
     return persisted;
+}
+
+void VSegmentManager::TrimOperationTombstonesLocked(
+    ManagedVSegment& managed, size_t max_completed) {
+    const auto snapshot = managed.logical_allocator->Snapshot();
+    if (snapshot.completed_operations.size() <= max_completed) return;
+    size_t to_remove =
+        snapshot.completed_operations.size() - max_completed;
+    for (const auto& operation : snapshot.completed_operations) {
+        if (to_remove == 0) return;
+        if (operation.outcome == OperationOutcome::COMMITTED) continue;
+        if (managed.logical_allocator->ForgetCompleted(
+                operation.operation_id) == ErrorCode::OK) {
+            operation_vsegments_.erase(operation.operation_id);
+            --to_remove;
+        }
+    }
 }
 
 ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
