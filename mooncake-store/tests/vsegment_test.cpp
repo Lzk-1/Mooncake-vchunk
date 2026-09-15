@@ -2,6 +2,7 @@
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
 #include "cvm/cvm_keys.h"
+#include "cvm/etcd_view_store.h"
 #include "vsegment/vsegment_ha.h"
 #include "vsegment/vsegment_service.h"
 #include "vsegment/vsegment_manager.h"
@@ -24,6 +25,24 @@ TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
               "/cvm/cluster-a/snapshot/vsegment_partition_quota");
     EXPECT_NE(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
               cvm::VSegmentPartitionQuotaSnapshotKey("cluster-b"));
+}
+
+TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
+    partition::PartitionRoute route{
+        "partition-7", "submaster-a", 9,
+        static_cast<int32_t>(partition::PartitionState::kMigrating),
+        "submaster-b"};
+    std::string encoded;
+    ASSERT_EQ(cvm::EtcdViewStore::SerializePartitionRoute(route, encoded),
+              ErrorCode::OK);
+    partition::PartitionRoute decoded;
+    ASSERT_EQ(cvm::EtcdViewStore::DeserializePartitionRoute(encoded, decoded),
+              ErrorCode::OK);
+    EXPECT_EQ(decoded.partition_id, route.partition_id);
+    EXPECT_EQ(decoded.owner_submaster_id, route.owner_submaster_id);
+    EXPECT_EQ(decoded.route_epoch, route.route_epoch);
+    EXPECT_EQ(decoded.state, route.state);
+    EXPECT_EQ(decoded.target_submaster_id, route.target_submaster_id);
 }
 
 class TestStateCommitter : public VSegmentStateCommitter {
