@@ -19,11 +19,17 @@ class VSegmentViewProvider {
                                std::string* detail = nullptr) = 0;
 };
 
+struct PSegmentLocation {
+    std::string endpoint;
+    uint64_t base_address{0};
+};
+YLT_REFL(PSegmentLocation, endpoint, base_address);
+
 class SegmentEndpointResolver {
    public:
     virtual ~SegmentEndpointResolver() = default;
-    virtual ErrorCode ResolveEndpoint(const std::string& segment_id,
-                                      std::string* endpoint) = 0;
+    virtual ErrorCode ResolveLocation(const std::string& segment_id,
+                                      PSegmentLocation* location) = 0;
 };
 
 class VSegmentViewCache {

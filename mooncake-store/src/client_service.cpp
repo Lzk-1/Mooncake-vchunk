@@ -228,13 +228,15 @@ class MasterClientSegmentEndpointResolver final
     explicit MasterClientSegmentEndpointResolver(MasterClient* master_client)
         : master_client_(master_client) {}
 
-    ErrorCode ResolveEndpoint(const std::string& segment_id,
-                              std::string* endpoint) override {
-        if (!master_client_ || !endpoint) return ErrorCode::INVALID_PARAMS;
+    ErrorCode ResolveLocation(
+        const std::string& segment_id,
+        vsegment::PSegmentLocation* location) override {
+        if (!master_client_ || !location) return ErrorCode::INVALID_PARAMS;
         auto result = master_client_->GetPSegmentEndpoint(segment_id);
         if (!result) return result.error();
-        *endpoint = std::move(result.value());
-        return endpoint->empty() ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
+        *location = std::move(result.value());
+        return location->endpoint.empty() ? ErrorCode::INVALID_PARAMS
+                                          : ErrorCode::OK;
     }
 
    private:

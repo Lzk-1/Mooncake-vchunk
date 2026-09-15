@@ -977,10 +977,10 @@ MasterClient::GetVSegmentView(const std::string& partition_id,
                       vsegment::VSegmentView>(partition_id, vsegment_id);
 }
 
-tl::expected<std::string, ErrorCode> MasterClient::GetPSegmentEndpoint(
-    const std::string& segment_id) {
-    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint, std::string>(
-        segment_id);
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+MasterClient::GetPSegmentEndpoint(const std::string& segment_id) {
+    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint,
+                      vsegment::PSegmentLocation>(segment_id);
 }
 
 vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(

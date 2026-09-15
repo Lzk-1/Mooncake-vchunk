@@ -2957,7 +2957,9 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
 bool MasterService::HasCompletedMemoryCacheReplica(
     const ObjectMetadata& metadata) {
     return metadata.HasReplica([](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed();
+        return (replica.is_memory_replica() ||
+                replica.is_vsegment_replica()) &&
+               replica.is_completed();
     });
 }
 
@@ -4500,7 +4502,8 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
 }
 
 bool MasterService::IsMemoryReplicaEvictable(const Replica& replica) const {
-    return replica.is_memory_replica() && replica.is_completed() &&
+    return (replica.is_memory_replica() || replica.is_vsegment_replica()) &&
+           replica.is_completed() &&
            replica.get_refcnt() == 0 && IsReplicaReadable(replica);
 }
 
@@ -4668,8 +4671,8 @@ MasterService::GetVSegmentView(const std::string& partition_id,
     return view;
 }
 
-tl::expected<std::string, ErrorCode> MasterService::GetPSegmentEndpoint(
-    const std::string& segment_id) {
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
     UUID id;
     if (!StringToUuid(segment_id, id))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -4679,7 +4682,8 @@ tl::expected<std::string, ErrorCode> MasterService::GetPSegmentEndpoint(
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     if (segment.te_endpoint.empty())
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    return segment.te_endpoint;
+    return vsegment::PSegmentLocation{
+        segment.te_endpoint, static_cast<uint64_t>(segment.base)};
 }
 
 vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
@@ -9988,6 +9992,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
+    auto has_vsegment_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_vsegment_replica);
+    };
     auto evict_replicas =
         [&, this](ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
@@ -10019,6 +10026,12 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                   TenantState& tenant_state,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (!offload_on_evict_) {
+                return evict_replicas(metadata, deferred_replicas);
+            }
+
+            // VSegment extents are already durable psegment allocations and
+            // cannot be passed to the memory-buffer offload pipeline.
+            if (has_vsegment_replica(metadata)) {
                 return evict_replicas(metadata, deferred_replicas);
             }
 
@@ -10262,6 +10275,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
+    auto has_vsegment_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_vsegment_replica);
+    };
 
     // Returns freed bytes. Returns 0 if offload-queued and no additional
     // replicas were evicted (all MEMORY replicas of the key are now pinned).
@@ -10275,6 +10291,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         if (!offload_on_evict_) {
             // Original behavior
+            return evict_replicas(metadata, deferred_replicas);
+        }
+
+        // VSegment replicas have no client-owned memory buffer to offload.
+        if (has_vsegment_replica(metadata)) {
             return evict_replicas(metadata, deferred_replicas);
         }
 
@@ -12915,6 +12936,9 @@ std::string MasterService::MediumForReplicaType(ReplicaType replica_type) {
 }
 
 std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
+    if (metadata.HasVSegmentReplica()) {
+        return "vsegment";
+    }
     if (metadata.HasMemReplica()) {
         return "cpu";
     }

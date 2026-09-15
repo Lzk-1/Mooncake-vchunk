@@ -214,8 +214,8 @@ class MasterClient {
     [[nodiscard]] tl::expected<vsegment::VSegmentView, ErrorCode>
     GetVSegmentView(const std::string& partition_id,
                     const std::string& vsegment_id);
-    [[nodiscard]] tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
+    [[nodiscard]] tl::expected<vsegment::PSegmentLocation, ErrorCode>
+    GetPSegmentEndpoint(const std::string& segment_id);
     [[nodiscard]] vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,

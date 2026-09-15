@@ -65,7 +65,7 @@ class WrappedMasterService {
         uint64_t client_trace_id = 0, const UUID& client_id = {});
     tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
         const std::string& partition_id, const std::string& vsegment_id);
-    tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
+    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
         const std::string& segment_id);
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,

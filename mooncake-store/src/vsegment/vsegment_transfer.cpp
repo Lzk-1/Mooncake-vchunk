@@ -106,17 +106,26 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
                                     replica.length, slices);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
     for (auto& request : resolved.requests) {
-        std::string endpoint;
-        auto result = endpoint_resolver_->ResolveEndpoint(request.segment_id,
-                                                          &endpoint);
-        if (result != ErrorCode::OK || endpoint.empty()) {
+        PSegmentLocation location;
+        auto result = endpoint_resolver_->ResolveLocation(request.segment_id,
+                                                          &location);
+        if (result != ErrorCode::OK || location.endpoint.empty()) {
             plan.error = result == ErrorCode::OK ? ErrorCode::SEGMENT_NOT_FOUND
                                                  : result;
             plan.detail = "cannot resolve endpoint for " + request.segment_id;
             plan.requests.clear();
             return plan;
         }
-        plan.requests.push_back({std::move(request), std::move(endpoint)});
+        if (request.physical_offset >
+            std::numeric_limits<uint64_t>::max() - location.base_address) {
+            plan.error = ErrorCode::INVALID_PARAMS;
+            plan.detail = "psegment target address overflows";
+            plan.requests.clear();
+            return plan;
+        }
+        request.physical_offset += location.base_address;
+        plan.requests.push_back(
+            {std::move(request), std::move(location.endpoint)});
     }
     return plan;
 }

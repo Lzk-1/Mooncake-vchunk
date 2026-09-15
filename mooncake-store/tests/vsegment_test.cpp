@@ -15,6 +15,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <limits>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -105,11 +106,13 @@ class TestViewProvider : public VSegmentViewProvider {
 
 class TestEndpointResolver : public SegmentEndpointResolver {
    public:
-    ErrorCode ResolveEndpoint(const std::string& segment_id,
-                              std::string* endpoint) override {
-        *endpoint = "endpoint://" + segment_id;
+    ErrorCode ResolveLocation(const std::string& segment_id,
+                              PSegmentLocation* location) override {
+        location->endpoint = "endpoint://" + segment_id;
+        location->base_address = base_address;
         return ErrorCode::OK;
     }
+    uint64_t base_address{4096};
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -383,12 +386,28 @@ TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
     ASSERT_TRUE(first) << first.detail;
     ASSERT_EQ(first.requests.size(), 3);
     EXPECT_EQ(first.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(first.requests[0].transfer.physical_offset, 4096 + 48);
     EXPECT_EQ(first.requests[1].endpoint, "endpoint://segment-b");
     EXPECT_EQ(provider.loads, 1);
 
     auto cached = planner.Plan(replica, {{2000, 96}});
     ASSERT_TRUE(cached);
     EXPECT_EQ(provider.loads, 1);
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    endpoints.base_address = std::numeric_limits<uint64_t>::max();
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 1, 8};
+    EXPECT_EQ(planner.Plan(replica, {{1000, 8}}).error,
+              ErrorCode::INVALID_PARAMS);
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {

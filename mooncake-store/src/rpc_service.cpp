@@ -333,7 +333,7 @@ WrappedMasterService::GetVSegmentView(const std::string& partition_id,
     return master_service_.GetVSegmentView(partition_id, vsegment_id);
 }
 
-tl::expected<std::string, ErrorCode>
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
 WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
     return master_service_.GetPSegmentEndpoint(segment_id);
 }
