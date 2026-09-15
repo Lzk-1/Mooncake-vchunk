@@ -39,7 +39,7 @@ struct CompletedOperationRecord {
     std::string allocation_id;
     OperationOutcome outcome{OperationOutcome::ABORTED};
     LogicalRange range;
-    uint64_t completion_revision{0};
+    struct_pack::compatible<uint64_t, 1> completion_revision;
 };
 YLT_REFL(CompletedOperationRecord, operation_id, allocation_id, outcome,
          range, completion_revision);

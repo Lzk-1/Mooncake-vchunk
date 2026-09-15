@@ -28,6 +28,24 @@ struct LegacySlotMetadataExport {
 };
 YLT_REFL(LegacySlotMetadataExport, slot, source_master_id, objects);
 
+struct LegacyCompletedOperationRecord {
+    std::string operation_id;
+    std::string allocation_id;
+    OperationOutcome outcome{OperationOutcome::ABORTED};
+    LogicalRange range;
+};
+YLT_REFL(LegacyCompletedOperationRecord, operation_id, allocation_id, outcome,
+         range);
+
+struct LegacyLogicalAllocationSnapshot {
+    uint64_t logical_capacity{0};
+    std::vector<LogicalRange> free_ranges;
+    std::vector<ReservationRecord> reservations;
+    std::vector<LegacyCompletedOperationRecord> completed_operations;
+};
+YLT_REFL(LegacyLogicalAllocationSnapshot, logical_capacity, free_ranges,
+         reservations, completed_operations);
+
 TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
     EXPECT_EQ(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
               "/cvm/cluster-a/snapshot/vsegment_partition_quota");
@@ -44,6 +62,19 @@ TEST(VSegmentMigrationTest, SlotExportAcceptsLegacyPayload) {
     EXPECT_EQ(decoded.slot, 7);
     EXPECT_EQ(decoded.source_master_id, "submaster-a");
     EXPECT_FALSE(decoded.vsegment_partition.has_value());
+}
+
+TEST(VSegmentSnapshotCompatibilityTest, ReadsLegacyCompletedOperation) {
+    LegacyLogicalAllocationSnapshot legacy{
+        64, {}, {}, {{"put-1", "object-1", OperationOutcome::COMMITTED,
+                      {0, 64}}}};
+    const auto bytes = struct_pack::serialize(legacy);
+    LogicalAllocationSnapshot decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.completed_operations.size(), 1u);
+    EXPECT_EQ(decoded.completed_operations[0].completion_revision.value_or(0),
+              0u);
 }
 
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
