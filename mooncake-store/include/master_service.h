@@ -205,6 +205,18 @@ class MasterService {
         const std::string& partition_id, const std::string& vsegment_id);
     tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
         const std::string& segment_id);
+    vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name = {});
+    ErrorCode VSegmentPutEnd(const vsegment::VSegmentDescriptor& replica,
+                             uint64_t route_epoch,
+                             const std::string& operation_id,
+                             const std::string& object_id);
+    ErrorCode VSegmentPutRevoke(const std::string& partition_id,
+                                const std::string& vsegment_id,
+                                uint64_t route_epoch,
+                                const std::string& operation_id);
 
     // vsegment 依赖注入（§12.3.8 预留）：PutStart/PutEnd/PutRevoke 的两阶段
     // 写语义委托给 vsegment 实现方。未注入时回退旧直达写路径。

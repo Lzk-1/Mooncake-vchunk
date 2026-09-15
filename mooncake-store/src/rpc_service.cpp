@@ -338,6 +338,29 @@ WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
     return master_service_.GetPSegmentEndpoint(segment_id);
 }
 
+vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    return master_service_.VSegmentPutStart(partition_id, route_epoch,
+                                            operation_id, length,
+                                            profile_name);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutEnd(
+    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    return master_service_.VSegmentPutEnd(replica, route_epoch, operation_id,
+                                          object_id);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    return master_service_.VSegmentPutRevoke(partition_id, vsegment_id,
+                                             route_epoch, operation_id);
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id,
@@ -2124,6 +2147,13 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetPSegmentEndpoint>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::VSegmentPutRevoke>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(

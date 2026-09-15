@@ -55,6 +55,21 @@ struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutStart> {
+    static constexpr const char* value = "VSegmentPutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutEnd> {
+    static constexpr const char* value = "VSegmentPutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutRevoke> {
+    static constexpr const char* value = "VSegmentPutRevoke";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
 };
@@ -904,6 +919,35 @@ tl::expected<std::string, ErrorCode> MasterClient::GetPSegmentEndpoint(
     const std::string& segment_id) {
     return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint, std::string>(
         segment_id);
+}
+
+vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    auto result =
+        invoke_rpc<&WrappedMasterService::VSegmentPutStart,
+                   vsegment::VSegmentPutStartResult>(
+            partition_id, route_epoch, operation_id, length, profile_name);
+    if (result) return std::move(result.value());
+    return {result.error(), operation_id, {}, "vsegment PutStart RPC failed"};
+}
+
+ErrorCode MasterClient::VSegmentPutEnd(
+    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    auto result = invoke_rpc<&WrappedMasterService::VSegmentPutEnd, ErrorCode>(
+        replica, route_epoch, operation_id, object_id);
+    return result ? result.value() : result.error();
+}
+
+ErrorCode MasterClient::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    auto result =
+        invoke_rpc<&WrappedMasterService::VSegmentPutRevoke, ErrorCode>(
+            partition_id, vsegment_id, route_epoch, operation_id);
+    return result ? result.value() : result.error();
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(

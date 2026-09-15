@@ -4330,6 +4330,33 @@ tl::expected<std::string, ErrorCode> MasterService::GetPSegmentEndpoint(
     return segment.te_endpoint;
 }
 
+vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    if (!vsegment_service_)
+        return {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, operation_id, {},
+                "vsegment service is not initialized"};
+    return vsegment_service_->StartPut(partition_id, route_epoch, operation_id,
+                                       length, profile_name);
+}
+
+ErrorCode MasterService::VSegmentPutEnd(
+    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    return vsegment_service_->CommitPut(replica, route_epoch, operation_id,
+                                        object_id);
+}
+
+ErrorCode MasterService::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    return vsegment_service_->AbortPut(partition_id, vsegment_id, route_epoch,
+                                       operation_id);
+}
+
 auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);

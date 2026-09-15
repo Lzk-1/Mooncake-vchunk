@@ -216,6 +216,16 @@ class MasterClient {
                     const std::string& vsegment_id);
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetPSegmentEndpoint(
         const std::string& segment_id);
+    [[nodiscard]] vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name = {});
+    [[nodiscard]] ErrorCode VSegmentPutEnd(
+        const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+        const std::string& operation_id, const std::string& object_id);
+    [[nodiscard]] ErrorCode VSegmentPutRevoke(
+        const std::string& partition_id, const std::string& vsegment_id,
+        uint64_t route_epoch, const std::string& operation_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex

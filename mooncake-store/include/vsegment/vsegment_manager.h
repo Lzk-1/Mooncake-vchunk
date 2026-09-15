@@ -48,6 +48,7 @@ struct VSegmentPutStartResult {
     std::string detail;
     explicit operator bool() const { return error == ErrorCode::OK; }
 };
+YLT_REFL(VSegmentPutStartResult, error, operation_id, replica, detail);
 
 struct VSegmentManagerStats {
     size_t preparing{0};
