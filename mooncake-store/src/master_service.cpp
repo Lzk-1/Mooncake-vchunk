@@ -12411,6 +12411,8 @@ std::string MasterService::MediumForReplicaType(ReplicaType replica_type) {
         case ReplicaType::LOCAL_DISK:
         case ReplicaType::NOF_SSD:
             return "disk";
+        case ReplicaType::VSEGMENT:
+            return "vsegment";
         case ReplicaType::ALL:
         default:
             return "cpu";

@@ -394,6 +394,21 @@ TEST(VSegmentViewTest, PersistsCreatingProfileIdentity) {
               ErrorCode::INVALID_PARAMS);
 }
 
+TEST(VSegmentReplicaTest, RuntimeMetadataPreservesLogicalDescriptor) {
+    VSegmentDescriptor expected{"partition-1", "vs-1", 128, 64};
+    Replica replica(expected, ReplicaStatus::COMPLETE);
+
+    EXPECT_EQ(replica.type(), ReplicaType::VSEGMENT);
+    EXPECT_TRUE(replica.is_vsegment_replica());
+    const auto descriptor = replica.get_descriptor();
+    ASSERT_TRUE(descriptor.is_vsegment_replica());
+    const auto& actual = descriptor.get_vsegment_descriptor();
+    EXPECT_EQ(actual.partition_id, expected.partition_id);
+    EXPECT_EQ(actual.vsegment_id, expected.vsegment_id);
+    EXPECT_EQ(actual.logical_offset, expected.logical_offset);
+    EXPECT_EQ(actual.length, expected.length);
+}
+
 TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
     auto config = Config();
     std::swap(config.quotas[0], config.quotas[1]);

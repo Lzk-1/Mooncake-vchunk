@@ -712,6 +712,22 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::VSEGMENT: {
+            const auto *vsegment_data =
+                std::get_if<VSegmentReplicaData>(&replica.data_);
+            if (!vsegment_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing VSegmentReplicaData"));
+            }
+            const auto &descriptor = vsegment_data->descriptor;
+            packer.pack_array(4);
+            packer.pack(descriptor.partition_id);
+            packer.pack(descriptor.vsegment_id);
+            packer.pack(descriptor.logical_offset);
+            packer.pack(descriptor.length);
+            break;
+        }
         default:
             // Unsupported replica type
             packer.pack(static_cast<int8_t>(255));
@@ -810,6 +826,30 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::VSEGMENT): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 4) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica VSEGMENT payload is not "
+                    "valid array[4]"));
+            }
+            auto *items = payload.via.array.ptr;
+            VSegmentDescriptor descriptor;
+            descriptor.partition_id = items[0].as<std::string>();
+            descriptor.vsegment_id = items[1].as<std::string>();
+            descriptor.logical_offset = items[2].as<uint64_t>();
+            descriptor.length = items[3].as<uint64_t>();
+            if (descriptor.partition_id.empty() ||
+                descriptor.vsegment_id.empty() || descriptor.length == 0) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica invalid VSEGMENT identity"));
+            }
+            replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;
         }
         default:
