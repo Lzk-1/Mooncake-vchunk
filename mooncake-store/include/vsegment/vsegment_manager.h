@@ -9,6 +9,7 @@
 
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
+#include "replica.h"
 
 namespace mooncake::vsegment {
 
@@ -27,9 +28,10 @@ struct PartitionVSegmentSnapshot {
     uint64_t route_epoch{0};
     uint64_t metadata_revision{0};
     std::vector<VSegmentStateSnapshot> vsegments;
+    std::unordered_map<std::string, std::string> operation_vsegments;
 };
 YLT_REFL(PartitionVSegmentSnapshot, partition_id, config_generation,
-         route_epoch, metadata_revision, vsegments);
+         route_epoch, metadata_revision, vsegments, operation_vsegments);
 
 class VSegmentStateCommitter {
    public:
@@ -37,6 +39,14 @@ class VSegmentStateCommitter {
     virtual ErrorCode Commit(const PartitionVSegmentSnapshot& state,
                              const std::string& mutation,
                              std::string* detail) = 0;
+};
+
+struct VSegmentPutStartResult {
+    ErrorCode error{ErrorCode::OK};
+    std::string operation_id;
+    VSegmentDescriptor replica;
+    std::string detail;
+    explicit operator bool() const { return error == ErrorCode::OK; }
 };
 
 // Partition-local facade intended to be owned by the Partition's SubMaster.
@@ -56,19 +66,27 @@ class VSegmentManager {
     // partition/profile and asks callers to retry while it is running.
     VSegmentAllocationResult RequestCreate(const std::string& profile_name,
                                            uint64_t retry_after_ms = 50);
+    VSegmentPutStartResult StartPut(const std::string& operation_id,
+                                    uint64_t length,
+                                    const std::string& profile_name = {},
+                                    uint64_t expected_route_epoch = 0);
     ErrorCode SetRouteEpoch(uint64_t route_epoch);
     ReservationResult ReservePut(const std::string& vsegment_id,
                                  const std::string& operation_id,
-                                 uint64_t length);
+                                 uint64_t length,
+                                 uint64_t expected_route_epoch = 0);
     ErrorCode CommitPut(const std::string& vsegment_id,
                         const std::string& operation_id,
                         const std::string& allocation_id,
-                        LogicalRange* range = nullptr);
+                        LogicalRange* range = nullptr,
+                        uint64_t expected_route_epoch = 0);
     ErrorCode AbortPut(const std::string& vsegment_id,
-                       const std::string& operation_id);
+                       const std::string& operation_id,
+                       uint64_t expected_route_epoch = 0);
     ErrorCode ReleaseObject(const std::string& vsegment_id,
                             const std::string& allocation_id,
-                            LogicalRange range);
+                            LogicalRange range,
+                            uint64_t expected_route_epoch = 0);
     ErrorCode TransitionLifecycle(const std::string& vsegment_id,
                                   Lifecycle target);
 
@@ -91,12 +109,14 @@ class VSegmentManager {
                             std::string* detail = nullptr);
     std::string partition_id_;
     uint64_t config_generation_{0};
+    std::string default_profile_;
     std::unordered_map<std::string, VSegmentProfile> profiles_;
     std::vector<PartitionVSegmentConfig> quota_configs_;
     PartitionQuotaAllocator physical_allocator_;
     CreationCoordinator profile_creation_coordinator_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, ManagedVSegment> vsegments_;
+    std::unordered_map<std::string, std::string> operation_vsegments_;
     uint64_t route_epoch_{0};
     uint64_t metadata_revision_{0};
     std::shared_ptr<VSegmentStateCommitter> committer_;

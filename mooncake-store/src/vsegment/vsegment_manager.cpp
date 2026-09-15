@@ -42,6 +42,7 @@ VSegmentManager::VSegmentManager(PartitionVSegmentConfig config,
                                  std::shared_ptr<VSegmentStateCommitter> committer)
     : partition_id_(config.partition_id),
       config_generation_(config.config_generation),
+      default_profile_(config.profile_name),
       quota_configs_{std::move(config)},
       physical_allocator_(quota_configs_),
       committer_(std::move(committer)) {
@@ -56,6 +57,7 @@ VSegmentManager::VSegmentManager(
     std::shared_ptr<VSegmentStateCommitter> committer)
     : partition_id_(std::move(partition_id)),
       config_generation_(quota_snapshot.config_generation),
+      default_profile_(quota_snapshot.default_profile),
       quota_configs_(ConfigsForPartition(quota_snapshot, partition_id_)),
       physical_allocator_(quota_configs_),
       committer_(std::move(committer)) {
@@ -97,6 +99,77 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
     return ManagerError(ErrorCode::VSEGMENT_CREATING,
                         "vsegment creation is in progress; retry_after_ms=" +
                             std::to_string(retry_after_ms));
+}
+
+VSegmentPutStartResult VSegmentManager::StartPut(
+    const std::string& operation_id, uint64_t length,
+    const std::string& requested_profile, uint64_t expected_route_epoch) {
+    const auto& profile_name =
+        requested_profile.empty() ? default_profile_ : requested_profile;
+    if (operation_id.empty() || length == 0 || !profiles_.count(profile_name))
+        return {ErrorCode::INVALID_PARAMS, operation_id, {},
+                "invalid PutStart operation, length, or profile"};
+
+    for (int pass = 0; pass < 2; ++pass) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+                return {ErrorCode::STALE_ROUTE, operation_id, {},
+                        "PutStart route epoch is stale"};
+            auto existing_operation = operation_vsegments_.find(operation_id);
+            if (existing_operation != operation_vsegments_.end()) {
+                auto managed = vsegments_.find(existing_operation->second);
+                if (managed == vsegments_.end())
+                    return {ErrorCode::INTERNAL_ERROR, operation_id, {},
+                            "PutStart operation references a missing vsegment"};
+                auto reservation =
+                    managed->second.logical_allocator->Reserve(operation_id,
+                                                               length);
+                if (!reservation)
+                    return {reservation.error, operation_id, {},
+                            std::move(reservation.detail)};
+                return {ErrorCode::OK,
+                        operation_id,
+                        {partition_id_, existing_operation->second,
+                         reservation.range.offset, reservation.range.length},
+                        {}};
+            }
+            for (auto& [id, managed] : vsegments_) {
+                if (managed.lifecycle != Lifecycle::ACTIVE ||
+                    managed.profile_name != profile_name)
+                    continue;
+                const auto before = managed.logical_allocator->Snapshot();
+                auto reservation =
+                    managed.logical_allocator->Reserve(operation_id, length);
+                if (!reservation) {
+                    if (reservation.error == ErrorCode::NO_AVAILABLE_HANDLE)
+                        continue;
+                    return {reservation.error, operation_id, {},
+                            std::move(reservation.detail)};
+                }
+                std::string detail;
+                operation_vsegments_.emplace(operation_id, id);
+                auto persisted = PersistLocked("logical_reserve", &detail);
+                if (persisted != ErrorCode::OK) {
+                    operation_vsegments_.erase(operation_id);
+                    managed.logical_allocator->Restore(before);
+                    return {persisted, operation_id, {}, std::move(detail)};
+                }
+                return {ErrorCode::OK,
+                        operation_id,
+                        {partition_id_, id, reservation.range.offset,
+                         reservation.range.length},
+                        {}};
+            }
+        }
+        auto creation = RequestCreate(profile_name);
+        if (!creation) {
+            return {creation.error, operation_id, {},
+                    std::move(creation.detail)};
+        }
+    }
+    return {ErrorCode::NO_AVAILABLE_HANDLE, operation_id, {},
+            "new vsegment has no allocatable logical range"};
 }
 
 VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
@@ -161,20 +234,31 @@ ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
 
 ReservationResult VSegmentManager::ReservePut(
     const std::string& vsegment_id, const std::string& operation_id,
-    uint64_t length) {
+    uint64_t length, uint64_t expected_route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+        return ReservationError(ErrorCode::STALE_ROUTE,
+                                "PutStart route epoch is stale");
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end() ||
         managed->second.lifecycle != Lifecycle::ACTIVE)
         return ReservationError(ErrorCode::SEGMENT_NOT_FOUND,
                                 "vsegment not found or not active");
+    auto existing = operation_vsegments_.find(operation_id);
+    if (existing != operation_vsegments_.end() &&
+        existing->second != vsegment_id)
+        return ReservationError(ErrorCode::INVALID_WRITE,
+                                "operation is reserved in another vsegment");
     const auto before = managed->second.logical_allocator->Snapshot();
     auto result = managed->second.logical_allocator->Reserve(operation_id,
                                                               length);
     if (!result) return result;
     std::string detail;
+    const bool inserted =
+        operation_vsegments_.emplace(operation_id, vsegment_id).second;
     const auto persisted = PersistLocked("logical_reserve", &detail);
     if (persisted != ErrorCode::OK) {
+        if (inserted) operation_vsegments_.erase(operation_id);
         managed->second.logical_allocator->Restore(before);
         return ReservationError(persisted, std::move(detail));
     }
@@ -184,8 +268,11 @@ ReservationResult VSegmentManager::ReservePut(
 ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
                                      const std::string& operation_id,
                                      const std::string& allocation_id,
-                                     LogicalRange* range) {
+                                     LogicalRange* range,
+                                     uint64_t expected_route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+        return ErrorCode::STALE_ROUTE;
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
     const auto before = managed->second.logical_allocator->Snapshot();
@@ -199,8 +286,11 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
 }
 
 ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
-                                    const std::string& operation_id) {
+                                    const std::string& operation_id,
+                                    uint64_t expected_route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+        return ErrorCode::STALE_ROUTE;
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
     const auto before = managed->second.logical_allocator->Snapshot();
@@ -214,8 +304,11 @@ ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
 
 ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
                                          const std::string& allocation_id,
-                                         LogicalRange range) {
+                                         LogicalRange range,
+                                         uint64_t expected_route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+        return ErrorCode::STALE_ROUTE;
     auto managed = vsegments_.find(vsegment_id);
     if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
     const auto before = managed->second.logical_allocator->Snapshot();
@@ -243,9 +336,25 @@ ErrorCode VSegmentManager::TransitionLifecycle(
     if (target == Lifecycle::RETIRED &&
         !managed->second.logical_allocator->Empty())
         return ErrorCode::OBJECT_REPLICA_BUSY;
+    std::vector<std::pair<std::string, std::string>> retired_operations;
+    if (target == Lifecycle::RETIRED) {
+        for (auto operation = operation_vsegments_.begin();
+             operation != operation_vsegments_.end();) {
+            if (operation->second == vsegment_id) {
+                retired_operations.push_back(*operation);
+                operation = operation_vsegments_.erase(operation);
+            } else {
+                ++operation;
+            }
+        }
+    }
     managed->second.lifecycle = target;
     const auto persisted = PersistLocked("lifecycle_transition");
-    if (persisted != ErrorCode::OK) managed->second.lifecycle = current;
+    if (persisted != ErrorCode::OK) {
+        managed->second.lifecycle = current;
+        operation_vsegments_.insert(retired_operations.begin(),
+                                    retired_operations.end());
+    }
     if (persisted == ErrorCode::OK && target == Lifecycle::RETIRED) {
         auto released = physical_allocator_.Release(managed->second.view);
         if (released != ErrorCode::OK) return released;
@@ -266,6 +375,7 @@ PartitionVSegmentSnapshot VSegmentManager::SnapshotLocked() const {
     snapshot.config_generation = config_generation_;
     snapshot.route_epoch = route_epoch_;
     snapshot.metadata_revision = metadata_revision_;
+    snapshot.operation_vsegments = operation_vsegments_;
     for (const auto& [id, managed] : vsegments_) {
         snapshot.vsegments.push_back(
             {managed.profile_name, managed.lifecycle, managed.view,
@@ -363,6 +473,13 @@ ErrorCode VSegmentManager::Restore(
             ManagedVSegment{state.profile_name, state.lifecycle, state.view,
                             std::move(logical_allocators[index])});
     }
+    for (const auto& [operation, vsegment] : snapshot.operation_vsegments) {
+        if (operation.empty() || !vsegments_.count(vsegment)) {
+            if (detail) *detail = "operation references missing vsegment";
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    operation_vsegments_ = snapshot.operation_vsegments;
     route_epoch_ = snapshot.route_epoch;
     metadata_revision_ = snapshot.metadata_revision;
     return ErrorCode::OK;

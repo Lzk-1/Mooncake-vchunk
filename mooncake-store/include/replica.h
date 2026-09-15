@@ -206,14 +206,15 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
-// vsegment 逻辑区间引用：对象数据不再直接指向物理 buffer/文件，而是通过
-// vsegment_id 引用一份不可变布局，再由 (logical_offset, length) 定位到
-// 逻辑空间中的一段。物理落点由 Store 侧按 VSegmentView 映射展开。
+// Logical location of one object replica inside an immutable vsegment view.
+// Physical endpoints remain resolved through SegmentRegistry at transfer time.
 struct VSegmentDescriptor {
+    std::string partition_id;
     std::string vsegment_id;
     uint64_t logical_offset{0};
     uint64_t length{0};
-    YLT_REFL(VSegmentDescriptor, vsegment_id, logical_offset, length);
+    YLT_REFL(VSegmentDescriptor, partition_id, vsegment_id, logical_offset,
+             length);
 };
 
 class Replica {

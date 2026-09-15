@@ -1,5 +1,7 @@
 #include "vsegment/vsegment.h"
 #include "vsegment/vsegment_runtime.h"
+#include "vsegment/vsegment_transfer.h"
+#include "vsegment/vsegment_ha.h"
 #include "vsegment/vsegment_manager.h"
 #include "vsegment/partition_quota_planner.h"
 
@@ -35,6 +37,31 @@ class TestStateCommitter : public VSegmentStateCommitter {
     bool delay_create_begin{false};
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
+};
+
+class TestViewProvider : public VSegmentViewProvider {
+   public:
+    ErrorCode LoadView(const std::string& partition_id,
+                       const std::string& vsegment_id, VSegmentView* output,
+                       std::string*) override {
+        ++loads;
+        if (view.partition_id != partition_id ||
+            view.vsegment_id != vsegment_id)
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        *output = view;
+        return ErrorCode::OK;
+    }
+    int loads{0};
+    VSegmentView view;
+};
+
+class TestEndpointResolver : public SegmentEndpointResolver {
+   public:
+    ErrorCode ResolveEndpoint(const std::string& segment_id,
+                              std::string* endpoint) override {
+        *endpoint = "endpoint://" + segment_id;
+        return ErrorCode::OK;
+    }
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -291,6 +318,41 @@ TEST(VSegmentResolverTest, RejectsViewWithInvalidChecksum) {
     allocation.view.members[0].base_offset += 8;
     auto resolved = ResolveTransfer(allocation.view, 0, 8, {{1000, 8}});
     EXPECT_EQ(resolved.error, ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    TestViewProvider provider;
+    provider.view = allocation.view;
+    TestEndpointResolver endpoints;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+
+    auto first = planner.Plan(replica, {{1000, 96}});
+    ASSERT_TRUE(first) << first.detail;
+    ASSERT_EQ(first.requests.size(), 3);
+    EXPECT_EQ(first.requests[0].endpoint, "endpoint://segment-a");
+    EXPECT_EQ(first.requests[1].endpoint, "endpoint://segment-b");
+    EXPECT_EQ(provider.loads, 1);
+
+    auto cached = planner.Plan(replica, {{2000, 96}});
+    ASSERT_TRUE(cached);
+    EXPECT_EQ(provider.loads, 1);
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentViewCache cache;
+    ASSERT_EQ(cache.Insert(allocation.view), ErrorCode::OK);
+    auto conflicting = allocation.view;
+    conflicting.members[0].base_offset += 8;
+    conflicting.checksum = ComputeViewChecksum(conflicting);
+    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
 }
 
 TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
@@ -553,6 +615,90 @@ TEST(VSegmentManagerTest, AsyncCreationReturnsRetryableStatus) {
                          committer->mutations.end(),
                          "vsegment_create_begin"),
               1);
+}
+
+TEST(VSegmentManagerTest, PutStartCreatesThenReturnsIdempotentDescriptor) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto creating = manager.StartPut("put-1", 96);
+    EXPECT_EQ(creating.error, ErrorCode::VSEGMENT_CREATING);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        started = manager.StartPut("put-1", 96);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+    }
+    ASSERT_TRUE(started) << started.detail;
+    EXPECT_EQ(started.replica.partition_id, "partition-1");
+    EXPECT_EQ(started.replica.logical_offset, 0);
+    EXPECT_EQ(started.replica.length, 96);
+
+    auto retry = manager.StartPut("put-1", 96);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry.replica.vsegment_id, started.replica.vsegment_id);
+    EXPECT_EQ(retry.replica.logical_offset, started.replica.logical_offset);
+}
+
+TEST(VSegmentManagerTest, FencesStalePartitionOwnerRequests) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    ASSERT_EQ(manager.SetRouteEpoch(7), ErrorCode::OK);
+    auto stale = manager.StartPut("put-1", 64, "default", 6);
+    EXPECT_EQ(stale.error, ErrorCode::STALE_ROUTE);
+    auto current = manager.StartPut("put-1", 64, "default", 7);
+    EXPECT_EQ(current.error, ErrorCode::VSEGMENT_CREATING);
+    EXPECT_EQ(manager.SetRouteEpoch(6), ErrorCode::STALE_ROUTE);
+}
+
+TEST(VSegmentHaTest, ReplaysContinuousPartitionRevisions) {
+    PartitionVSegmentSnapshot base;
+    base.partition_id = "partition-1";
+    base.config_generation = 1;
+    base.route_epoch = 4;
+    base.metadata_revision = 10;
+    auto next = base;
+    next.metadata_revision = 11;
+    VSegmentOpLogRecord record{"partition-1", 4, 11, "logical_reserve",
+                               next};
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_STATE;
+    struct_json::to_json(record, entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+
+    PartitionVSegmentSnapshot recovered;
+    std::string detail;
+    EXPECT_EQ(ReplayVSegmentState(base, {entry}, &recovered, &detail),
+              ErrorCode::OK)
+        << detail;
+    EXPECT_EQ(recovered.metadata_revision, 11);
+    EXPECT_EQ(recovered.route_epoch, 4);
+}
+
+TEST(VSegmentHaTest, RejectsRevisionGapAndStaleEpoch) {
+    PartitionVSegmentSnapshot base;
+    base.partition_id = "partition-1";
+    base.config_generation = 1;
+    base.route_epoch = 4;
+    base.metadata_revision = 10;
+    auto next = base;
+    next.metadata_revision = 12;
+    VSegmentOpLogRecord record{"partition-1", 4, 12, "logical_reserve",
+                               next};
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_STATE;
+    struct_json::to_json(record, entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    PartitionVSegmentSnapshot recovered;
+    EXPECT_EQ(ReplayVSegmentState(base, {entry}, &recovered),
+              ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+
+    record.metadata_revision = 11;
+    record.route_epoch = 3;
+    record.state.metadata_revision = 11;
+    record.state.route_epoch = 3;
+    struct_json::to_json(record, entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    EXPECT_EQ(ReplayVSegmentState(base, {entry}, &recovered),
+              ErrorCode::STALE_ROUTE);
 }
 
 }  // namespace
