@@ -686,6 +686,48 @@ void MasterService::StopSlotOwnerHeartbeat() {
 }
 
 #ifdef STORE_USE_ETCD
+namespace {
+
+ErrorCode LoadEffectivePartitionRoute(
+    const std::string& cluster_id, const std::string& partition_id,
+    partition::PartitionRoute& route, ViewVersionId& version) {
+    // KV Partition ids are decimal CVM slot ids. Until an explicit migration
+    // coordinator publishes a richer PartitionRoute, use the existing
+    // lease-backed SlotOwner record as the production ownership authority.
+    size_t parsed = 0;
+    unsigned long numeric = 0;
+    try {
+        numeric = std::stoul(partition_id, &parsed);
+    } catch (...) {
+        return cvm::EtcdViewStore::LoadPartitionRoute(
+            cluster_id, partition_id, route, version);
+    }
+    if (parsed != partition_id.size() ||
+        numeric > std::numeric_limits<uint16_t>::max()) {
+        return cvm::EtcdViewStore::LoadPartitionRoute(
+            cluster_id, partition_id, route, version);
+    }
+    cvm::SlotOwner slot_owner;
+    auto error = cvm::EtcdViewStore::LoadSlotOwner(
+        cluster_id, static_cast<uint16_t>(numeric), slot_owner, version);
+    if (error != ErrorCode::OK) return error;
+    if (slot_owner.primary_master_id.empty() || version <= 0)
+        return ErrorCode::INVALID_VERSION;
+    route.partition_id.partition_id = partition_id;
+    route.owner_submaster_id = slot_owner.primary_master_id;
+    route.route_epoch = static_cast<uint64_t>(version);
+    route.state = slot_owner.state ==
+                          static_cast<int32_t>(cvm::SlotState::kMigrating)
+                      ? static_cast<int32_t>(
+                            partition::PartitionState::kMigrating)
+                      : static_cast<int32_t>(
+                            partition::PartitionState::kActive);
+    route.target_submaster_id = slot_owner.migrating_to_master_id;
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
 ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     const bool kv_partition_enabled = enable_ha_ &&
                                       ha_backend_type_ == "etcd" &&
@@ -739,7 +781,17 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
         return ImportSlotMetadata(slot);
     };
     hb_config.on_slot_released = [this](uint16_t slot) {
-        (void)ExportSlotMetadata(slot);
+        const auto exported = ExportSlotMetadata(slot);
+        if (exported != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to export released vsegment Partition "
+                       << slot << ": " << toString(exported);
+            return;
+        }
+        const auto refresh = RefreshVSegmentOwnership();
+        if (refresh != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to detach released vsegment Partition "
+                       << slot << ": " << toString(refresh);
+        }
     };
     const bool lease_bound = hb_config.lease_id != 0;
     slot_owner_heartbeat_ =
@@ -786,8 +838,8 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
     for (const auto& partition_id : partition_ids) {
         partition::PartitionRoute route;
         ViewVersionId version = 0;
-        auto error = cvm::EtcdViewStore::LoadPartitionRoute(
-            cluster_id_, partition_id, route, version);
+        auto error = LoadEffectivePartitionRoute(cluster_id_, partition_id,
+                                                 route, version);
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
             if (recovered.count(partition_id)) complete = false;
             continue;
@@ -1299,7 +1351,7 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         }
         partition::PartitionRoute route;
         ViewVersionId version = 0;
-        auto route_error = cvm::EtcdViewStore::LoadPartitionRoute(
+        auto route_error = LoadEffectivePartitionRoute(
             cluster_id_, partition_id, route, version);
         if (route_error != ErrorCode::OK ||
             route.owner_submaster_id != master_id_) {
@@ -2982,6 +3034,7 @@ void MasterService::RebuildCacheTotalAccounting() {
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
+    ReleaseVSegmentReplicaState(metadata, pred_fn);
     auto replicas = metadata.PopReplicas(pred_fn);
     SyncCacheTotalAccounting(metadata);
     return replicas;
@@ -2989,9 +3042,49 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata) {
+    ReleaseVSegmentReplicaState(metadata,
+                                [](const Replica&) { return true; });
     auto replicas = metadata.PopReplicas();
     SyncCacheTotalAccounting(metadata);
     return replicas;
+}
+
+void MasterService::ReleaseVSegmentReplicaState(
+    const ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& pred_fn) {
+    if (!vsegment_service_) return;
+    const auto allocation_id =
+        metadata.tenant_id.MakeScopedKey(metadata.user_key);
+    metadata.VisitReplicas(
+        [&](const Replica& replica) {
+            return replica.is_vsegment_replica() && pred_fn(replica);
+        },
+        [&](const Replica& replica) {
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            ErrorCode result = ErrorCode::OBJECT_NOT_FOUND;
+            if ((replica.status() == ReplicaStatus::PROCESSING ||
+                 replica.status() == ReplicaStatus::INITIALIZED) &&
+                !descriptor.operation_id.empty()) {
+                result = vsegment_service_->AbortPutOwned(
+                    descriptor.partition_id, descriptor.vsegment_id,
+                    descriptor.operation_id);
+                // Same-size Upsert marks an already committed replica as
+                // PROCESSING. INVALID_WRITE distinguishes that state from a
+                // live reservation, so release its committed allocation.
+                if (result == ErrorCode::INVALID_WRITE) {
+                    result = vsegment_service_->ReleaseObject(descriptor,
+                                                              allocation_id);
+                }
+            } else {
+                result = vsegment_service_->ReleaseObject(descriptor,
+                                                          allocation_id);
+            }
+            if (result != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to discard vsegment replica state, key="
+                           << metadata.user_key
+                           << ", error=" << toString(result);
+            }
+        });
 }
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
@@ -5617,6 +5710,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+#ifdef STORE_USE_ETCD
+    if (!OwnsSlot(cvm::KeySlot(object_id.tenant_id, object_id.user_key)))
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+#endif
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -5921,6 +6018,10 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+#ifdef STORE_USE_ETCD
+    if (!OwnsSlot(cvm::KeySlot(object_id.tenant_id, object_id.user_key)))
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+#endif
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         MC_LOG(INFO) << "key=" << key << ", info=object_not_found";
@@ -6286,7 +6387,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // preempts immediately.
                 if (tenant_state.processing_keys.count(key) > 0) {
                     auto processing_replicas =
-                        metadata.PopReplicas(&Replica::fn_is_processing);
+                        PopReplicasWithCacheTotalAccounting(
+                            metadata, &Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
@@ -9433,7 +9535,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
                 // Persist OK (or HA disabled / never published) — apply.
                 auto replicas =
-                    metadata.PopReplicas(&Replica::fn_is_processing);
+                    PopReplicasWithCacheTotalAccounting(
+                        metadata, &Replica::fn_is_processing);
                 if (!replicas.empty()) {
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }

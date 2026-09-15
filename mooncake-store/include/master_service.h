@@ -1545,6 +1545,9 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
+    void ReleaseVSegmentReplicaState(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
