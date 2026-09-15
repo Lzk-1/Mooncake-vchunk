@@ -66,9 +66,9 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
             return a.segment_id < b.segment_id;
         });
 
-    // A physical byte can belong to only one profile. Profiles sharing a
-    // medium receive deterministic contiguous lanes before each lane is split
-    // evenly across Partitions.
+    // A physical byte can belong to only one profile. Balanced mode therefore
+    // requires profile pools to be disjoint; medium is the available hard
+    // selector in the current psegment inventory model.
     std::map<std::string, std::vector<const VSegmentProfileSpec*>> profiles;
     for (const auto& profile : snapshot.profile_specs) {
         std::string detail;
@@ -83,6 +83,10 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
         return Fail(ErrorCode::INVALID_PARAMS, "unknown default profile");
 
     for (const auto& [medium, medium_profiles] : profiles) {
+        if (medium_profiles.size() != 1) {
+            return Fail(ErrorCode::INVALID_PARAMS,
+                        "balanced profiles overlap psegment medium " + medium);
+        }
         auto pool = by_medium.find(medium);
         if (pool == by_medium.end() || pool->second.empty())
             return Fail(ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT,
@@ -95,9 +99,8 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
                                 " psegments");
         }
 
-        for (size_t profile_index = 0; profile_index < medium_profiles.size();
-             ++profile_index) {
-            const auto& profile = *medium_profiles[profile_index];
+        for (const auto* profile_ptr : medium_profiles) {
+            const auto& profile = *profile_ptr;
             std::map<std::string, PartitionPhysicalQuota> quotas;
             for (const auto& partition : ordered_partitions) {
                 auto& quota = quotas[partition];
@@ -111,11 +114,8 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
                         static_cast<long double>(segment.capacity) *
                         (1.0L - request.reserved_ratio))),
                     segment.io_alignment);
-                const uint64_t lane = AlignDown(
-                    usable / medium_profiles.size(), segment.io_alignment);
-                const uint64_t lane_begin = lane * profile_index;
                 const uint64_t per_partition = AlignDown(
-                    lane / ordered_partitions.size(),
+                    usable / ordered_partitions.size(),
                     std::max<uint64_t>(segment.io_alignment,
                                        profile.io_alignment));
                 for (size_t partition_index = 0;
@@ -124,7 +124,7 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
                     if (per_partition == 0) continue;
                     quotas[ordered_partitions[partition_index]].extents.push_back(
                         {segment.segment_id,
-                         lane_begin + per_partition * partition_index,
+                         per_partition * partition_index,
                          per_partition});
                 }
             }

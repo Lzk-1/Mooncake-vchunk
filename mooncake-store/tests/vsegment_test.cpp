@@ -222,6 +222,24 @@ TEST(PartitionQuotaPlannerTest, RejectsInsufficientMemberSegments) {
     EXPECT_NE(result.detail.find("requires 2 psegments"), std::string::npos);
 }
 
+TEST(PartitionQuotaPlannerTest, RejectsOverlappingBalancedProfilePools) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 1;
+    request.policy_digest = "policy";
+    request.default_profile = "first";
+    request.partition_ids = {"partition-1"};
+    auto first = Profile();
+    first.name = "first";
+    auto second = Profile();
+    second.name = "second";
+    request.profile_specs = {first, second};
+    request.segments = {{"segment-a", 1024, 8, "DRAM", true, true},
+                        {"segment-b", 1024, 8, "DRAM", true, true}};
+    auto result = PartitionQuotaPlanner().Plan(request);
+    EXPECT_EQ(result.error, ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(result.detail.find("overlap"), std::string::npos);
+}
+
 TEST(PartitionQuotaPlannerTest, ExcludesUnhealthySegments) {
     PartitionQuotaPlanRequest request;
     request.config_generation = 1;
