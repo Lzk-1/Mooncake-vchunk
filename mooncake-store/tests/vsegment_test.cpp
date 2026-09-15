@@ -641,6 +641,12 @@ TEST(VSegmentManagerTest, RestoresCommittedIdentityForExactRelease) {
     EXPECT_EQ(recovered.ReleaseObject(allocation.view.vsegment_id,
                                       "object-1", range),
               ErrorCode::OK);
+    const auto released = recovered.Snapshot();
+    ASSERT_EQ(released.vsegments.size(), 1u);
+    EXPECT_TRUE(released.operation_vsegments.empty());
+    EXPECT_TRUE(
+        released.vsegments.front().logical_allocation.completed_operations
+            .empty());
 }
 
 TEST(VSegmentManagerTest, SnapshotIsJsonSerializable) {

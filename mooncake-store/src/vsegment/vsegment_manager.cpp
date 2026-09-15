@@ -343,9 +343,30 @@ ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
     const auto result = managed->second.logical_allocator->Release(
         allocation_id, range);
     if (result != ErrorCode::OK) return result;
+    std::vector<std::pair<std::string, std::string>> forgotten_operations;
+    for (const auto& completed : before.completed_operations) {
+        if (completed.allocation_id != allocation_id) continue;
+        auto operation = operation_vsegments_.find(completed.operation_id);
+        if (operation != operation_vsegments_.end()) {
+            forgotten_operations.push_back(*operation);
+            operation_vsegments_.erase(operation);
+        }
+        const auto forgotten =
+            managed->second.logical_allocator->ForgetCompleted(
+                completed.operation_id);
+        if (forgotten != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            operation_vsegments_.insert(forgotten_operations.begin(),
+                                        forgotten_operations.end());
+            return forgotten;
+        }
+    }
     const auto persisted = PersistLocked("logical_release");
-    if (persisted != ErrorCode::OK)
+    if (persisted != ErrorCode::OK) {
         managed->second.logical_allocator->Restore(before);
+        operation_vsegments_.insert(forgotten_operations.begin(),
+                                    forgotten_operations.end());
+    }
     return persisted;
 }
 
