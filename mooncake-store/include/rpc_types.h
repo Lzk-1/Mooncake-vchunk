@@ -155,6 +155,29 @@ struct InterMasterHandshakeResponse {
 YLT_REFL(InterMasterHandshakeResponse, master_id, lease_id, owned_slot_count,
          version);
 
+/**
+ * @brief InterMasterExportSlot request (确定性哈希方案 §15.7): the new slot
+ * owner pulls the object-metadata export of `slot` from the previous owner.
+ * The previous owner serializes and returns its SlotMetadataExport without
+ * dropping local metadata until InterMasterAckSlotImported arrives.
+ */
+struct InterMasterExportSlotRequest {
+    uint16_t slot{0};
+    std::string requester_master_id;
+};
+YLT_REFL(InterMasterExportSlotRequest, slot, requester_master_id);
+
+/**
+ * @brief InterMasterAckSlotImported request: the new owner notifies the
+ * previous owner that `slot`'s metadata has been materialized locally, so the
+ * previous owner can drop its local metadata (and clear the staged export).
+ */
+struct InterMasterAckSlotImportedRequest {
+    uint16_t slot{0};
+    std::string importer_master_id;
+};
+YLT_REFL(InterMasterAckSlotImportedRequest, slot, importer_master_id);
+
 enum class JobType {
     DRAIN = 0,
 };

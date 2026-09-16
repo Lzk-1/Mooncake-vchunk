@@ -1,10 +1,6 @@
 #include "cvm/etcd_view_store.h"
 
-#include <algorithm>
-#include <chrono>
-#include <memory>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -56,50 +52,6 @@ ErrorCode ParseRangeJson(const std::string& json,
 
 // ---- JSON serialization ----
 
-ErrorCode EtcdViewStore::SerializeSlotOwner(const SlotOwner& owner,
-                                            std::string& out) {
-    try {
-        struct_json::to_json(owner, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSlotOwner failed: " << e.what();
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeserializeSlotOwner(const std::string& in,
-                                              SlotOwner& out) {
-    try {
-        struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSlotOwner failed: " << e.what();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::SerializeSegmentOwner(const SegmentOwner& owner,
-                                               std::string& out) {
-    try {
-        struct_json::to_json(owner, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSegmentOwner failed: " << e.what();
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeserializeSegmentOwner(const std::string& in,
-                                                 SegmentOwner& out) {
-    try {
-        struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSegmentOwner failed: " << e.what();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
 ErrorCode EtcdViewStore::SerializeMasterRegistration(const MasterRegistration& reg,
                                                      std::string& out) {
     try {
@@ -122,269 +74,24 @@ ErrorCode EtcdViewStore::DeserializeMasterRegistration(const std::string& in,
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::SerializeKvViewSnapshot(const KvViewSnapshot& snapshot,
-                                                 std::string& out) {
+ErrorCode EtcdViewStore::SerializeRingMeta(const RingMeta& meta,
+                                           std::string& out) {
     try {
-        struct_json::to_json(snapshot, out);
+        struct_json::to_json(meta, out);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeKvViewSnapshot failed: " << e.what();
+        LOG(ERROR) << "SerializeRingMeta failed: " << e.what();
         return ErrorCode::SERIALIZE_FAIL;
     }
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdViewStore::DeserializeKvViewSnapshot(const std::string& in,
-                                                   KvViewSnapshot& out) {
+ErrorCode EtcdViewStore::DeserializeRingMeta(const std::string& in,
+                                             RingMeta& out) {
     try {
         struct_json::from_json(out, in);
     } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeKvViewSnapshot failed: " << e.what();
+        LOG(ERROR) << "DeserializeRingMeta failed: " << e.what();
         return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::SerializeSegmentViewSnapshot(
-    const SegmentViewSnapshot& snapshot, std::string& out) {
-    try {
-        struct_json::to_json(snapshot, out);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "SerializeSegmentViewSnapshot failed: " << e.what();
-        return ErrorCode::SERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeserializeSegmentViewSnapshot(const std::string& in,
-                                                        SegmentViewSnapshot& out) {
-    try {
-        struct_json::from_json(out, in);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "DeserializeSegmentViewSnapshot failed: " << e.what();
-        return ErrorCode::DESERIALIZE_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
-// ---- KV view ----
-
-ErrorCode EtcdViewStore::LoadSlotOwner(const std::string& cluster_namespace,
-                                       uint16_t slot, SlotOwner& out,
-                                       ViewVersionId& version) {
-    const std::string key = SlotOwnerKey(cluster_namespace, slot);
-    std::string value;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return DeserializeSlotOwner(value, out);
-}
-
-ErrorCode EtcdViewStore::SaveSlotOwner(const std::string& cluster_namespace,
-                                       const SlotOwner& owner) {
-    const std::string key = SlotOwnerKey(cluster_namespace, owner.slot);
-    std::string value;
-    ErrorCode err = SerializeSlotOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-}
-
-ErrorCode EtcdViewStore::SaveSlotOwnerWithLease(
-    const std::string& cluster_namespace, const SlotOwner& owner,
-    EtcdLeaseId lease_id) {
-    const std::string key = SlotOwnerKey(cluster_namespace, owner.slot);
-    std::string value;
-    ErrorCode err = SerializeSlotOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return EtcdHelper::PutWithLease(key.data(), key.size(), value.data(),
-                                    value.size(), lease_id);
-}
-
-ErrorCode EtcdViewStore::SaveSlotOwnersWithLease(
-    const std::string& cluster_namespace,
-    const std::vector<SlotOwner>& owners, EtcdLeaseId lease_id) {
-    // etcd 默认单事务操作数上限为 128，因此按 128 个/批分块，每批一次事务写。
-    constexpr size_t kTxnOpLimit = 128;
-    for (size_t i = 0; i < owners.size(); i += kTxnOpLimit) {
-        const size_t n = std::min(kTxnOpLimit, owners.size() - i);
-        std::vector<std::string> keys;
-        std::vector<std::string> values;
-        keys.reserve(n);
-        values.reserve(n);
-        bool serialize_ok = true;
-        for (size_t j = 0; j < n; ++j) {
-            const SlotOwner& owner = owners[i + j];
-            keys.push_back(SlotOwnerKey(cluster_namespace, owner.slot));
-            std::string value;
-            if (SerializeSlotOwner(owner, value) != ErrorCode::OK) {
-                serialize_ok = false;
-                break;
-            }
-            values.push_back(std::move(value));
-        }
-        if (!serialize_ok) {
-            return ErrorCode::SERIALIZE_FAIL;
-        }
-        ErrorCode err = EtcdHelper::BatchPutWithLease(keys, values, lease_id);
-        if (err == ErrorCode::OK) {
-            continue;
-        }
-        // 某批事务失败：退化为逐条写，避免整批丢弃。仍失败则上抛。
-        LOG(WARNING) << "SaveSlotOwnersWithLease batch of " << n
-                     << " failed: " << err << ", falling back per-slot";
-        for (size_t j = 0; j < n; ++j) {
-            err = EtcdHelper::PutWithLease(keys[j].data(), keys[j].size(),
-                                           values[j].data(), values[j].size(),
-                                           lease_id);
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "SaveSlotOwnersWithLease per-slot put failed for "
-                           << keys[j] << ": " << err;
-                return err;
-            }
-        }
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode EtcdViewStore::DeleteSlotOwner(const std::string& cluster_namespace,
-                                         uint16_t slot) {
-    const std::string key = SlotOwnerKey(cluster_namespace, slot);
-    const std::string end = PrefixEnd(key);
-    return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
-                                   end.size());
-}
-
-ErrorCode EtcdViewStore::DeleteSlotOwnerIfOwnedBy(
-    const std::string& cluster_namespace, uint16_t slot,
-    const std::string& master_id) {
-    SlotOwner owner;
-    ViewVersionId version = 0;
-    ErrorCode err = LoadSlotOwner(cluster_namespace, slot, owner, version);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-        return ErrorCode::OK;  // already gone; nothing to clean up
-    }
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    if (owner.primary_master_id != master_id) {
-        return ErrorCode::OK;  // now owned by another master; leave it
-    }
-    return DeleteSlotOwner(cluster_namespace, slot);
-}
-
-ErrorCode EtcdViewStore::LoadAllSlotOwners(const std::string& cluster_namespace,
-                                           std::vector<SlotOwner>& out,
-                                           ViewVersionId& version) {
-    out.clear();
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    const std::string end = PrefixEnd(prefix);
-    std::string json;
-    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
-                                               end.data(), end.size(),
-                                               /*limit=*/0, json, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    std::vector<std::pair<std::string, std::string>> kvs;
-    err = ParseRangeJson(json, kvs);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    out.reserve(kvs.size());
-    for (const auto& kv : kvs) {
-        SlotOwner owner;
-        err = DeserializeSlotOwner(kv.second, owner);
-        if (err != ErrorCode::OK) {
-            return err;
-        }
-        out.push_back(std::move(owner));
-    }
-    return ErrorCode::OK;
-}
-
-// ---- Segment view (reserved) ----
-
-ErrorCode EtcdViewStore::LoadSegmentOwner(const std::string& cluster_namespace,
-                                          const std::string& segment_id,
-                                          SegmentOwner& out,
-                                          ViewVersionId& version) {
-    const std::string key = SegmentOwnerKey(cluster_namespace, segment_id);
-    std::string value;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return DeserializeSegmentOwner(value, out);
-}
-
-ErrorCode EtcdViewStore::SaveSegmentOwner(const std::string& cluster_namespace,
-                                          const SegmentOwner& owner) {
-    const std::string key =
-        SegmentOwnerKey(cluster_namespace, owner.segment_id);
-    std::string value;
-    ErrorCode err = SerializeSegmentOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-}
-
-ErrorCode EtcdViewStore::SaveSegmentOwnerWithLease(
-    const std::string& cluster_namespace, const SegmentOwner& owner,
-    EtcdLeaseId lease_id) {
-    const std::string key =
-        SegmentOwnerKey(cluster_namespace, owner.segment_id);
-    std::string value;
-    ErrorCode err = SerializeSegmentOwner(owner, value);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return EtcdHelper::PutWithLease(key.data(), key.size(), value.data(),
-                                    value.size(), lease_id);
-}
-
-ErrorCode EtcdViewStore::DeleteSegmentOwner(
-    const std::string& cluster_namespace, const std::string& segment_id) {
-    const std::string key = SegmentOwnerKey(cluster_namespace, segment_id);
-    const std::string end = PrefixEnd(key);
-    return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
-                                   end.size());
-}
-
-ErrorCode EtcdViewStore::LoadAllSegmentOwners(
-    const std::string& cluster_namespace, std::vector<SegmentOwner>& out,
-    ViewVersionId& version) {
-    out.clear();
-    const std::string prefix = SegmentViewPrefix(cluster_namespace);
-    const std::string end = PrefixEnd(prefix);
-    std::string json;
-    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
-                                               end.data(), end.size(),
-                                               /*limit=*/0, json, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    std::vector<std::pair<std::string, std::string>> kvs;
-    err = ParseRangeJson(json, kvs);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    out.reserve(kvs.size());
-    for (const auto& kv : kvs) {
-        SegmentOwner owner;
-        err = DeserializeSegmentOwner(kv.second, owner);
-        if (err != ErrorCode::OK) {
-            return err;
-        }
-        out.push_back(std::move(owner));
     }
     return ErrorCode::OK;
 }
@@ -425,19 +132,6 @@ ErrorCode EtcdViewStore::SaveSegmentDescriptor(
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
-ErrorCode EtcdViewStore::LoadSegmentDescriptor(
-    const std::string& cluster_namespace, const std::string& segment_id,
-    SegmentDescriptor& out, ViewVersionId& version) {
-    const std::string key =
-        SegmentNeutralEntityKey(cluster_namespace, segment_id);
-    std::string value;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    return DeserializeSegmentDescriptor(value, out);
-}
-
 ErrorCode EtcdViewStore::DeleteSegmentDescriptor(
     const std::string& cluster_namespace, const std::string& segment_id) {
     const std::string key =
@@ -447,7 +141,39 @@ ErrorCode EtcdViewStore::DeleteSegmentDescriptor(
                                    end.size());
 }
 
-// ---- Per-master segment mount (submaster_snapshot/{id}/segments/{seg}) ----
+ErrorCode EtcdViewStore::LoadAllSegmentDescriptors(
+    const std::string& cluster_namespace,
+    std::vector<SegmentDescriptor>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix = SegmentNeutralEntityPrefix(cluster_namespace);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    std::vector<std::pair<std::string, std::string>> kvs;
+    err = ParseRangeJson(json, kvs);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        SegmentDescriptor desc;
+        err = DeserializeSegmentDescriptor(kv.second, desc);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        out.push_back(std::move(desc));
+    }
+    return ErrorCode::OK;
+}
+
+// ---- Per-master segment mount (snapshot/{id}/segments/{seg}) ----
 
 ErrorCode EtcdViewStore::SerializeMountEntry(const MountEntry& entry,
                                              std::string& out) {
@@ -475,7 +201,7 @@ ErrorCode EtcdViewStore::SaveMountEntryWithLease(
     const std::string& cluster_namespace, const std::string& master_id,
     const MountEntry& entry, EtcdLeaseId lease_id) {
     const std::string key =
-        SubmasterSegmentMountKey(cluster_namespace, master_id, entry.segment_id);
+        SnapshotSegmentMountKey(cluster_namespace, master_id, entry.segment_id);
     std::string value;
     ErrorCode err = SerializeMountEntry(entry, value);
     if (err != ErrorCode::OK) {
@@ -489,18 +215,18 @@ ErrorCode EtcdViewStore::DeleteMountEntry(
     const std::string& cluster_namespace, const std::string& master_id,
     const std::string& segment_id) {
     const std::string key =
-        SubmasterSegmentMountKey(cluster_namespace, master_id, segment_id);
+        SnapshotSegmentMountKey(cluster_namespace, master_id, segment_id);
     const std::string end = PrefixEnd(key);
     return EtcdHelper::DeleteRange(key.data(), key.size(), end.data(),
                                    end.size());
 }
 
-ErrorCode EtcdViewStore::LoadSubmasterSegmentMounts(
-    const std::string& cluster_namespace, const std::string& master_id,
-    std::vector<MountEntry>& out, ViewVersionId& version) {
+ErrorCode EtcdViewStore::LoadAllMountEntries(
+    const std::string& cluster_namespace,
+    std::vector<std::pair<std::string, MountEntry>>& out,
+    ViewVersionId& version) {
     out.clear();
-    const std::string prefix =
-        SubmasterSegmentsPrefix(cluster_namespace, master_id);
+    const std::string prefix = SnapshotPrefix(cluster_namespace);
     const std::string end = PrefixEnd(prefix);
     std::string json;
     ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
@@ -516,14 +242,23 @@ ErrorCode EtcdViewStore::LoadSubmasterSegmentMounts(
         return err;
     }
 
+    // key = snapshot/{master_id}/segments/{segment_id}. Skip any other
+    // snapshot subkey (e.g. future reg/oplog) that may appear in the scan.
+    constexpr char kSegmentsMarker[] = "/segments/";
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
+        const std::size_t pos = kv.first.rfind(kSegmentsMarker);
+        if (pos == std::string::npos || pos <= prefix.size()) {
+            continue;
+        }
         MountEntry entry;
         err = DeserializeMountEntry(kv.second, entry);
         if (err != ErrorCode::OK) {
             return err;
         }
-        out.push_back(std::move(entry));
+        const std::string master_id =
+            kv.first.substr(prefix.size(), pos - prefix.size());
+        out.emplace_back(master_id, std::move(entry));
     }
     return ErrorCode::OK;
 }
@@ -608,144 +343,27 @@ ErrorCode EtcdViewStore::LoadAllMasters(
     return ErrorCode::OK;
 }
 
-// ---- Snapshots ----
-
-ErrorCode EtcdViewStore::SaveKvViewSnapshot(const std::string& cluster_namespace,
-                                            const KvViewSnapshot& snapshot) {
-    const std::string key = KvViewSnapshotKey(cluster_namespace);
+ErrorCode EtcdViewStore::SaveClusterMeta(const std::string& cluster_namespace,
+                                         const RingMeta& meta) {
+    const std::string key = ClusterMetaKey(cluster_namespace);
     std::string value;
-    ErrorCode err = SerializeKvViewSnapshot(snapshot, value);
+    ErrorCode err = SerializeRingMeta(meta, value);
     if (err != ErrorCode::OK) {
         return err;
     }
     return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
 }
 
-ErrorCode EtcdViewStore::SaveSegmentViewSnapshot(
-    const std::string& cluster_namespace, const SegmentViewSnapshot& snapshot) {
-    const std::string key = SegmentViewSnapshotKey(cluster_namespace);
+ErrorCode EtcdViewStore::LoadClusterMeta(const std::string& cluster_namespace,
+                                         RingMeta& out,
+                                         ViewVersionId& version) {
+    const std::string key = ClusterMetaKey(cluster_namespace);
     std::string value;
-    ErrorCode err = SerializeSegmentViewSnapshot(snapshot, value);
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
     if (err != ErrorCode::OK) {
         return err;
     }
-    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-}
-
-namespace {
-// Content-dedup cache for snapshot writes. `generated_at_ms` changes on every
-// build, so a naive "write every sync cycle" put a ~MB value per cycle per
-// master and exhausted the etcd backend quota with MVCC revisions. Skip the
-// write when the owners content is unchanged since this process last wrote it.
-// Process-local: after a content change each master writes once, which is
-// acceptable (two puts per change instead of one).
-std::mutex g_snapshot_dedup_mutex;
-std::unordered_map<std::string, std::string> g_last_snapshot_content;
-}  // namespace
-
-ErrorCode EtcdViewStore::BuildAndSaveKvViewSnapshot(
-    const std::string& cluster_namespace, ViewVersionId& version) {
-    std::vector<SlotOwner> owners;
-    ErrorCode err = LoadAllSlotOwners(cluster_namespace, owners, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    // Fingerprint over the owners only (exclude version/generated_at so the
-    // steady state produces a stable string).
-    std::string content;
-    try {
-        struct_json::to_json(owners, content);
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "BuildAndSaveKvViewSnapshot: fingerprint failed: "
-                     << e.what();
-        content.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        auto& last = g_last_snapshot_content["kv:" + cluster_namespace];
-        if (!content.empty() && last == content) {
-            return ErrorCode::OK;  // unchanged, skip the etcd write
-        }
-        last = content;
-    }
-
-    KvViewSnapshot snapshot;
-    snapshot.version = version;
-    snapshot.generated_at_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    snapshot.slot_owners = std::move(owners);
-    err = SaveKvViewSnapshot(cluster_namespace, snapshot);
-    if (err != ErrorCode::OK) {
-        // 写失败时回滚缓存，下轮重试完整写入。
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        g_last_snapshot_content.erase("kv:" + cluster_namespace);
-    }
-    return err;
-}
-
-ErrorCode EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
-    const std::string& cluster_namespace, ViewVersionId& version) {
-    std::vector<SegmentOwner> owners;
-    ErrorCode err = LoadAllSegmentOwners(cluster_namespace, owners, version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    std::string content;
-    try {
-        struct_json::to_json(owners, content);
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "BuildAndSaveSegmentViewSnapshot: fingerprint failed: "
-                     << e.what();
-        content.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        auto& last = g_last_snapshot_content["segment:" + cluster_namespace];
-        if (!content.empty() && last == content) {
-            return ErrorCode::OK;  // unchanged, skip the etcd write
-        }
-        last = content;
-    }
-
-    SegmentViewSnapshot snapshot;
-    snapshot.version = version;
-    snapshot.generated_at_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    snapshot.segment_owners = std::move(owners);
-    err = SaveSegmentViewSnapshot(cluster_namespace, snapshot);
-    if (err != ErrorCode::OK) {
-        std::lock_guard<std::mutex> lock(g_snapshot_dedup_mutex);
-        g_last_snapshot_content.erase("segment:" + cluster_namespace);
-    }
-    return err;
-}
-
-// ---- Watch ----
-
-ErrorCode EtcdViewStore::WatchKvView(const std::string& cluster_namespace,
-                                     ViewVersionId start_revision, void* ctx,
-                                     WatchCallback cb) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::WatchWithPrefixFromRevision(prefix.data(), prefix.size(),
-                                                   start_revision, ctx, cb);
-}
-
-ErrorCode EtcdViewStore::CancelWatchKvView(const std::string& cluster_namespace) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::CancelWatchWithPrefix(prefix.data(), prefix.size());
-}
-
-ErrorCode EtcdViewStore::WaitWatchKvViewStopped(
-    const std::string& cluster_namespace, int timeout_ms) {
-    const std::string prefix = KvViewPrefix(cluster_namespace);
-    return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
-                                                  timeout_ms);
+    return DeserializeRingMeta(value, out);
 }
 
 // ---- Master membership watch ----

@@ -825,7 +825,7 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     }
 
     const auto initial_slots = ResolveOwnedSlotsForCvm();
-    UpdateOwnedSlots(initial_slots);
+    UpdateExpectedSlots(initial_slots);
     if (vchunk_recovery_pending_) {
         const auto error = vchunk_manager_.Recover(
             getCurrentTimeInMilli(), [this](const VChunkMetadataRecord& record) {
@@ -849,14 +849,15 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     // 16384 slots without overwriting each other.
     hb_config.dynamic_slot_resolver = [this]() {
         auto slots = ResolveOwnedSlotsForCvm();
-        UpdateOwnedSlots(slots);
+        UpdateExpectedSlots(slots);
         return slots;
     };
     hb_config.lease_id = cvm_lease_id_;
-    // live primary → live primary 元数据交接（P4 技术债 1）：slot 平移时在
-    // 释放端导出对象元数据、在获得端导入，避免只依赖 standby 回放晋升路径。
+    // live primary → live primary 元数据交接（§15.7 RPC 直传）：释放端把对象
+    // 元数据 stage 到内存等新 owner 拉取，获得端经 InterMasterRpc 直传拉取导
+    // 入并回 ack。数据字节始终留在 segment，不搬移。
     hb_config.on_slot_acquired = [this](uint16_t slot) {
-        (void)ImportSlotMetadata(slot);
+        return ImportSlotMetadata(slot);
     };
     hb_config.on_slot_released = [this](uint16_t slot) {
         (void)ExportSlotMetadata(slot);
@@ -929,7 +930,7 @@ uint32_t MasterService::GetOwnedSlotCount() const {
         return 0;
     }
     return static_cast<uint32_t>(
-        std::count(owned_slot_lookup_.begin(), owned_slot_lookup_.end(), true));
+        std::count(ready_owned_.begin(), ready_owned_.end(), true));
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -1163,8 +1164,8 @@ void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
 #endif
 }
 
-ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
-    // 1. Collect this slot's object metadata across all shards.
+SlotMetadataExport MasterService::BuildSlotMetadataExport(
+    uint16_t slot) const {
     SlotMetadataExport export_payload;
     export_payload.slot = slot;
     export_payload.source_master_id = master_id_;
@@ -1192,21 +1193,10 @@ ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
             }
         }
     }
+    return export_payload;
+}
 
-    // 2. Serialize (struct_pack) and persist as a binary etcd value.
-    auto bytes = struct_pack::serialize(export_payload);
-    std::string value(bytes.begin(), bytes.end());
-    const std::string key = cvm::SlotMetadataExportKey(cluster_id_, slot);
-    ErrorCode err =
-        EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
-    if (err != ErrorCode::OK) {
-        LOG(WARNING) << "ExportSlotMetadata: put failed slot=" << slot
-                     << ", objects=" << export_payload.objects.size()
-                     << ", err=" << err;
-        return err;
-    }
-
-    // 3. Drop the exported objects from local metadata (release cleanup).
+ErrorCode MasterService::DropSlotMetadataLocal(uint16_t slot) {
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         MetadataShardAccessorRW shard(this, shard_idx);
         for (auto tenant_it = shard->tenants.begin();
@@ -1228,33 +1218,84 @@ ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
             }
         }
     }
-
     return ErrorCode::OK;
 }
 
+ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
+    // on_release：stage 导出到内存缓存，等新 owner RPC 拉取；不删本地、不写
+    // etcd——旧 owner 收到 InterMasterAckSlotImported 后才 DropSlotMetadataLocal。
+    SlotMetadataExport export_payload = BuildSlotMetadataExport(slot);
+    {
+        std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
+        pending_slot_exports_[slot] = std::move(export_payload);
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<SlotMetadataExport, ErrorCode>
+MasterService::InterMasterExportSlot(uint16_t slot,
+                                    const std::string& /*requester_master_id*/) {
+    // 优先返回 staged 缓存（旧 owner 已 release）；缓存缺失（新 owner 过早拉取）
+    // 则即时导出兜底。
+    {
+        std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
+        auto it = pending_slot_exports_.find(slot);
+        if (it != pending_slot_exports_.end()) {
+            return it->second;
+        }
+    }
+    SlotMetadataExport export_payload = BuildSlotMetadataExport(slot);
+    return export_payload;
+}
+
+tl::expected<bool, ErrorCode>
+MasterService::InterMasterAckSlotImported(uint16_t slot,
+                                         const std::string& /*importer_master_id*/) {
+    bool had_staged = false;
+    {
+        std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
+        had_staged = pending_slot_exports_.erase(slot) > 0;
+    }
+    ErrorCode err = DropSlotMetadataLocal(slot);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "InterMasterAckSlotImported: drop failed slot=" << slot
+                     << ", err=" << err;
+        return tl::make_unexpected(err);
+    }
+    return had_staged;
+}
+
 ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
-    const std::string key = cvm::SlotMetadataExportKey(cluster_id_, slot);
-    std::string value;
-    EtcdRevisionId revision = 0;
-    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, revision);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-        // No graceful export available (e.g. the previous owner died and the
-        // slot was reclaimed via standby replay). Nothing to pull.
+    // 推导迁移前一任 owner（旧环）。空环 / 无旧 owner（冷启动、旧 owner
+    // 消亡）→ 无可拉取对象，直接视为就绪（元数据为空，客户端重建）。
+    std::vector<std::string> prev_ids;
+    {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        prev_ids = cvm_prev_primary_ids_;
+    }
+    const auto old_owner = cvm::ResolveSlotOwnerOnRing(prev_ids, slot);
+    if (!old_owner || old_owner->empty() || *old_owner == master_id_) {
+        // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
         return ErrorCode::OK;
     }
-    if (err != ErrorCode::OK) {
-        LOG(WARNING) << "ImportSlotMetadata: get failed slot=" << slot
-                     << ", err=" << err;
-        return err;
+
+    if (!inter_master_rpc_) {
+        LOG(WARNING) << "ImportSlotMetadata: inter_master_rpc_ not ready, "
+                        "will retry slot="
+                     << slot;
+        return ErrorCode::INVALID_PARAMS;
     }
 
-    SlotMetadataExport export_payload;
-    if (struct_pack::deserialize_to(export_payload, value) !=
-        struct_pack::errc::ok) {
-        LOG(ERROR) << "ImportSlotMetadata: deserialize failed slot=" << slot
-                   << ", bytes=" << value.size();
-        return ErrorCode::DESERIALIZE_FAIL;
+    // RPC 直传拉取旧 owner 的 slot 元数据导出（不落 etcd）。
+    auto pull_result =
+        inter_master_rpc_->ExportSlot(*old_owner, slot, master_id_);
+    if (!pull_result.has_value()) {
+        LOG(WARNING) << "ImportSlotMetadata: RPC pull failed slot=" << slot
+                     << ", old_owner=" << *old_owner
+                     << ", err=" << toString(pull_result.error());
+        return pull_result.error();
     }
+    const SlotMetadataExport& export_payload = pull_result.value();
 
     const auto resolve = [](const StandbyObjectEntry& entry) {
         auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
@@ -1377,19 +1418,28 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         }
     }
 
-    // 技术债 3.3：一次性交接完成后删除 slot_meta 键，避免二进制导出残留。
-    // 删除失败仅告警不阻断——残留键会在下次 acquire 时被幂等重导。
-    const std::string end = cvm::PrefixEnd(key);
-    ErrorCode del_err =
-        EtcdHelper::DeleteRange(key.data(), key.size(), end.data(), end.size());
-    if (del_err != ErrorCode::OK) {
-        LOG(WARNING) << "ImportSlotMetadata: delete slot_meta failed slot="
-                     << slot << ", err=" << del_err;
+    // RPC 直传：导入完成后通知旧 owner 删除本地元数据（ack）。ack 失败仅告警
+    // 不阻断——旧 owner 残留元数据由其观察/lease 逻辑兜底清理。
+    auto ack_result =
+        inter_master_rpc_->AckSlotImported(*old_owner, slot, master_id_);
+    if (!ack_result.has_value()) {
+        LOG(WARNING) << "ImportSlotMetadata: ack failed slot=" << slot
+                     << ", old_owner=" << *old_owner
+                     << ", err=" << toString(ack_result.error());
     }
     return ErrorCode::OK;
 }
 #else
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
+
+SlotMetadataExport MasterService::BuildSlotMetadataExport(
+    uint16_t /*slot*/) const {
+    return {};
+}
+
+ErrorCode MasterService::DropSlotMetadataLocal(uint16_t /*slot*/) {
+    return ErrorCode::OK;
+}
 
 ErrorCode MasterService::ExportSlotMetadata(uint16_t /*slot*/) {
     return ErrorCode::OK;
@@ -1397,6 +1447,17 @@ ErrorCode MasterService::ExportSlotMetadata(uint16_t /*slot*/) {
 
 ErrorCode MasterService::ImportSlotMetadata(uint16_t /*slot*/) {
     return ErrorCode::OK;
+}
+
+tl::expected<SlotMetadataExport, ErrorCode>
+MasterService::InterMasterExportSlot(uint16_t /*slot*/,
+                                    const std::string& /*requester*/) {
+    return SlotMetadataExport{};
+}
+
+tl::expected<bool, ErrorCode> MasterService::InterMasterAckSlotImported(
+    uint16_t /*slot*/, const std::string& /*importer*/) {
+    return false;
 }
 #endif
 
@@ -1426,9 +1487,9 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     }
 
     // 2. Write per-master MountEntry to
-    //    submaster_snapshot/{master_id}/segments/{seg_id} (with lease —
-    //    auto-cleaned on master death; key=(master_id, segment_id) naturally
-    //    supports one-segment-multi-master without overwrite conflicts).
+    //    snapshot/{master_id}/segments/{seg_id} (with lease — auto-cleaned on
+    //    master death; key=(master_id, segment_id) naturally supports
+    //    one-segment-multi-master without overwrite conflicts).
     cvm::MountEntry mount;
     mount.segment_id = seg_id;
     mount.mounted_at_ms =
@@ -1440,7 +1501,7 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
             cluster_id_, master_id_, mount, cvm_lease_id_);
     } else {
         // Fallback: write persistent MountEntry without lease.
-        const std::string key = cvm::SubmasterSegmentMountKey(
+        const std::string key = cvm::SnapshotSegmentMountKey(
             cluster_id_, master_id_, seg_id);
         std::string value;
         cvm::EtcdViewStore::SerializeMountEntry(mount, value);
@@ -1452,6 +1513,9 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
                         "failed: segment="
                      << seg_id << " master=" << master_id_
                      << " err=" << err;
+    } else {
+        LOG(INFO) << "PublishSegmentOwnerForCvm done: segment=" << seg_id
+                  << " master=" << master_id_;
     }
 }
 
@@ -1462,15 +1526,56 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
     }
     const std::string id = UuidToString(segment_id);
 
-    // Delete only this master's MountEntry; the neutral SegmentDescriptor
-    // stays if other submasters still have this segment mounted.
+    // 先删除本 master 的挂载记录；描述符是否清理取决于是否还有其他 master
+    // 仍挂载该 segment（案 A：最后一个挂载者卸载时删除描述符）。
     ErrorCode err =
         cvm::EtcdViewStore::DeleteMountEntry(cluster_id_, master_id_, id);
     if (err != ErrorCode::OK) {
+        // 删除失败时本 master 的挂载记录可能仍在，后续扫描会因「排除了本机」
+        // 而误判为「无其它挂载」，进而误删描述符。保守返回，不删描述符。
         LOG(WARNING) << "RemoveSegmentOwnerForCvm DeleteMountEntry failed: "
                         "segment="
                      << id << " master=" << master_id_ << " err=" << err;
+        return;
     }
+
+    // 感知「是否还有其他 master 挂载」：全量扫描 snapshot/*/segments/，过滤
+    // 出 segment_id == id 且 master_id != 本机 的挂载记录。
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
+    ViewVersionId version = 0;
+    err = cvm::EtcdViewStore::LoadAllMountEntries(cluster_id_, mounts, version);
+    if (err != ErrorCode::OK) {
+        // 无法确认时保守返回，不删描述符（避免误删仍被其它 master 使用的描述符）。
+        LOG(WARNING) << "RemoveSegmentOwnerForCvm LoadAllMountEntries failed: "
+                        "segment="
+                     << id << " master=" << master_id_ << " err=" << err;
+        return;
+    }
+
+    for (const auto& m : mounts) {
+        if (m.second.segment_id == id && m.first != master_id_) {
+            LOG(INFO) << "RemoveSegmentOwnerForCvm kept descriptor (still "
+                         "mounted elsewhere): segment="
+                      << id << " master=" << master_id_;
+            return;  // 仍有其它 master 挂载，保留描述符。
+        }
+    }
+
+    // 最后一个挂载者已卸载：删除中立描述符。
+    // NOTE：与「新挂载者写挂载记录」存在跨节点 check-then-act 竞态窗口（挂载
+    // 顺序为 描述符→挂载记录，卸载为 挂载记录→扫描→描述符），极端交错下可能
+    // 误删描述符；影响仅限 HTTP /segment_view 的描述符字段，可被后续 mount
+    // 幂等重写自愈，故此处容忍该窗口，不做 key 布局/事务原子化。
+    err = cvm::EtcdViewStore::DeleteSegmentDescriptor(cluster_id_, id);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "RemoveSegmentOwnerForCvm DeleteSegmentDescriptor "
+                        "failed: segment="
+                     << id << " master=" << master_id_ << " err=" << err;
+        return;
+    }
+    LOG(INFO) << "RemoveSegmentOwnerForCvm done (last mount removed "
+                 "descriptor): segment="
+              << id << " master=" << master_id_;
 }
 
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
@@ -1489,34 +1594,33 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
         return cvm_last_resolved_owned_slots_;
     }
 
+    // 确定性哈希（§15.2）：primary_ids = 稳定排序(存活成员)[0:submaster_count]。
+    // 不再依赖 etcd 的 role 字段过滤——role 由「本机是否在 primary_ids 内」
+    // 纯函数推导，消除 role 未收敛时 standby 随机拿 slot 的竞态（§15.8 P2）。
     std::vector<std::string> ids;
     ids.reserve(masters.size());
     for (const auto& m : masters) {
-        // Only serving primaries own slots. Standbys do not publish slot
-        // ownership, so including them would strand part of the slot space.
-        if (static_cast<cvm::MasterRole>(m.role) != cvm::MasterRole::kPrimary) {
-            continue;
-        }
         if (!m.master_id.empty()) {
             ids.push_back(m.master_id);
         }
     }
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (submaster_count_ > 0 && ids.size() > submaster_count_) {
+        ids.resize(submaster_count_);
+    }
 
-    // etcd 注册表是唯一事实源：本机必须已注册为 primary 才参与分配。
-    // 不再无条件注入本机 master_id——否则任一节点视图缺失对端时都会以
-    // n==1 身份全量接管，是 slot 覆盖战的直接根源。
-    const bool self_registered =
+    // 本机是否在推导出的 primary_ids 内（而非 etcd role 字段）。
+    const bool self_primary =
         std::binary_search(ids.begin(), ids.end(), master_id_);
     std::vector<uint16_t> slots;
-    if (self_registered) {
+    if (self_primary) {
         // 技术债 3.1：一致性哈希环分配已提取到 cvm::ResolveOwnedSlotsOnRing
         // 纯函数（可单元测试），本机 owned slots 由 (ids, master_id_) 决定。
         slots = cvm::ResolveOwnedSlotsOnRing(ids, master_id_);
     } else {
-        LOG(WARNING) << "ResolveOwnedSlotsForCvm: self not registered as "
-                        "primary in etcd (masters="
+        LOG(WARNING) << "ResolveOwnedSlotsForCvm: self not in primary_ids "
+                        "(primaries="
                      << ids.size() << "), owning no slots this cycle";
     }
 
@@ -1535,6 +1639,11 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
 
         // P1：成员增删（根因）变化时才打印一次，避免心跳周期刷屏。
         if (cvm_last_primary_ids_ != ids) {
+            // 迁移旧环（Phase 3）：保存变化前的 primary 列表，供 gained slot
+            // 推导旧 owner（RPC 直传的「上一任 owner」）。仅 membership 变化时
+            // 更新；不变时维持旧值，使 acquire 失败后的下一轮重试仍能定位旧
+            // owner。
+            cvm_prev_primary_ids_ = cvm_last_primary_ids_;
             std::vector<std::string> joined;
             std::vector<std::string> left;
             std::set_difference(ids.begin(), ids.end(),
@@ -1580,19 +1689,19 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
     std::vector<std::string> ids;
     ids.reserve(masters.size());
     for (const auto& m : masters) {
-        if (static_cast<cvm::MasterRole>(m.role) != cvm::MasterRole::kPrimary) {
-            continue;
-        }
         if (!m.master_id.empty()) {
             ids.push_back(m.master_id);
         }
     }
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (submaster_count_ > 0 && ids.size() > submaster_count_) {
+        ids.resize(submaster_count_);
+    }
 
-    // 与 ResolveOwnedSlotsForCvm 保持一致：纯粹以 etcd 注册表计算环，
-    // 不注入本机 master_id，保证所有权判定与认领发布使用同一个环。
-    // 解析结果为空（注册表无 primary）时由调用方跳过转发。
+    // 与 ResolveOwnedSlotsForCvm 保持一致：primary_ids = 稳定排序(存活成员)
+    // [0:submaster_count]，不依赖 etcd role 字段，客户端/服务端推导同环。
+    // 解析结果为空（无存活成员）时由调用方跳过转发。
     return cvm::ResolveSlotOwnerOnRing(ids, slot);
 }
 #else
@@ -1605,14 +1714,17 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 }
 #endif
 
-void MasterService::UpdateOwnedSlots(const std::vector<uint16_t>& slots) {
+void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
-    owned_slot_lookup_.assign(cvm::kSlotCount, false);
+    expected_owned_.assign(cvm::kSlotCount, false);
     for (uint16_t slot : slots) {
         if (slot < cvm::kSlotCount) {
-            owned_slot_lookup_[slot] = true;
+            expected_owned_[slot] = true;
         }
     }
+    // Phase 1：行为等价——ready 全量跟随 expected（Phase 3/4 再解耦，由
+    // MarkSlotsReady 在元数据导入完成后单独置位）。
+    ready_owned_ = expected_owned_;
     owned_slots_ready_ = true;
     // 一致性哈希环分配结果（3.1）：仅在数量变化（含首次解析）时打印，
     // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
@@ -1623,7 +1735,20 @@ void MasterService::UpdateOwnedSlots(const std::vector<uint16_t>& slots) {
         owned_slot_count_logged_ = true;
         last_logged_owned_count_ = slots.size();
     }
-    VLOG(1) << "UpdateOwnedSlots: " << slots.size() << " slots";
+    VLOG(1) << "UpdateExpectedSlots: " << slots.size() << " slots";
+}
+
+void MasterService::MarkSlotsReady(const std::vector<uint16_t>& slots) {
+    std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (ready_owned_.size() != cvm::kSlotCount) {
+        ready_owned_.assign(ready_owned_.size(), false);
+        ready_owned_.resize(cvm::kSlotCount, false);
+    }
+    for (uint16_t slot : slots) {
+        if (slot < ready_owned_.size()) {
+            ready_owned_[slot] = true;
+        }
+    }
 }
 
 bool MasterService::OwnsSlot(uint16_t slot) const {
@@ -1631,7 +1756,7 @@ bool MasterService::OwnsSlot(uint16_t slot) const {
     if (!owned_slots_ready_) {
         return true;  // partition 未启用或尚未解析过，放行
     }
-    return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
+    return slot < ready_owned_.size() && ready_owned_[slot];
 }
 
 bool MasterService::OwnsVChunkSlot(uint16_t slot) const {
@@ -1641,7 +1766,21 @@ bool MasterService::OwnsVChunkSlot(uint16_t slot) const {
                                  submaster_count_ > 1;
         return !partitioned;
     }
-    return slot < owned_slot_lookup_.size() && owned_slot_lookup_[slot];
+    return slot < ready_owned_.size() && ready_owned_[slot];
+}
+
+ErrorCode MasterService::CheckSlotServiceability(uint16_t slot) const {
+    std::shared_lock<std::shared_mutex> lock(owned_slots_mutex_);
+    if (!owned_slots_ready_) {
+        return ErrorCode::OK;  // partition 未启用或尚未解析，放行
+    }
+    if (slot < ready_owned_.size() && ready_owned_[slot]) {
+        return ErrorCode::OK;
+    }
+    if (slot < expected_owned_.size() && expected_owned_[slot]) {
+        return ErrorCode::SLOT_MIGRATING;
+    }
+    return ErrorCode::SLOT_NOT_OWNED;
 }
 
 MasterService::~MasterService() {
@@ -1923,7 +2062,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // 幂等重挂载（segment 已存在）同样要把 client 标记为 OK：Ping 仅凭
     // ok_client_ 判定 client_status，若此处不标记，HeartbeatAllSubmasters
     // 收到 NEED_REMOUNT 后用普通 mount 重挂永远无法消除该状态，形成
-    // 每秒一次的 remount 死循环（并持续写 OpLog/segment_view）。
+    // 每秒一次的 remount 死循环（并持续写 OpLog / segment 视图记录）。
     // 注意：必须在 segment 访问释放之后再加 client_mutex_，避免与
     // ClientMonitorFunc 的 client_mutex_ -> segment access 加锁顺序倒挂。
     if (mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS) {
@@ -3822,7 +3961,7 @@ void MasterService::RestoreFromStandbySnapshot(
                 }
                 // 同步到读路径 owned-slot 位图（A1），让新 primary 立即按
                 // 最新分区拒绝非本机 slot 的读请求。
-                UpdateOwnedSlots(owned_slots);
+                UpdateExpectedSlots(owned_slots);
             }
         }
     }
@@ -4353,7 +4492,13 @@ auto MasterService::GetReplicaList(const std::string& key,
     // 尝试向 slot owner 转发（方案 B 第二阶段）；转发失败再回退到
     // SLOT_NOT_OWNED 让客户端根据最新 slot→master 视图重新路由。
     const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
-    if (!OwnsSlot(slot)) {
+    const ErrorCode svc = CheckSlotServiceability(slot);
+    if (svc == ErrorCode::SLOT_MIGRATING) {
+        LOG(INFO) << "GetReplicaList rejected with SLOT_MIGRATING: key=" << key
+                  << " slot=" << slot;
+        return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+    }
+    if (svc == ErrorCode::SLOT_NOT_OWNED) {
 #ifdef STORE_USE_ETCD
         auto owner = ResolveSlotOwnerMasterId(slot);
         if (owner && !owner->empty() && *owner != master_id_ &&
@@ -4525,8 +4670,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::map<std::string, std::vector<size_t>> forward_groups;
     for (size_t i = 0; i < keys.size(); ++i) {
         const uint16_t slot = cvm::KeySlot(normalized_tenant, keys[i]);
-        if (OwnsSlot(slot)) {
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc == ErrorCode::OK) {
             local_indices.push_back(i);
+            continue;
+        }
+        if (svc == ErrorCode::SLOT_MIGRATING) {
+            results[i] = tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
             continue;
         }
 #ifdef STORE_USE_ETCD
@@ -5130,7 +5280,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     {
         const uint16_t slot =
             cvm::KeySlot(object_id.tenant_id, object_id.user_key);
-        if (!OwnsSlot(slot)) {
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc == ErrorCode::SLOT_MIGRATING) {
+            LOG(INFO) << "PutStart rejected with SLOT_MIGRATING: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+        }
+        if (svc == ErrorCode::SLOT_NOT_OWNED) {
             auto owner = ResolveSlotOwnerMasterId(slot);
             if (owner && !owner->empty() && *owner != master_id_ &&
                 inter_master_rpc_) {
@@ -5771,7 +5927,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     {
         const uint16_t slot =
             cvm::KeySlot(object_id.tenant_id, object_id.user_key);
-        if (!OwnsSlot(slot)) {
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc == ErrorCode::SLOT_MIGRATING) {
+            LOG(INFO) << "UpsertStart rejected with SLOT_MIGRATING: key="
+                      << object_id.user_key << " slot=" << slot;
+            return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+        }
+        if (svc == ErrorCode::SLOT_NOT_OWNED) {
             auto owner = ResolveSlotOwnerMasterId(slot);
             if (owner && !owner->empty() && *owner != master_id_ &&
                 inter_master_rpc_) {

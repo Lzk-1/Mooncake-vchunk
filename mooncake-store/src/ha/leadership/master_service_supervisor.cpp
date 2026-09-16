@@ -195,26 +195,26 @@ class CvmMembershipCoordinator : public cvm::CvmServiceDelegate {
         stop_serve_signal_ = std::move(signal);
     }
 
-    // Blocks until either a role change or a kv-view change is pending, then
-    // clears both so each change is consumed exactly once. The caller re-reads
-    // CvmController::GetCurrentRole() as the source of truth after waking; a
-    // standby uses the wake-up to re-bind its replay sources.
-    void WaitForRoleOrViewChange() {
+    // Blocks until either a role change or a membership (member set) change is
+    // pending, then clears both so each change is consumed exactly once. The
+    // caller re-reads CvmController::GetCurrentRole() as the source of truth
+    // after waking; a standby uses the wake-up to re-bind its replay sources.
+    void WaitForRoleOrMembershipChange() {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this] {
-            return has_pending_role_ || has_pending_view_;
+            return has_pending_role_ || has_pending_membership_;
         });
         has_pending_role_ = false;
-        has_pending_view_ = false;
+        has_pending_membership_ = false;
     }
 
     void OnSlotAcquired(uint16_t /*slot*/) override {}
     void OnSlotReleased(uint16_t /*slot*/) override {}
 
-    void OnKvViewChanged() override {
+    void OnMembershipChanged() override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            has_pending_view_ = true;
+            has_pending_membership_ = true;
         }
         cv_.notify_all();
     }
@@ -258,7 +258,7 @@ class CvmMembershipCoordinator : public cvm::CvmServiceDelegate {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool has_pending_role_{false};
-    bool has_pending_view_{false};
+    bool has_pending_membership_{false};
     std::function<void()> stop_serve_signal_;
 };
 
@@ -277,7 +277,7 @@ std::optional<MasterView> BuildCvmObservedLeader(
     }
     MasterView view;
     view.leader_address = primary;
-    view.view_version = cvm_controller->GetKvViewVersion();
+    view.view_version = 0;  // 无持久化 kv_view；版本不再用于路由。
     return view;
 }
 
@@ -422,8 +422,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 server.init_ibv();
             }
 
-            const ViewVersionId view_version =
-                cvm_controller ? cvm_controller->GetKvViewVersion() : 0;
+            const ViewVersionId view_version = 0;  // 无持久化 kv_view 版本。
             mooncake::WrappedMasterServiceConfig wrapped_config(config,
                                                                  view_version);
             // In HA serving-primary mode, snapshot bootstrap belongs to
@@ -522,7 +521,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                              accept_standby_runtime_updates,
                              cvm_controller);
             if (cvm_controller) {
-                cvm_membership_coordinator.WaitForRoleOrViewChange();
+                cvm_membership_coordinator.WaitForRoleOrMembershipChange();
             } else {
                 // Unreachable: target_role is kPrimary when cvm_controller is
                 // null. Sleep defensively to avoid a tight loop.

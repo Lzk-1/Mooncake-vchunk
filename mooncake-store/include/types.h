@@ -378,6 +378,9 @@ enum class ErrorCode : int32_t {
     SLOT_NOT_OWNED =
         -1012,  ///< The key's slot is not owned by this master (KV partition
                 ///< rebalanced); the client should re-route.
+    SLOT_MIGRATING =
+        -1013,  ///< The key's slot is owned (ring-derived) but its metadata is
+                ///< still being imported; the client should back off and retry.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

@@ -15,6 +15,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "cvm/cvm_types.h"
+#include "metadata_store.h"
 #include "rpc_client_io_context.h"
 #include "rpc_types.h"
 #include "types.h"
@@ -144,6 +145,22 @@ class InterMasterRpcClient {
         const std::string& master_id, const UUID& client_id,
         const std::string& key, const std::string& tenant_id,
         uint64_t slice_length, const ReplicateConfig& config);
+
+    // ----- Slot-metadata migration (确定性哈希方案 §15.7: RPC 直传) -----
+
+    // Pulls the object-metadata export for `slot` from the previous owner
+    // `master_id`. The previous owner keeps its local metadata and the staged
+    // export until AckSlotImported arrives.
+    tl::expected<SlotMetadataExport, ErrorCode> ExportSlot(
+        const std::string& master_id, uint16_t slot,
+        const std::string& requester_master_id);
+
+    // Notifies the previous owner that `slot`'s metadata has been imported,
+    // so it can drop its local metadata (and clear the staged export).
+    // Returns true when the previous owner had a staged export.
+    tl::expected<bool, ErrorCode> AckSlotImported(
+        const std::string& master_id, uint16_t slot,
+        const std::string& importer_master_id);
 
    private:
     // Generic sync RPC invocation against the pool of the target address.

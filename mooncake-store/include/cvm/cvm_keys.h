@@ -29,46 +29,6 @@ inline std::string CvmNamespaceRoot(const std::string& cluster_namespace) {
     return std::string(kCvmRootPrefix) + cluster_namespace + "/";
 }
 
-// "/cvm/<namespace>/kv_view/"
-inline std::string KvViewPrefix(const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "kv_view/";
-}
-
-// "/cvm/<namespace>/kv_view/slot/<slot:05d>"
-inline std::string SlotOwnerKey(const std::string& cluster_namespace,
-                                uint16_t slot) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%05u", static_cast<unsigned>(slot));
-    return KvViewPrefix(cluster_namespace) + "slot/" + buf;
-}
-
-// "/cvm/<namespace>/slot_meta/"
-inline std::string SlotMetadataExportPrefix(
-    const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "slot_meta/";
-}
-
-// "/cvm/<namespace>/slot_meta/<slot:05d>"
-// Binary (struct_pack) value holding the object metadata exported by the
-// previous live primary owner during a slot handoff.
-inline std::string SlotMetadataExportKey(const std::string& cluster_namespace,
-                                         uint16_t slot) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%05u", static_cast<unsigned>(slot));
-    return SlotMetadataExportPrefix(cluster_namespace) + buf;
-}
-
-// "/cvm/<namespace>/segment_view/"
-inline std::string SegmentViewPrefix(const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "segment_view/";
-}
-
-// "/cvm/<namespace>/segment_view/<segment_id>"
-inline std::string SegmentOwnerKey(const std::string& cluster_namespace,
-                                   const std::string& segment_id) {
-    return SegmentViewPrefix(cluster_namespace) + segment_id;
-}
-
 // "/cvm/<namespace>/masters/"
 inline std::string MasterRegistrationPrefix(
     const std::string& cluster_namespace) {
@@ -81,22 +41,14 @@ inline std::string MasterRegistrationKey(const std::string& cluster_namespace,
     return MasterRegistrationPrefix(cluster_namespace) + master_id;
 }
 
-// "/cvm/<namespace>/snapshot/"
-inline std::string SnapshotPrefix(const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "snapshot/";
+// "/cvm/<namespace>/cluster_meta" — RingMeta { submaster_count } (§15.3).
+// Cluster-wide ring configuration read by clients to locally derive the same
+// primary ring as the masters.
+inline std::string ClusterMetaKey(const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "cluster_meta";
 }
 
-// "/cvm/<namespace>/snapshot/kv_view"
-inline std::string KvViewSnapshotKey(const std::string& cluster_namespace) {
-    return SnapshotPrefix(cluster_namespace) + "kv_view";
-}
-
-// "/cvm/<namespace>/snapshot/segment_view"
-inline std::string SegmentViewSnapshotKey(const std::string& cluster_namespace) {
-    return SnapshotPrefix(cluster_namespace) + "segment_view";
-}
-
-// ---- New segment neutral entity + per-master mount keys (§3 view layout) ----
+// ---- Segment neutral entity + per-master mount keys (§3 view layout) ----
 
 // "/cvm/<namespace>/segments/"
 inline std::string SegmentNeutralEntityPrefix(
@@ -110,23 +62,22 @@ inline std::string SegmentNeutralEntityKey(const std::string& cluster_namespace,
     return SegmentNeutralEntityPrefix(cluster_namespace) + segment_id;
 }
 
-// "/cvm/<namespace>/submaster_snapshot/"
-inline std::string SubmasterSnapshotPrefix(
-    const std::string& cluster_namespace) {
-    return CvmNamespaceRoot(cluster_namespace) + "submaster_snapshot/";
+// "/cvm/<namespace>/snapshot/"
+inline std::string SnapshotPrefix(const std::string& cluster_namespace) {
+    return CvmNamespaceRoot(cluster_namespace) + "snapshot/";
 }
 
-// "/cvm/<namespace>/submaster_snapshot/<master_id>/segments/"
-inline std::string SubmasterSegmentsPrefix(
+// "/cvm/<namespace>/snapshot/<master_id>/segments/"
+inline std::string SnapshotSegmentsPrefix(
     const std::string& cluster_namespace, const std::string& master_id) {
-    return SubmasterSnapshotPrefix(cluster_namespace) + master_id + "/segments/";
+    return SnapshotPrefix(cluster_namespace) + master_id + "/segments/";
 }
 
-// "/cvm/<namespace>/submaster_snapshot/<master_id>/segments/<segment_id>"
-inline std::string SubmasterSegmentMountKey(
+// "/cvm/<namespace>/snapshot/<master_id>/segments/<segment_id>"
+inline std::string SnapshotSegmentMountKey(
     const std::string& cluster_namespace, const std::string& master_id,
     const std::string& segment_id) {
-    return SubmasterSegmentsPrefix(cluster_namespace, master_id) + segment_id;
+    return SnapshotSegmentsPrefix(cluster_namespace, master_id) + segment_id;
 }
 
 // ---- Partition 路由（§5.2 vsegment 预留接口，仅存 owner + epoch）----

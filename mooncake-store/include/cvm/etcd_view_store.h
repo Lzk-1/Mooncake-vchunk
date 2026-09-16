@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cvm/cvm_types.h"
@@ -11,79 +12,22 @@
 namespace mooncake {
 namespace cvm {
 
-// Serialization + etcd persistence for CVM views, built on EtcdHelper.
+// Serialization + etcd persistence for CVM metadata, built on EtcdHelper.
 //
-// All KV view / segment view / master registration records are stored in etcd
-// under the CVM key space (see cvm_keys.h). ViewVersionId is the etcd revision
-// returned by the read, so consumers can watch from it without gaps.
+// Master registration, ring metadata, segment neutral descriptors and
+// per-master segment mounts are stored in etcd under the CVM key space (see
+// cvm_keys.h). ViewVersionId is the etcd revision returned by reads, so
+// consumers can watch from it without gaps.
 class EtcdViewStore {
    public:
     // ---- JSON serialization ----
-    static ErrorCode SerializeSlotOwner(const SlotOwner& owner,
-                                        std::string& out);
-    static ErrorCode DeserializeSlotOwner(const std::string& in,
-                                          SlotOwner& out);
-
-    static ErrorCode SerializeSegmentOwner(const SegmentOwner& owner,
-                                           std::string& out);
-    static ErrorCode DeserializeSegmentOwner(const std::string& in,
-                                             SegmentOwner& out);
-
     static ErrorCode SerializeMasterRegistration(const MasterRegistration& reg,
                                                  std::string& out);
     static ErrorCode DeserializeMasterRegistration(const std::string& in,
                                                    MasterRegistration& out);
 
-    static ErrorCode SerializeKvViewSnapshot(const KvViewSnapshot& snapshot,
-                                             std::string& out);
-    static ErrorCode DeserializeKvViewSnapshot(const std::string& in,
-                                               KvViewSnapshot& out);
-    static ErrorCode SerializeSegmentViewSnapshot(
-        const SegmentViewSnapshot& snapshot, std::string& out);
-    static ErrorCode DeserializeSegmentViewSnapshot(const std::string& in,
-                                                    SegmentViewSnapshot& out);
-
-    // ---- KV view ----
-    static ErrorCode LoadSlotOwner(const std::string& cluster_namespace,
-                                   uint16_t slot, SlotOwner& out,
-                                   ViewVersionId& version);
-    static ErrorCode SaveSlotOwner(const std::string& cluster_namespace,
-                                   const SlotOwner& owner);
-    static ErrorCode SaveSlotOwnerWithLease(const std::string& cluster_namespace,
-                                            const SlotOwner& owner,
-                                            EtcdLeaseId lease_id);
-    // Batch variant: writes many slot owners in chunks (each chunk a single
-    // etcd txn, all bound to lease_id). Speeds up bulk acquisition (e.g. cold
-    // start / node add) that would otherwise issue one RPC per slot. Falls back
-    // to per-slot puts within a chunk if the txn fails; returns an error only
-    // if a final per-slot put fails.
-    static ErrorCode SaveSlotOwnersWithLease(
-        const std::string& cluster_namespace,
-        const std::vector<SlotOwner>& owners, EtcdLeaseId lease_id);
-    static ErrorCode DeleteSlotOwner(const std::string& cluster_namespace,
-                                     uint16_t slot);
-    static ErrorCode DeleteSlotOwnerIfOwnedBy(
-        const std::string& cluster_namespace, uint16_t slot,
-        const std::string& master_id);
-    static ErrorCode LoadAllSlotOwners(const std::string& cluster_namespace,
-                                       std::vector<SlotOwner>& out,
-                                       ViewVersionId& version);
-
-    // ---- Segment view (reserved, deprecated in favor of per-master mount) ----
-    static ErrorCode LoadSegmentOwner(const std::string& cluster_namespace,
-                                      const std::string& segment_id,
-                                      SegmentOwner& out,
-                                      ViewVersionId& version);
-    static ErrorCode SaveSegmentOwner(const std::string& cluster_namespace,
-                                      const SegmentOwner& owner);
-    static ErrorCode SaveSegmentOwnerWithLease(
-        const std::string& cluster_namespace, const SegmentOwner& owner,
-        EtcdLeaseId lease_id);
-    static ErrorCode DeleteSegmentOwner(const std::string& cluster_namespace,
-                                        const std::string& segment_id);
-    static ErrorCode LoadAllSegmentOwners(const std::string& cluster_namespace,
-                                          std::vector<SegmentOwner>& out,
-                                          ViewVersionId& version);
+    static ErrorCode SerializeRingMeta(const RingMeta& meta, std::string& out);
+    static ErrorCode DeserializeRingMeta(const std::string& in, RingMeta& out);
 
     // ---- Segment neutral entity (segments/{segment_id}) ----
     static ErrorCode SerializeSegmentDescriptor(const SegmentDescriptor& desc,
@@ -92,14 +36,13 @@ class EtcdViewStore {
                                                   SegmentDescriptor& out);
     static ErrorCode SaveSegmentDescriptor(const std::string& cluster_namespace,
                                            const SegmentDescriptor& desc);
-    static ErrorCode LoadSegmentDescriptor(const std::string& cluster_namespace,
-                                           const std::string& segment_id,
-                                           SegmentDescriptor& out,
-                                           ViewVersionId& version);
     static ErrorCode DeleteSegmentDescriptor(
         const std::string& cluster_namespace, const std::string& segment_id);
+    static ErrorCode LoadAllSegmentDescriptors(
+        const std::string& cluster_namespace,
+        std::vector<SegmentDescriptor>& out, ViewVersionId& version);
 
-    // ---- Per-master segment mount (submaster_snapshot/{id}/segments/{seg}) ----
+    // ---- Per-master segment mount (snapshot/{id}/segments/{seg}) ----
     static ErrorCode SerializeMountEntry(const MountEntry& entry,
                                          std::string& out);
     static ErrorCode DeserializeMountEntry(const std::string& in,
@@ -111,9 +54,13 @@ class EtcdViewStore {
     static ErrorCode DeleteMountEntry(const std::string& cluster_namespace,
                                       const std::string& master_id,
                                       const std::string& segment_id);
-    static ErrorCode LoadSubmasterSegmentMounts(
-        const std::string& cluster_namespace, const std::string& master_id,
-        std::vector<MountEntry>& out, ViewVersionId& version);
+    // Aggregates every mount record under snapshot/*/segments/, returning
+    // (master_id, MountEntry) pairs so consumers can map each mount back to
+    // its owning master.
+    static ErrorCode LoadAllMountEntries(
+        const std::string& cluster_namespace,
+        std::vector<std::pair<std::string, MountEntry>>& out,
+        ViewVersionId& version);
 
     // ---- Master registration ----
     static ErrorCode RegisterMaster(const std::string& cluster_namespace,
@@ -126,19 +73,14 @@ class EtcdViewStore {
                                     std::vector<MasterRegistration>& out,
                                     ViewVersionId& version);
 
-    // ---- Snapshots ----
-    // Reads the raw slot/segment records, aggregates them into a point-in-time
-    // snapshot and writes it back to etcd. `version` is set to the etcd
-    // revision of the raw records that were aggregated.
-    static ErrorCode BuildAndSaveKvViewSnapshot(
-        const std::string& cluster_namespace, ViewVersionId& version);
-    static ErrorCode BuildAndSaveSegmentViewSnapshot(
-        const std::string& cluster_namespace, ViewVersionId& version);
-
-    static ErrorCode SaveKvViewSnapshot(const std::string& cluster_namespace,
-                                        const KvViewSnapshot& snapshot);
-    static ErrorCode SaveSegmentViewSnapshot(
-        const std::string& cluster_namespace, const SegmentViewSnapshot& snapshot);
+    // ---- Cluster ring metadata (cluster_meta) ----
+    // Persists/reads the cluster-wide RingMeta { submaster_count } (§15.3).
+    // Masters write it once at startup (idempotent); clients read it to derive
+    // the same primary ring locally.
+    static ErrorCode SaveClusterMeta(const std::string& cluster_namespace,
+                                     const RingMeta& meta);
+    static ErrorCode LoadClusterMeta(const std::string& cluster_namespace,
+                                     RingMeta& out, ViewVersionId& version);
 
     // ---- Partition 路由（§5.2 vsegment 预留接口，仅存 owner + epoch）----
     // 注意：ETCD 只保存路由（owner + epoch），不保存 free extents / 完整 view。
@@ -182,16 +124,10 @@ class EtcdViewStore {
     // ---- Watch ----
     using WatchCallback = void (*)(void*, const char*, size_t, const char*,
                                    size_t, int, int64_t);
-    static ErrorCode WatchKvView(const std::string& cluster_namespace,
-                                 ViewVersionId start_revision, void* ctx,
-                                 WatchCallback cb);
-    static ErrorCode CancelWatchKvView(const std::string& cluster_namespace);
-    static ErrorCode WaitWatchKvViewStopped(const std::string& cluster_namespace,
-                                            int timeout_ms);
 
     // ---- Master membership watch ----
     // Watches the master registration prefix so member add/remove (e.g. lease
-    // expiry) can drive immediate role re-evaluation (P3 failover).
+    // expiry) can drive immediate role re-evaluation.
     static ErrorCode WatchMasters(const std::string& cluster_namespace,
                                   ViewVersionId start_revision, void* ctx,
                                   WatchCallback cb);

@@ -51,6 +51,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
         {ErrorCode::SLOT_NOT_OWNED, "SLOT_NOT_OWNED"},
+        {ErrorCode::SLOT_MIGRATING, "SLOT_MIGRATING"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},

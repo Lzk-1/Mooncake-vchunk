@@ -262,6 +262,19 @@ class MasterService {
                            const std::string& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config);
 
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传，
+    // 替代 etcd slot_meta 中转)。新 owner 通过墙向旧 owner 拉取 `slot` 的对象
+    // 元数据导出；旧 owner 序列化并返回 SlotMetadataExport，但直到收到
+    // InterMasterAckSlotImported 才删除本地元数据。二者均为 peer-trust，直读
+    // 本地 metadata_shards_，不再经 etcd。
+    tl::expected<SlotMetadataExport, ErrorCode> InterMasterExportSlot(
+        uint16_t slot, const std::string& requester_master_id);
+
+    // 新 owner 导入完成后通知旧 owner 删除本地元数据（并清空 staged 导出
+    // 缓存）。幂等；返回 true 表示曾有 staged 项。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
+        uint16_t slot, const std::string& importer_master_id);
+
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
      *        unit tests can drive a single eviction cycle synchronously
@@ -2266,8 +2279,9 @@ class MasterService {
     const std::string cvm_http_host_;
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调）。
     const uint32_t submaster_count_;
-    // Publishes this submaster's slot ownership to etcd for the KV partition
-    // view. Only started in HA mode when a stable master_id is configured.
+    // Drives slot-metadata handoff for this submaster (deterministic ring; no
+    // etcd publication). Only started in HA mode when a stable master_id is
+    // configured.
     std::unique_ptr<cvm::SlotOwnerHeartbeat> slot_owner_heartbeat_;
     // Inter-master RPC client (CVM multi-submaster coordination): etcd-driven
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
@@ -2320,18 +2334,23 @@ class MasterService {
     // registration lifecycle (auto-removed on lease expiry). 0 until the
     // supervisor injects it via SetCvmLeaseId().
     EtcdLeaseId cvm_lease_id_{0};
-    // 读路径 slot 所有权校验位图（A1）。由心跳 resolver 与晋升路径更新，
-    // GetReplicaList / BatchGetReplicaList 读路径校验，非 owner 拒绝服务。
-    // owned_slots_ready_ 为 false 表示 partition 未启用或尚未解析过，放行。
+    // 两级 slot 状态（确定性哈希方案 §15.6）：
+    //   expected_owned_ = ring 推导「应拥有」的 slot（by ResolveOwnedSlotsForCvm）
+    //   ready_owned_    = 元数据已就绪（import/replay 完成）可服务
+    // 读路径以 ready_owned_ 判权；expected && !ready 即「迁移中」（Phase 4 拒
+    // 绝为 SLOT_MIGRATING）。owned_slots_ready_ 表示 expected 是否已解析过，
+    // 为 false 时 partition 未启用或尚未解析，读路径放行。
     mutable std::shared_mutex owned_slots_mutex_;
-    std::vector<bool> owned_slot_lookup_;
+    std::vector<bool> expected_owned_;
+    std::vector<bool> ready_owned_;
     bool owned_slots_ready_{false};
     // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
     bool owned_slot_count_logged_{false};
     std::size_t last_logged_owned_count_{0};
-    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把 segment owner 原始
-    // 记录同步到 etcd（segment_view/<id>），供 CvmController 聚合生成 segment
-    // view 快照。仅在 etcd HA backend 下生效，其余场景为空操作。
+    // Segment view (CVM) 数据源：在 segment 挂载/卸载时把中立描述符
+    // segments/<seg_id> + 每 master 挂载记录 snapshot/<master_id>/segments/
+    // <seg_id> 同步到 etcd，CvmHttpServer 据此聚合出 segment 视图。仅在 etcd
+    // HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
     // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
@@ -2345,19 +2364,40 @@ class MasterService {
     // 归属变更日志（P1）：缓存最近一次解析到的 primary 成员列表（已排序去重），
     // 用于在成员增删时打印 joined/left 根因，仅变化时打印一次。
     std::vector<std::string> cvm_last_primary_ids_;
+    // 迁移旧环（Phase 3）：成员列表发生变化「前」的 primary 列表，供
+    // ImportSlotMetadata 推导 gained slot 的上一任 owner（旧 owner 直传）。
+    // 仅在 membership 变化时更新，保持不变时维持旧值以支持 acquire 重试。
+    std::vector<std::string> cvm_prev_primary_ids_;
     mutable std::mutex cvm_resolver_mutex_;
-    // live primary → live primary 的 slot 元数据交接（P4 技术债 1）。
-    // ExportSlotMetadata 把 `slot` 下所有对象的元数据序列化后写入 etcd，再
-    // 从本地 metadata_shards_ 擦除；ImportSlotMetadata 从 etcd 读回并物化到
-    // 本地 metadata_shards_。数据字节始终留在 segment，不搬移。两者均由
-    // SlotOwnerHeartbeat 的 on_slot_released / on_slot_acquired 钩子在心跳
-    // 线程调用。
+    // live primary → live primary 的 slot 元数据交接（确定性哈希方案 §15.7，
+    // RPC 直传替代 etcd slot_meta 中转）。
+    //   ExportSlotMetadata(slot)  —— on_release 钩子：收集该 slot 对象元数据
+    //      并缓存到 pending_slot_exports_（不删本地，等新 owner 拉取 + ack）。
+    //   ImportSlotMetadata(slot)   —— on_acquire 钩子：推导旧 owner（旧环），
+    //      经 InterMasterRpc 直传拉取 export 并物化到本地，成功后回 ack。
+    // 数据字节始终留在 segment，不搬移。二者均运行在心跳线程。
     ErrorCode ExportSlotMetadata(uint16_t slot);
     ErrorCode ImportSlotMetadata(uint16_t slot);
-    // A1：读路径 slot 所有权校验。UpdateOwnedSlots 由心跳 resolver 与晋升路径
-    // 调用，把最新 owned slot 集合写入位图；OwnsSlot 供读路径查询（未就绪放行）。
-    void UpdateOwnedSlots(const std::vector<uint16_t>& slots);
+
+    // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
+    SlotMetadataExport BuildSlotMetadataExport(uint16_t slot) const;
+    // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
+    ErrorCode DropSlotMetadataLocal(uint16_t slot);
+    // RPC 直传的 staged 导出缓存：旧 owner 在 on_release 时把导出结果放这里，
+    // 等新 owner InterMasterExportSlot 拉取；收到 AckSlotImported 后删除缓存
+    // 并清理本地元数据。
+    std::unordered_map<uint16_t, SlotMetadataExport> pending_slot_exports_;
+    mutable std::mutex pending_slot_exports_mutex_;
+    // A1：读路径 slot 所有权校验。UpdateExpectedSlots 由心跳 resolver 与晋升
+    // 路径调用，写 expected_owned_ 位图（ring 推导的应拥有集合）；MarkSlotsReady
+    // 把已完成元数据导入的 slot 置入 ready_owned_。OwnsSlot 读 ready_owned_。
+    // Phase 1 行为等价：expected 更新时 ready 全量跟随。
+    void UpdateExpectedSlots(const std::vector<uint16_t>& slots);
+    void MarkSlotsReady(const std::vector<uint16_t>& slots);
     bool OwnsSlot(uint16_t slot) const;
+    // 读/写路径 slot 可服务性校验（Phase 4）：ready_owned_ → OK；expected 但
+    // !ready → SLOT_MIGRATING（新 owner 正在导入元数据）；否则 → SLOT_NOT_OWNED。
+    ErrorCode CheckSlotServiceability(uint16_t slot) const;
     // 读路径转发：解析任意 slot 的 owner master_id（基于一致性哈希环与
     // etcd 中的 primary master 列表）。解析失败返回 nullopt。供 GetReplicaList
     // / BatchGetReplicaList 在 OwnsSlot 失败时向 slot owner 转发请求。

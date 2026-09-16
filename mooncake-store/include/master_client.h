@@ -834,6 +834,20 @@ class MasterClient {
     [[nodiscard]] ErrorCode RefreshSubmasterRouting();
 
     /**
+     * @brief 带 slot 迁移重试语义的单 RPC 调用（Phase 6）。
+     * 对「已 SwitchToSubmaster 的 key」执行一次 RPC，并按错误码闭环处理：
+     *   - SLOT_NOT_OWNED：环已变化 → 刷新路由 + 重切 submaster，重试一次；
+     *   - SLOT_MIGRATING ：owner 已 expected 但元数据未就绪 → 退避（有界）后
+     *     原地重试，不刷新（环本身正确）。
+     * @tparam ServiceMethod 成员函数指针；ReturnType 为 RPC 返回值类型。
+     * @param tenant_id / key 仅用于错误重试时的 SwitchToSubmaster 路由。
+     * @param args 原样按值转发给 invoke_rpc（多次调用安全，不会被 move 掉）。
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> InvokeRoutedWithSlotRetry(
+        const std::string& tenant_id, const std::string& key, Args... args);
+
+    /**
      * @brief Switches the underlying RPC pool to the given submaster address.
      * @param address Submaster address (primary_master_id).
      */

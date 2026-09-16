@@ -17,19 +17,18 @@
 namespace mooncake {
 namespace cvm {
 
-// Publishes this submaster's slot ownership to etcd on a fixed interval.
+// Drives slot-metadata handoff on a fixed interval (确定性哈希方案 §15.6).
 //
-// The submaster (a MasterService instance) owns a set of logical slots. It
-// periodically writes one `SlotOwner` record per owned slot under
-// `/cvm/{ns}/kv_view/slot/{slot:05d}` (see EtcdViewStore::SaveSlotOwner).
-// EtcdViewStore later aggregates these raw records into a `KvViewSnapshot`
-// that clients read to route keys to the right submaster.
-//
-// Slot ownership is published on a fixed interval. With a non-zero `lease_id`
-// the records are lease-bound and auto-removed when the lease expires (master
-// death), which lets the dynamic partition rebalance the freed slots. With
-// `lease_id == 0` the mapping is a persistent fact re-affirmed idempotently
-// (single-master fallback).
+// Slot ownership is NO LONGER published to etcd: it is derived
+// deterministically from the primary member list (f(members, master_id)).
+// On each tick this recomputes the owned slot set via `dynamic_slot_resolver`
+// (or the static `owned_slots`) and hands the diff to SlotMigrator, which
+// invokes the acquire/release hooks:
+//   on_slot_acquired(slot) -> ErrorCode (RPC pull from the previous owner;
+//                             non-OK keeps the slot pending for a retry)
+//   on_slot_released(slot)  -> stage the export for the new owner to pull.
+// No SlotOwner record is written anywhere; clients derive the same ring
+// locally instead of reading a persisted kv_view.
 class SlotOwnerHeartbeat {
    public:
     struct Config {
@@ -48,18 +47,18 @@ class SlotOwnerHeartbeat {
         // slot. The callback must be safe to invoke from the heartbeat thread.
         std::function<std::vector<uint16_t>()> dynamic_slot_resolver;
 
-        // Optional etcd lease id. When non-zero, each slot record is written
-        // with this lease so it is auto-deleted when the lease expires (master
-        // death), letting the dynamic partition rebalance the freed slots.
-        // When zero, slot ownership is a persistent fact re-affirmed by each
-        // heartbeat (single-master fallback).
+        // Retained for diagnostics only: the supervisor-granted member lease
+        // (member-level fence). No per-slot record is written with this lease
+        // anymore — slot ownership is derived, not published.
         EtcdLeaseId lease_id{0};
 
-        // Optional hooks fired on slot ownership change (P4). on_slot_acquired
-        // materializes object metadata for a newly-owned slot (no-op when it
-        // already arrived via the standby-restore path); on_slot_released drops
-        // it. Leave empty for ownership-publishing-only behavior.
-        std::function<void(uint16_t)> on_slot_acquired;
+        // Optional hooks fired on slot ownership change (确定性哈希方案 §15.7).
+        // on_slot_acquired pulls object metadata for a newly-owned slot from the
+        // previous owner and returns ErrorCode: OK marks it ready, any other
+        // code keeps the slot pending for a retry next cycle. on_slot_released
+        // stages the export for the new owner to pull. Leave empty for
+        // derive-only behavior.
+        std::function<ErrorCode(uint16_t)> on_slot_acquired;
         std::function<void(uint16_t)> on_slot_released;
     };
 
@@ -72,8 +71,8 @@ class SlotOwnerHeartbeat {
     ErrorCode Start();
     void Stop();
 
-    // Writes a `SlotOwner` record for every owned slot once. Idempotent; safe
-    // to call from the heartbeat thread or externally.
+    // Recomputes the owned slot set and drives the SlotMigrator diff/hooks
+    // once. Idempotent; safe to call from the heartbeat thread or externally.
     ErrorCode PublishOnce();
 
    private:

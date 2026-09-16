@@ -2056,6 +2056,37 @@ WrappedMasterService::InterMasterUpsertStart(
         [] {}, [] {});
 }
 
+tl::expected<SlotMetadataExport, ErrorCode>
+WrappedMasterService::InterMasterExportSlot(
+    uint16_t slot, const std::string& requester_master_id) {
+    return execute_rpc(
+        "InterMasterExportSlot",
+        [&] {
+            return master_service_.InterMasterExportSlot(slot,
+                                                         requester_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("slot=", slot,
+                             ", requester=", requester_master_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<bool, ErrorCode>
+WrappedMasterService::InterMasterAckSlotImported(
+    uint16_t slot, const std::string& importer_master_id) {
+    return execute_rpc(
+        "InterMasterAckSlotImported",
+        [&] {
+            return master_service_.InterMasterAckSlotImported(
+                slot, importer_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("slot=", slot, ", importer=", importer_master_id);
+        },
+        [] {}, [] {});
+}
+
 // ---- vsegment 预留 RPC 接口占位实现（方法体由 vsegment 实现方落地）----
 tl::expected<partition::VSegmentView, ErrorCode>
 WrappedMasterService::GetVSegmentView(const std::string& vsegment_id) {
@@ -2137,6 +2168,13 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterUpsertStart>(
+        &wrapped_master_service);
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传).
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterExportSlot>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterAckSlotImported>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);

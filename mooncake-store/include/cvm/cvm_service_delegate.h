@@ -7,9 +7,10 @@
 namespace mooncake {
 namespace cvm {
 
-// Callback interface implemented by MasterService. CvmController calls into
-// this delegate to notify the embedding master of slot ownership changes,
-// without taking a dependency on the concrete MasterService type.
+// Callback interface implemented by the embedding master (or the HA
+// supervisor bridging for it). CvmController calls into this delegate to
+// notify role and membership changes without taking a dependency on the
+// concrete MasterService type.
 class CvmServiceDelegate {
    public:
     virtual ~CvmServiceDelegate() = default;
@@ -26,10 +27,11 @@ class CvmServiceDelegate {
     // its serving/standby state machine accordingly.
     virtual void OnRoleChanged(MasterRole new_role) = 0;
 
-    // Called when the cached slot->primary view changes (slot ownership
-    // rebalanced or a primary's lease expired). A standby uses this to re-bind
-    // its replay sources even when its own role stays kStandby.
-    virtual void OnKvViewChanged() {}
+    // Called when the CVM master member set changes (a master registered or
+    // its lease expired). A standby re-derives its replay sources locally from
+    // the updated member list (deterministic ring) even when its own role
+    // stays kStandby — the replacement for the removed persisted kv_view.
+    virtual void OnMembershipChanged() {}
 };
 
 }  // namespace cvm

@@ -565,8 +565,8 @@ class WrappedMasterServiceConfig {
     // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
     std::string master_id;
     // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
-    // HTTP server disabled; set a non-zero port to expose /kv_view,
-    // /segment_view and /health for inspection.
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
@@ -1264,8 +1264,8 @@ class MasterServiceConfig {
     // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
     std::string master_id;
     // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
-    // HTTP server disabled; set a non-zero port to expose /kv_view,
-    // /segment_view and /health for inspection.
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。

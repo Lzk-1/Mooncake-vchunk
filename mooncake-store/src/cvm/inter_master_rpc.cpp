@@ -258,6 +258,28 @@ InterMasterRpcClient::UpsertStart(const std::string& master_id,
         *address, client_id, key, tenant_id, slice_length, config);
 }
 
+tl::expected<SlotMetadataExport, ErrorCode> InterMasterRpcClient::ExportSlot(
+    const std::string& master_id, uint16_t slot,
+    const std::string& requester_master_id) {
+    auto address = ResolveAddress(master_id);
+    if (!address) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return invoke_rpc<&WrappedMasterService::InterMasterExportSlot,
+                      SlotMetadataExport>(*address, slot, requester_master_id);
+}
+
+tl::expected<bool, ErrorCode> InterMasterRpcClient::AckSlotImported(
+    const std::string& master_id, uint16_t slot,
+    const std::string& importer_master_id) {
+    auto address = ResolveAddress(master_id);
+    if (!address) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return invoke_rpc<&WrappedMasterService::InterMasterAckSlotImported, bool>(
+        *address, slot, importer_master_id);
+}
+
 void InterMasterRpcClient::EnqueueBroadcastFree(const std::string& tenant_id,
                                                  const std::string& key) {
     if (!running_.load()) {

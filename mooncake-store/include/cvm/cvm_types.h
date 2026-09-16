@@ -25,14 +25,8 @@ enum class MasterRole : int32_t {
     kStandby = 1,
 };
 
-// Ownership state of a segment (segment view is reserved).
-enum class SegmentOwnerState : int32_t {
-    kStable = 0,
-    kTransitioning = 1,
-};
-
 // ---------------------------------------------------------------------------
-// KV view: slot -> primary master ownership
+// KV slot ownership record
 // ---------------------------------------------------------------------------
 
 // NOTE: enum fields are stored as int32_t so the records serialize/deserialize
@@ -44,17 +38,6 @@ struct SlotOwner {
     std::string migrating_to_master_id;  // empty when stable
 };
 YLT_REFL(SlotOwner, slot, primary_master_id, state, migrating_to_master_id);
-
-// ---------------------------------------------------------------------------
-// Segment view: segment -> owner master ownership (reserved)
-// ---------------------------------------------------------------------------
-
-struct SegmentOwner {
-    std::string segment_id;
-    std::string owner_master_id;
-    int32_t state{0};  // SegmentOwnerState
-};
-YLT_REFL(SegmentOwner, segment_id, owner_master_id, state);
 
 // ---------------------------------------------------------------------------
 // Segment neutral entity (one per segment, no owner) — replaces the old
@@ -104,41 +87,14 @@ struct MasterRegistration {
 };
 YLT_REFL(MasterRegistration, master_id, address, role, registered_at_ms);
 
-// ---------------------------------------------------------------------------
-// Aggregated views (in-memory snapshots)
-// ---------------------------------------------------------------------------
-
-struct KvView {
-    std::vector<SlotOwner> slot_owners;
+// Cluster-wide ring configuration persisted under /cvm/{ns}/cluster_meta
+// (确定性哈希方案 §15.3). Clients and masters derive the same primary_ids =
+// sort(members by master_id)[0:submaster_count] from this count, so slot
+// ownership no longer needs to be persisted per slot.
+struct RingMeta {
+    uint32_t submaster_count{1};
 };
-YLT_REFL(KvView, slot_owners);
-
-struct SegmentView {
-    std::vector<SegmentOwner> segment_owners;
-};
-YLT_REFL(SegmentView, segment_owners);
-
-// ---------------------------------------------------------------------------
-// Derived snapshots (persisted back to etcd)
-// ---------------------------------------------------------------------------
-
-// Aggregated, point-in-time view of slot ownership. EtcdViewStore builds this
-// from the raw slot records and writes it back to etcd so that clients can read
-// the whole mapping with a single range get instead of one key per slot.
-struct KvViewSnapshot {
-    ViewVersionId version{0};       // Etcd revision of the raw records used.
-    int64_t generated_at_ms{0};     // Build time (ms since epoch).
-    std::vector<SlotOwner> slot_owners;
-};
-YLT_REFL(KvViewSnapshot, version, generated_at_ms, slot_owners);
-
-// Aggregated, point-in-time view of segment ownership (reserved).
-struct SegmentViewSnapshot {
-    ViewVersionId version{0};       // Etcd revision of the raw records used.
-    int64_t generated_at_ms{0};     // Build time (ms since epoch).
-    std::vector<SegmentOwner> segment_owners;
-};
-YLT_REFL(SegmentViewSnapshot, version, generated_at_ms, segment_owners);
+YLT_REFL(RingMeta, submaster_count);
 
 }  // namespace cvm
 }  // namespace mooncake

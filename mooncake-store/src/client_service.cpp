@@ -576,9 +576,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             // No single-leader master_view is published. In the CVM
             // multi-submaster architecture masters never write master_view;
             // they register under /cvm/<ns>/masters/ instead. Fall back to
-            // the CVM registry to bootstrap the connection. Per-key routing
-            // is loaded afterwards via LoadPartitionRouting() from the
-            // kv_view snapshot in etcd.
+            // the CVM registry to bootstrap the connection. Per-slot routing
+            // is loaded afterwards via LoadPartitionRouting(), which derives
+            // the slot->primary ring locally from cluster_meta + the masters
+            // registry (no persisted kv_view).
             LOG(INFO) << "No master_view in HA backend; trying CVM "
                          "multi-submaster bootstrap from /cvm/ registry";
             auto err =
@@ -868,9 +869,9 @@ void Client::TryLoadRoutingOnce() {
 
 void Client::RoutingRefreshThreadMain() {
     // Refresh cadence aligned with SlotOwnerHeartbeat (5s) and
-    // CvmController::SyncLoop (5s). Slot migration is a low-frequency event,
-    // so a fixed sleep (rather than a fast poll) keeps steady-state etcd load
-    // low while still picking up changes promptly.
+    // CvmController role reconciliation (5s). Slot migration is a
+    // low-frequency event, so a fixed sleep (rather than a fast poll) keeps
+    // steady-state etcd load low while still picking up changes promptly.
     constexpr auto kRefreshInterval = std::chrono::milliseconds(5000);
 
     while (routing_refresh_running_.load()) {

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <utility>
 
 #include <glog/logging.h>
@@ -24,6 +25,18 @@ namespace {
 constexpr int kWatchEventBroken = 2;
 constexpr int kWatchStopTimeoutMs = 1000;
 constexpr int kKeepAliveReadyTimeoutMs = 1000;
+
+// 逗号拼接 id 列表，空时返回 "[]"，用于 membership change 日志字段。
+std::string JoinIds(const std::vector<std::string>& ids) {
+    std::string out;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) {
+            out += ",";
+        }
+        out += ids[i];
+    }
+    return out.empty() ? "[]" : out;
+}
 
 }  // namespace
 
@@ -49,6 +62,7 @@ ErrorCode CvmController::Start() {
               << ", registration_lease_ttl_sec="
               << config_.registration_lease_ttl_sec << ", http_host="
               << config_.http_host << ", http_port=" << config_.http_port
+              << ", submaster_count=" << config_.submaster_count
               << ", sync_interval_ms=" << config_.sync_interval.count();
 
     // NOTE: the etcd client is a process-global singleton (EtcdHelper); the
@@ -92,25 +106,30 @@ ErrorCode CvmController::Start() {
     LOG(INFO) << "CvmController::Start RegisterMaster ok: master_id="
               << reg.master_id;
 
-    err = RefreshKvView();
+    // Persist the cluster-wide ring config (§15.3). Idempotent: submaster_count
+    // is a static deployment constant, so concurrent writes converge to the
+    // same value. Clients read this to locally derive the primary ring.
+    RingMeta ring_meta;
+    ring_meta.submaster_count = config_.submaster_count;
+    err = EtcdViewStore::SaveClusterMeta(config_.cluster_namespace, ring_meta);
     if (err != ErrorCode::OK) {
-        LOG(WARNING) << "CvmController initial RefreshKvView failed: " << err
-                     << ", cluster_namespace=" << config_.cluster_namespace;
+        LOG(WARNING) << "CvmController::Start SaveClusterMeta failed: err="
+                     << err << ", cluster_namespace=" << config_.cluster_namespace
+                     << ", submaster_count=" << config_.submaster_count
+                     << " (clients may fall back to stale ring until retried)";
     } else {
-        LOG(INFO) << "CvmController initial RefreshKvView ok";
+        LOG(INFO) << "CvmController::Start SaveClusterMeta ok: submaster_count="
+                  << config_.submaster_count;
     }
 
-    watch_state_ = std::make_unique<WatchState>();
     masters_watch_state_ = std::make_unique<WatchState>();
     running_.store(true);
 
     keepalive_thread_ = std::thread([this]() { KeepaliveLoop(); });
-    watch_thread_ = std::thread([this]() { WatchLoop(); });
     masters_watch_thread_ = std::thread([this]() { MastersWatchLoop(); });
-    sync_thread_ = std::thread([this]() { SyncLoop(); });
     membership_thread_ = std::thread([this]() { MembershipLoop(); });
     LOG(INFO) << "CvmController::Start started "
-                 "keepalive/watch/masters_watch/sync/membership threads";
+                 "keepalive/masters_watch/membership threads";
 
     if (config_.http_port != 0) {
         CvmHttpServer::Config http_cfg;
@@ -136,20 +155,15 @@ ErrorCode CvmController::Start() {
 }
 
 void CvmController::Stop() {
-    if (!running_.load() && !watch_thread_.joinable() &&
-        !masters_watch_thread_.joinable() && !keepalive_thread_.joinable() &&
-        !sync_thread_.joinable() && !membership_thread_.joinable()) {
+    if (!running_.load() && !masters_watch_thread_.joinable() &&
+        !keepalive_thread_.joinable() && !membership_thread_.joinable()) {
         return;
     }
 
     running_.store(false);
 
-    CancelWatchAndWait();
+    CancelMastersWatchAndWait();
 
-    if (watch_state_) {
-        std::lock_guard<std::mutex> lock(watch_state_->mutex);
-        watch_state_->cv.notify_all();
-    }
     if (masters_watch_state_) {
         std::lock_guard<std::mutex> lock(masters_watch_state_->mutex);
         masters_watch_state_->cv.notify_all();
@@ -159,15 +173,8 @@ void CvmController::Stop() {
         (void)EtcdHelper::CancelKeepAlive(lease_id_);
         keepalive_thread_.join();
     }
-    if (watch_thread_.joinable()) {
-        watch_thread_.join();
-    }
     if (masters_watch_thread_.joinable()) {
         masters_watch_thread_.join();
-    }
-    if (sync_thread_.joinable()) {
-        sync_cv_.notify_all();
-        sync_thread_.join();
     }
     if (membership_thread_.joinable()) {
         membership_cv_.notify_all();
@@ -180,166 +187,16 @@ void CvmController::Stop() {
     }
 
     (void)EtcdHelper::RevokeLease(lease_id_);
-    watch_state_.reset();
     masters_watch_state_.reset();
+    LOG(INFO) << "CvmController::Stop ok: master_id=" << config_.master_id
+              << ", lease_id=" << lease_id_;
 }
 
-bool CvmController::OwnsSlot(uint16_t slot) const {
-    SharedMutexLocker locker(&view_mutex_, shared_lock);
-    auto it = kv_view_.find(slot);
-    if (it == kv_view_.end()) {
-        return false;
-    }
-    return it->second.primary_master_id == config_.master_id &&
-           it->second.state == static_cast<int32_t>(SlotState::kStable);
-}
-
-std::vector<SlotOwner> CvmController::GetKvView() const {
-    SharedMutexLocker locker(&view_mutex_, shared_lock);
-    std::vector<SlotOwner> out;
-    out.reserve(kv_view_.size());
-    for (const auto& entry : kv_view_) {
-        out.push_back(entry.second);
-    }
-    return out;
-}
-
-ViewVersionId CvmController::GetKvViewVersion() const {
-    SharedMutexLocker locker(&view_mutex_, shared_lock);
-    return kv_view_version_;
-}
-
-ErrorCode CvmController::SyncOnce() {
-    ViewVersionId version = 0;
-    ErrorCode err = EtcdViewStore::BuildAndSaveKvViewSnapshot(
-        config_.cluster_namespace, version);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "CvmController build kv view snapshot failed: " << err;
-        return err;
-    }
-
-    err = EtcdViewStore::BuildAndSaveSegmentViewSnapshot(
-        config_.cluster_namespace, version);
-    if (err != ErrorCode::OK) {
-        // segment 视图为预留，失败不阻断 kv 视图路径同步。
-        LOG(WARNING) << "CvmController build segment view snapshot failed: "
-                     << err;
-    }
-
-    PushViewPaths();
-    return ErrorCode::OK;
-}
-
-void CvmController::PushViewPaths() {
-    const std::string kv_key = KvViewSnapshotKey(config_.cluster_namespace);
-    const std::string segment_key =
-        SegmentViewSnapshotKey(config_.cluster_namespace);
-
-    view_paths_["kv_view"] = kv_key;
-    view_paths_["segment_view"] = segment_key;
-
-    if (http_server_) {
-        http_server_->SetKvViewSnapshotKey(kv_key);
-        http_server_->SetSegmentViewSnapshotKey(segment_key);
-    }
-    LOG(INFO) << "CvmController pushed view paths: kv_view=" << kv_key
-              << " segment_view=" << segment_key;
-}
-
-ErrorCode CvmController::RefreshKvView() {
-    std::vector<SlotOwner> owners;
-    ViewVersionId version = 0;
-    ErrorCode err =
-        EtcdViewStore::LoadAllSlotOwners(config_.cluster_namespace, owners,
-                                         version);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
-    std::unordered_map<uint16_t, SlotOwner> next;
-    next.reserve(owners.size());
-    for (auto& owner : owners) {
-        next.emplace(owner.slot, std::move(owner));
-    }
-
-    {
-        SharedMutexLocker locker(&view_mutex_);
-        kv_view_ = std::move(next);
-        kv_view_version_ = version;
-    }
-    return ErrorCode::OK;
-}
-
-void CvmController::CancelWatchAndWait() {
-    if (watch_armed_.exchange(false)) {
-        (void)EtcdViewStore::CancelWatchKvView(config_.cluster_namespace);
-        (void)EtcdViewStore::WaitWatchKvViewStopped(config_.cluster_namespace,
-                                                    kWatchStopTimeoutMs);
-    }
+void CvmController::CancelMastersWatchAndWait() {
     if (masters_watch_armed_.exchange(false)) {
         (void)EtcdViewStore::CancelWatchMasters(config_.cluster_namespace);
         (void)EtcdViewStore::WaitWatchMastersStopped(config_.cluster_namespace,
                                                      kWatchStopTimeoutMs);
-    }
-}
-
-void CvmController::WatchLoop() {
-    while (running_.load()) {
-        ViewVersionId version_before = 0;
-        {
-            SharedMutexLocker locker(&view_mutex_, shared_lock);
-            version_before = kv_view_version_;
-        }
-
-        ErrorCode err = RefreshKvView();
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "CvmController WatchLoop refresh failed: " << err;
-        }
-
-        ViewVersionId version_after = 0;
-        {
-            SharedMutexLocker locker(&view_mutex_, shared_lock);
-            version_after = kv_view_version_;
-        }
-        // slot 所有权视图变化：通知 delegate，让 standby 即使角色不变也能
-        // 重绑回放源（技术债 2 修复）。
-        if (version_after != version_before && delegate_) {
-            delegate_->OnKvViewChanged();
-        }
-
-        if (!running_.load()) {
-            break;
-        }
-
-        CancelWatchAndWait();
-
-        {
-            std::lock_guard<std::mutex> lock(watch_state_->mutex);
-            watch_state_->dirty = false;
-            watch_state_->broken = false;
-        }
-
-        ViewVersionId start_version = 0;
-        {
-            SharedMutexLocker locker(&view_mutex_, shared_lock);
-            start_version = kv_view_version_;
-        }
-
-        err = EtcdViewStore::WatchKvView(config_.cluster_namespace,
-                                         start_version, watch_state_.get(),
-                                         &CvmController::WatchCallback);
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "CvmController arm watch failed: " << err;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
-        }
-        watch_armed_.store(true);
-
-        std::unique_lock<std::mutex> lock(watch_state_->mutex);
-        watch_state_->cv.wait(lock, [this] {
-            return watch_state_->dirty || watch_state_->broken ||
-                   !running_.load();
-        });
     }
 }
 
@@ -369,10 +226,17 @@ void CvmController::MastersWatchLoop() {
                    masters_watch_state_->broken || !running_.load();
         });
 
-        // 成员增删（lease 过期）→ 立即重算角色，并唤醒 sync 线程立即重算
-        // slot 快照，使 failover 不再等待轮询周期。
+        // 成员增删（lease 过期）→ 先探测成员集变化并记录日志，再重算角色。
+        std::vector<MasterRegistration> members;
+        if (LoadRankedMembers(members)) {
+            LogMembershipChange(members);
+        }
         ReconcileRole();
-        sync_cv_.notify_all();
+        // 成员集变化：即使本机角色不变（仍是 standby），也要通知 delegate
+        // 重新从最新成员列表本地推导回放源（替代已删除的 kv_view watch）。
+        if (delegate_) {
+            delegate_->OnMembershipChanged();
+        }
     }
 }
 
@@ -381,16 +245,6 @@ void CvmController::KeepaliveLoop() {
     ErrorCode rc = EtcdHelper::KeepAlive(lease_id_);
     if (rc == ErrorCode::ETCD_OPERATION_ERROR) {
         LOG(WARNING) << "CvmController keepalive error: " << rc;
-    }
-}
-
-void CvmController::SyncLoop() {
-    while (running_.load()) {
-        (void)SyncOnce();
-
-        std::unique_lock<std::mutex> lock(sync_mutex_);
-        sync_cv_.wait_for(lock, config_.sync_interval,
-                          [this] { return !running_.load(); });
     }
 }
 
@@ -406,7 +260,11 @@ bool CvmController::LoadRankedMembers(
         return false;
     }
 
-    // 收集所有存活 master（含本机）作为候选，按「先到先得」排序。
+    // 收集所有存活 master（含本机）作为候选，按 master_id 稳定排序。
+    // 排序键必须用 master_id（rpc_address:rpc_port），而非节点本地时钟
+    // registered_at_ms：同时启动时 registered_at_ms 随机，会导致「谁是
+    // primary」竞态（standby 随机拿到 slot）。master_id 重启稳定且可字节级
+    // 一致地复现，客户端与服务端据此推导出相同的 primary 序列。
     out.clear();
     out.reserve(masters.size());
     for (const auto& m : masters) {
@@ -417,12 +275,52 @@ bool CvmController::LoadRankedMembers(
 
     std::sort(out.begin(), out.end(),
               [](const MasterRegistration& a, const MasterRegistration& b) {
-                  if (a.registered_at_ms != b.registered_at_ms) {
-                      return a.registered_at_ms < b.registered_at_ms;
-                  }
                   return a.master_id < b.master_id;
               });
     return true;
+}
+
+void CvmController::LogMembershipChange(
+    const std::vector<MasterRegistration>& members) {
+    std::vector<std::string> ids;
+    ids.reserve(members.size());
+    for (const auto& m : members) {
+        if (!m.master_id.empty()) {
+            ids.push_back(m.master_id);
+        }
+    }
+    // LoadRankedMembers 已按 master_id 排序，ids 继承该顺序。成员集未变则不打
+    // 日志（watch 可能因等值事件重复唤醒）。
+    if (ids == last_member_ids_) {
+        return;
+    }
+
+    std::set<std::string> prev(last_member_ids_.begin(), last_member_ids_.end());
+    std::set<std::string> cur(ids.begin(), ids.end());
+    std::vector<std::string> joined;
+    std::vector<std::string> left;
+    for (const auto& id : ids) {
+        if (!prev.count(id)) {
+            joined.push_back(id);
+        }
+    }
+    for (const auto& id : last_member_ids_) {
+        if (!cur.count(id)) {
+            left.push_back(id);
+        }
+    }
+
+    const size_t primary_count =
+        std::min<size_t>(ids.size(), config_.submaster_count);
+    std::vector<std::string> primaries(ids.begin(),
+                                       ids.begin() + primary_count);
+
+    LOG(INFO) << "CvmController membership change: master_id="
+              << config_.master_id << ", joined=" << JoinIds(joined)
+              << ", left=" << JoinIds(left)
+              << ", primaries=" << JoinIds(primaries);
+
+    last_member_ids_ = std::move(ids);
 }
 
 MasterRole CvmController::ComputeDesiredRole() {
@@ -455,22 +353,6 @@ std::string CvmController::GetPrimaryAddress() {
     return members.front().address;
 }
 
-std::vector<MasterRegistration> CvmController::GetPrimaryPeers() {
-    std::vector<MasterRegistration> members;
-    if (!LoadRankedMembers(members) || members.empty()) {
-        return {};
-    }
-    std::vector<MasterRegistration> peers;
-    peers.reserve(std::min<size_t>(members.size(), config_.submaster_count));
-    for (size_t i = 0; i < members.size() && i < config_.submaster_count; ++i) {
-        if (members[i].master_id == config_.master_id) {
-            continue;  // 本机不作为自己的回放源。
-        }
-        peers.push_back(members[i]);
-    }
-    return peers;
-}
-
 std::vector<MasterRegistration> CvmController::GetBindingSources() {
     std::vector<MasterRegistration> members;
     if (!LoadRankedMembers(members) || members.empty()) {
@@ -480,7 +362,7 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
     const size_t primary_count =
         std::min<size_t>(members.size(), config_.submaster_count);
 
-    // 本机在「先到先得」排序列表中的位置。
+    // 本机在「先到先得」（master_id 稳定排序）列表中的位置。
     size_t my_index = members.size();
     for (size_t i = 0; i < members.size(); ++i) {
         if (members[i].master_id == config_.master_id) {
@@ -505,22 +387,20 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
     const uint16_t end = static_cast<uint16_t>((standby_rank + 1) * kSlotCount /
                                                standby_count);
 
-    // 求出负责区间内每个 slot 的 primary owner（仅 kStable、非本机）。
+    // 本地一致性哈希环：primary_ids = 排序去重后的前 submaster_count 个成员，
+    // 与服务端/客户端完全一致（slot_hash.h）。
+    std::vector<std::string> primary_ids;
+    primary_ids.reserve(primary_count);
+    for (size_t i = 0; i < primary_count; ++i) {
+        primary_ids.push_back(members[i].master_id);
+    }
+
+    // 求出负责区间内每个 slot 的 primary owner（确定性推导）。
     std::set<std::string> owner_ids;
-    {
-        SharedMutexLocker locker(&view_mutex_, shared_lock);
-        for (uint16_t slot = start; slot < end; ++slot) {
-            auto it = kv_view_.find(slot);
-            if (it == kv_view_.end()) {
-                continue;
-            }
-            if (it->second.state != static_cast<int32_t>(SlotState::kStable)) {
-                continue;
-            }
-            const std::string& owner = it->second.primary_master_id;
-            if (!owner.empty() && owner != config_.master_id) {
-                owner_ids.insert(owner);
-            }
+    for (uint16_t slot = start; slot < end; ++slot) {
+        const std::string owner = ResolveSlotOwnerOnRing(primary_ids, slot);
+        if (!owner.empty() && owner != config_.master_id) {
+            owner_ids.insert(owner);
         }
     }
 
@@ -531,6 +411,11 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
         if (owner_ids.count(m.master_id)) {
             sources.push_back(m);
         }
+    }
+    if (!sources.empty()) {
+        LOG(INFO) << "CvmController standby binding done: master_id="
+                  << config_.master_id << ", slot_range=[" << start << ","
+                  << end << "), source_count=" << sources.size();
     }
     return sources;
 }

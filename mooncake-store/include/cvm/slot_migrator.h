@@ -12,21 +12,22 @@
 namespace mooncake {
 namespace cvm {
 
-// Drives the slot ownership handoff state machine (P4).
+// Drives slot-metadata handoff as slot ownership shifts (确定性哈希方案 §15.6).
 //
-// A submaster owning a set of logical slots moves each slot through a two-phase
-// transition whenever ownership changes:
+// Slot ownership is NO LONGER persisted to etcd: it is derived deterministically
+// from the primary member list (f(members, master_id)). SlotMigrator therefore
+// no longer publishes kv/{slot} ownership records — it only computes the
+// gained/released slot diff against the previous cycle and invokes the
+// caller-provided hooks:
 //
-//   新获得 slot: kMigrating (migrating_to = self) -> on_acquire -> kStable
-//   释放   slot: on_release -> DeleteSlotOwnerIfOwnedBy(self)
-//   不变   slot: kStable (幂等 reaffirm)
+//   释放 slot: on_release(slot)  —— 旧 owner stage（导出元数据到内存，等新
+//                                    owner 拉取）
+//   获得 slot: on_acquire(slot)   —— 新 owner 拉取旧 owner 元数据并导入；
+//                                    非 OK 时不计入 last_owned_slots_，下轮
+//                                    重试（直到元数据就绪）
 //
-// `kMigrating` is visible to clients so they can treat a handoff-in-progress
-// slot as "not yet routable" instead of hitting a half-ready new owner.
-//
-// SlotMigrator only moves the *ownership records*; the actual object-metadata
-// materialization/drop is the caller's responsibility via the on_acquire /
-// on_release hooks (data bytes always stay in segments).
+// The actual object-metadata transfer/drop is the caller's responsibility via
+// these hooks (data bytes always stay in segments).
 class SlotMigrator {
    public:
     struct Config {
@@ -35,7 +36,11 @@ class SlotMigrator {
         EtcdLeaseId lease_id{0};
     };
 
-    using SlotCallback = std::function<void(uint16_t)>;
+    // on_acquire returns ErrorCode: OK means the slot's metadata is now ready
+    // locally; any other code keeps the slot out of last_owned_slots_ so it is
+    // retried next cycle. on_release is best-effort (no result needed).
+    using AcquireCallback = std::function<ErrorCode(uint16_t)>;
+    using ReleaseCallback = std::function<void(uint16_t)>;
 
     explicit SlotMigrator(Config config);
     ~SlotMigrator() = default;
@@ -44,28 +49,21 @@ class SlotMigrator {
     SlotMigrator& operator=(const SlotMigrator&) = delete;
 
     // Hooks invoked on ownership change. on_acquire materializes object
-    // metadata for the slot (or is a no-op when the metadata already arrived
-    // via the standby-restore path); on_release drops it.
-    void SetOnAcquire(SlotCallback cb) { on_acquire_ = std::move(cb); }
-    void SetOnRelease(SlotCallback cb) { on_release_ = std::move(cb); }
+    // metadata for the slot (RPC pull from the previous owner in Phase 3);
+    // on_release stages the export for the new owner to pull.
+    void SetOnAcquire(AcquireCallback cb) { on_acquire_ = std::move(cb); }
+    void SetOnRelease(ReleaseCallback cb) { on_release_ = std::move(cb); }
 
-    // Publishes slot ownership for `owned_slots`. Idempotent; safe to call from
-    // the heartbeat thread. Returns the last non-OK error (if any) but keeps
-    // going so a single failing slot does not block the rest.
+    // Computes the gained/released slot diff for `owned_slots` and drives the
+    // hooks. Idempotent; safe to call from the heartbeat thread. Returns the
+    // last non-OK error (if any) but keeps going.
     ErrorCode Reconcile(const std::vector<uint16_t>& owned_slots);
 
    private:
-    ErrorCode PublishMigrating(uint16_t slot);
-    ErrorCode PublishStable(uint16_t slot);
-
     Config config_;
-    SlotCallback on_acquire_;
-    SlotCallback on_release_;
+    AcquireCallback on_acquire_;
+    ReleaseCallback on_release_;
     std::vector<uint16_t> last_owned_slots_;
-    // Reconcile 调用计数，用于把不变 slot 的 reaffirm 降频为低频安全网：
-    // slot key 附着在 lease 上（keepalive 保活即不过期），逐周期重写只是
-    // 徒增 etcd MVCC revision，曾导致 backend 配额被写满。
-    uint64_t reconcile_cycles_{0};
 };
 
 }  // namespace cvm

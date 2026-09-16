@@ -352,6 +352,19 @@ class WrappedMasterService {
                            const std::string& tenant_id, uint64_t slice_length,
                            const ReplicateConfig& config);
 
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传，
+    // 替代 etcd slot_meta 中转): the new slot owner pulls the object-metadata
+    // export from the previous owner. The previous owner keeps its local
+    // metadata until InterMasterAckSlotImported arrives.
+    tl::expected<SlotMetadataExport, ErrorCode> InterMasterExportSlot(
+        uint16_t slot, const std::string& requester_master_id);
+
+    // New owner notifies the previous owner that `slot`'s metadata has been
+    // imported, so the previous owner can drop its local metadata (and clear
+    // the staged export). Returns true when a staged export existed.
+    tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
+        uint16_t slot, const std::string& importer_master_id);
+
     // ---- vsegment 预留 RPC 接口（§5.2，方法体由 vsegment 实现方落地）----
     // 元数据面：cache miss 时拉取完整不可变 view。
     tl::expected<partition::VSegmentView, ErrorCode> GetVSegmentView(

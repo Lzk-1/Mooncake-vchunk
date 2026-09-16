@@ -69,14 +69,14 @@ ErrorCode SlotOwnerHeartbeat::PublishOnce() {
         slots = config_.dynamic_slot_resolver();
     }
 
-    // Delegate the per-slot writes to the SlotMigrator state machine: it
-    // publishes kMigrating -> kStable for newly-acquired slots, deletes
-    // released slots, and re-affirms unchanged slots.
+    // Hand the owned-slot diff to the SlotMigrator: it computes gained/
+    // released and drives the acquire/release hooks (object-metadata RPC
+    // handoff). No etcd publish occurs — ownership is derived, not persisted.
     ErrorCode err = migrator_.Reconcile(slots);
     if (err != ErrorCode::OK) {
-        // Reconcile 内部已有逐 slot 失败 WARNING；这里补一条周期级汇总，
-        // 便于从心跳线程视角确认本轮发布未完全成功。
-        LOG(WARNING) << "SlotOwnerHeartbeat publish incomplete: master_id="
+        // Reconcile 内部已有逐 slot 失败日志；这里补一条周期级汇总，便于从
+        // 心跳线程视角确认本轮 slot 交接未完全成功。
+        LOG(WARNING) << "SlotOwnerHeartbeat reconcile incomplete: master_id="
                      << config_.master_id << " owned_slots=" << slots.size()
                      << " err=" << err;
     }

@@ -14,14 +14,16 @@
 namespace mooncake {
 namespace partition {
 
-// client 侧路由：应用 SlotOwner 映射，把逻辑 slot 解析为 submaster_id。
-// 映射来源为 etcd 快照（snapshot/kv_view，即 KvViewSnapshot），直读 etcd。
+// client 侧路由：把逻辑 slot 解析为 submaster_id（即 master_id，其值等于
+// RPC 端点 address）。映射来源为本地确定性哈希环推导（读成员列表 +
+// cluster_meta 的 submaster_count），与服务端 ResolveOwnedSlotsForCvm 一致，
+// 不再从 etcd 快照读逐 slot 归属。
 class PartitionRouter {
    public:
-    // 加载 slot → submaster 映射（覆盖式）。
+    // 加载 slot → submaster 映射（覆盖式）。仅用于单元测试 / 兼容旧路径。
     void LoadSlotOwners(const std::vector<cvm::SlotOwner>& owners);
 
-    // 直读 etcd 快照（snapshot/kv_view）并刷新映射。
+    // 读成员列表 + cluster_meta，本地建环并刷新映射。
     ErrorCode LoadFromEtcdSnapshot(const std::string& cluster_namespace);
 
     // slot → submaster_id（primary_master_id）；未命中返回 nullopt。

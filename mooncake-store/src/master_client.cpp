@@ -4,9 +4,11 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <chrono>
 #include <csignal>
 #include <future>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -575,6 +577,34 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
+    const std::string& tenant_id, const std::string& key, Args... args) {
+    auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
+
+    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED) {
+        // 环已变化（成员增删）：刷新路由 + 重切到新 owner，重试一次。
+        if (RefreshSubmasterRouting() == ErrorCode::OK &&
+            SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
+            return invoke_rpc<ServiceMethod, ReturnType>(args...);
+        }
+    } else if (!result && result.error() == ErrorCode::SLOT_MIGRATING) {
+        // owner 已 expected 但元数据尚未 import/replay 完成：环不变，退避
+        // （有界）后原地重试，等待元数据就绪。
+        constexpr int kMaxRetries = 3;
+        for (int i = 0; i < kMaxRetries; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20 << i));
+            auto attempt = invoke_rpc<ServiceMethod, ReturnType>(args...);
+            if (!attempt || attempt.error() != ErrorCode::SLOT_MIGRATING) {
+                return attempt;
+            }
+            result = std::move(attempt);
+        }
+    }
+
+    return result;
+}
+
 MasterClient::~MasterClient() = default;
 
 void MasterClient::WarmupRpcPool() {
@@ -774,8 +804,9 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::ExistKey, bool>(
-        object_key, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::ExistKey,
+                                            bool>(
+        tenant_id_.value(), object_key, object_key, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -893,9 +924,9 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key, tenant_id,
-                                                     trace_id, client_id_);
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
+        tenant_id, object_key, object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -975,9 +1006,10 @@ MasterClient::PutStart(const std::string& key,
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::PutStart, PutStartResult>(
-        client_id_, key, total_slice_length, config, tenant_id_.value(),
-        trace_id);
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::PutStart, PutStartResult>(
+        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
+        tenant_id_.value(), trace_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1062,9 +1094,10 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value(), trace_id,
-        operation_id);
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutEnd,
+                                            void>(
+        tenant_id_.value(), object_meta.key, client_id_, object_meta,
+        replica_type, tenant_id_.value(), trace_id, operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1135,8 +1168,10 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value(), operation_id);
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::PutRevoke,
+                                            void>(
+        tenant_id_.value(), key, client_id_, key, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1149,17 +1184,9 @@ tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
-                             VChunkMetadataRecord>(tenant_id, key, total_size,
-                                                   now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutStart,
-                            VChunkMetadataRecord>(tenant_id, key, total_size,
-                                                  now_ms);
-    }
-    return result;
+    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutStart,
+                                     VChunkMetadataRecord>(
+        tenant_id, key, tenant_id, key, total_size, now_ms);
 }
 
 tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
@@ -1170,15 +1197,8 @@ tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-        tenant_id, key, vchunk_id, now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutEnd, void>(
-            tenant_id, key, vchunk_id, now_ms);
-    }
-    return result;
+    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutEnd, void>(
+        tenant_id, key, tenant_id, key, vchunk_id, now_ms);
 }
 
 tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
@@ -1189,15 +1209,9 @@ tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
-    auto result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-        tenant_id, key, vchunk_id);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::VChunkPutRevoke, void>(
-            tenant_id, key, vchunk_id);
-    }
-    return result;
+    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutRevoke,
+                                     void>(tenant_id, key, tenant_id, key,
+                                           vchunk_id);
 }
 
 tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
@@ -1207,15 +1221,9 @@ tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
-    auto result = invoke_rpc<&WrappedMasterService::GetVChunk,
-                             VChunkReadLease>(tenant_id, key);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::GetVChunk,
-                            VChunkReadLease>(tenant_id, key);
-    }
-    return result;
+    return InvokeRoutedWithSlotRetry<&WrappedMasterService::GetVChunk,
+                                     VChunkReadLease>(tenant_id, key, tenant_id,
+                                                      key);
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
@@ -1237,15 +1245,8 @@ tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
     if (switch_err != ErrorCode::OK) {
         return tl::make_unexpected(switch_err);
     }
-    auto result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-        tenant_id, key, now_ms);
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED &&
-        RefreshSubmasterRouting() == ErrorCode::OK &&
-        SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-        result = invoke_rpc<&WrappedMasterService::RemoveVChunk, void>(
-            tenant_id, key, now_ms);
-    }
-    return result;
+    return InvokeRoutedWithSlotRetry<&WrappedMasterService::RemoveVChunk, void>(
+        tenant_id, key, tenant_id, key, now_ms);
 }
 
 tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
@@ -1317,8 +1318,10 @@ MasterClient::UpsertStart(const std::string& key,
         total_slice_length += slice_length;
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertStart, PutStartResult>(
-        client_id_, key, total_slice_length, config, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::UpsertStart, PutStartResult>(
+        tenant_id_.value(), key, client_id_, key, total_slice_length, config,
+        tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1400,9 +1403,10 @@ tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value(),
-        operation_id);
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::UpsertEnd,
+                                            void>(
+        tenant_id_.value(), object_meta.key, client_id_, object_meta,
+        replica_type, tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1471,8 +1475,10 @@ tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value(), operation_id);
+    auto result = InvokeRoutedWithSlotRetry<
+        &WrappedMasterService::UpsertRevoke, void>(
+        tenant_id_.value(), key, client_id_, key, replica_type,
+        tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1532,8 +1538,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
         return tl::make_unexpected(switch_err);
     }
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(
-        key, force, tenant_id_.value());
+    auto result = InvokeRoutedWithSlotRetry<&WrappedMasterService::Remove, void>(
+        tenant_id_.value(), key, key, force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
