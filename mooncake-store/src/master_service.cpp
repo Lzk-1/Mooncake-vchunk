@@ -599,6 +599,9 @@ MasterService::TryVSegmentPutStart(
     if (!normalized) return tl::make_unexpected(normalized.error());
     const std::string partition_id =
         std::to_string(cvm::KeySlot(*normalized, key));
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    const auto ready = CheckVSegmentServiceability(partition_id);
+    if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
     std::vector<std::string> operation_ids(config.replica_num);
     for (auto& id : operation_ids) id = UuidToString(generate_uuid());
     auto reservations = vsegment_service_->StartPutReplicasOwned(
@@ -620,7 +623,6 @@ MasterService::TryVSegmentPutStart(
         abort();
         return tl::make_unexpected(quota_result.error());
     }
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     const auto shard_idx = getShardIndex(*normalized, key);
     MetadataShardAccessorRW shard(this, shard_idx);
     auto& tenant_state = shard->tenants[*normalized];
@@ -674,10 +676,10 @@ namespace {
 
 ErrorCode LoadEffectivePartitionRoute(
     const std::string& cluster_id, const std::string& partition_id,
-    partition::PartitionRoute& route, ViewVersionId& version) {
-    // KV Partition ids are decimal CVM slot ids. Until an explicit migration
-    // coordinator publishes a richer PartitionRoute, use the existing
-    // lease-backed SlotOwner record as the production ownership authority.
+    partition::PartitionRoute& route, ViewVersionId& version,
+    const std::vector<std::string>& primary_ids, ViewVersionId ring_revision) {
+    // Numeric KV Partitions use the same membership-derived ring as KV PT.
+    // There are no per-slot ownership keys in the current CVM protocol.
     size_t parsed = 0;
     unsigned long numeric = 0;
     try {
@@ -687,26 +689,20 @@ ErrorCode LoadEffectivePartitionRoute(
             cluster_id, partition_id, route, version);
     }
     if (parsed != partition_id.size() ||
-        numeric > std::numeric_limits<uint16_t>::max()) {
+        numeric >= cvm::kSlotCount) {
         return cvm::EtcdViewStore::LoadPartitionRoute(
             cluster_id, partition_id, route, version);
     }
-    cvm::SlotOwner slot_owner;
-    auto error = cvm::EtcdViewStore::LoadSlotOwner(
-        cluster_id, static_cast<uint16_t>(numeric), slot_owner, version);
-    if (error != ErrorCode::OK) return error;
-    if (slot_owner.primary_master_id.empty() || version <= 0)
+    const auto owner = cvm::ResolveSlotOwnerOnRing(
+        primary_ids, static_cast<uint16_t>(numeric));
+    if (owner.empty() || ring_revision <= 0)
         return ErrorCode::INVALID_VERSION;
+    version = ring_revision;
     route.partition_id.partition_id = partition_id;
-    route.owner_submaster_id = slot_owner.primary_master_id;
+    route.owner_submaster_id = owner;
     route.route_epoch = static_cast<uint64_t>(version);
-    route.state = slot_owner.state ==
-                          static_cast<int32_t>(cvm::SlotState::kMigrating)
-                      ? static_cast<int32_t>(
-                            partition::PartitionState::kMigrating)
-                      : static_cast<int32_t>(
-                            partition::PartitionState::kActive);
-    route.target_submaster_id = slot_owner.migrating_to_master_id;
+    route.state = static_cast<int32_t>(partition::PartitionState::kActive);
+    route.target_submaster_id.clear();
     return ErrorCode::OK;
 }
 
@@ -749,7 +745,12 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     // 16384 slots without overwriting each other.
     hb_config.dynamic_slot_resolver = [this]() {
         auto slots = ResolveOwnedSlotsForCvm();
-        UpdateExpectedSlots(slots);
+        {
+            // Drain writes admitted under the previous owned-slot bitmap
+            // before staging a released Partition's immutable export.
+            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+            UpdateExpectedSlots(slots);
+        }
         const auto error = RefreshVSegmentOwnership();
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "Failed to refresh vsegment ownership: "
@@ -762,7 +763,9 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     // 元数据 stage 到内存等新 owner 拉取，获得端经 InterMasterRpc 直传拉取导
     // 入并回 ack。数据字节始终留在 segment，不搬移。
     hb_config.on_slot_acquired = [this](uint16_t slot) {
-        return ImportSlotMetadata(slot);
+        const auto error = ImportSlotMetadata(slot);
+        if (error == ErrorCode::OK) MarkSlotsReady({slot});
+        return error;
     };
     hb_config.on_slot_released = [this](uint16_t slot) {
         const auto exported = ExportSlotMetadata(slot);
@@ -771,11 +774,7 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
                        << slot << ": " << toString(exported);
             return;
         }
-        const auto refresh = RefreshVSegmentOwnership();
-        if (refresh != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to detach released vsegment Partition "
-                       << slot << ": " << toString(refresh);
-        }
+        // Retain the manager until the importer acknowledges the snapshot.
     };
     const bool lease_bound = hb_config.lease_id != 0;
     slot_owner_heartbeat_ =
@@ -793,7 +792,7 @@ ErrorCode MasterService::StartSlotOwnerHeartbeat() {
     return ErrorCode::OK;
 }
 
-ErrorCode MasterService::RefreshVSegmentOwnership() {
+ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) {
     if (!ordered_oplog_writer_) return ErrorCode::OK;
     if (!vsegment_service_) {
         vsegment::PartitionPhysicalQuotaSnapshot quota;
@@ -818,12 +817,21 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
     std::unordered_set<std::string> partition_ids;
     for (const auto& quota : vsegment_service_->quota_snapshot().quotas)
         partition_ids.insert(quota.partition_id);
+    std::vector<std::string> primary_ids;
+    ViewVersionId ring_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+        primary_ids = cvm_last_primary_ids_;
+        ring_revision = cvm_ring_revision_;
+    }
     bool complete = true;
     for (const auto& partition_id : partition_ids) {
+        if (!acquiring.empty() && partition_id != acquiring) continue;
         partition::PartitionRoute route;
         ViewVersionId version = 0;
         auto error = LoadEffectivePartitionRoute(cluster_id_, partition_id,
-                                                 route, version);
+                                                 route, version, primary_ids,
+                                                 ring_revision);
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
             if (recovered.count(partition_id)) complete = false;
             continue;
@@ -834,6 +842,26 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
         }
         const auto found = recovered.find(partition_id);
         const auto* state = found == recovered.end() ? nullptr : found->second;
+        const bool numeric_slot = !partition_id.empty() &&
+            partition_id.find_first_not_of("0123456789") == std::string::npos &&
+            partition_id.size() <= 5 &&
+            std::stoul(partition_id) < cvm::kSlotCount;
+        if (numeric_slot) {
+            // The release hook stages state and ACK detaches it. Removing here
+            // would lose the manager before the release hook can export it.
+            if (route.owner_submaster_id != master_id_) continue;
+            if (acquiring != partition_id &&
+                !OwnsSlot(static_cast<uint16_t>(std::stoul(partition_id))))
+                continue;
+            vsegment::PartitionVSegmentSnapshot current;
+            if (vsegment_service_->SnapshotPartition(partition_id, &current) ==
+                ErrorCode::OK) {
+                // Unrelated etcd writes must not invalidate in-flight requests.
+                route.route_epoch = current.route_epoch;
+            } else if (state) {
+                route.route_epoch = std::max(route.route_epoch, state->route_epoch);
+            }
+        }
         auto committer =
             std::make_shared<vsegment::OrderedOpLogVSegmentCommitter>(
                 ordered_oplog_writer_.get());
@@ -886,7 +914,18 @@ ErrorCode MasterService::RefreshVSegmentOwnership() {
             }
         }
     }
-    if (complete) recovered_vsegment_snapshots_.clear();
+    if (complete) {
+        // Keep state for pending imports; a per-slot acquire must not discard
+        // the other Partitions recovered from the primary/standby snapshot.
+        recovered_vsegment_snapshots_.erase(
+            std::remove_if(recovered_vsegment_snapshots_.begin(),
+                           recovered_vsegment_snapshots_.end(),
+                           [&](const auto& state) {
+                               return recovered_owned_partitions.count(
+                                   state.partition_id) != 0;
+                           }),
+            recovered_vsegment_snapshots_.end());
+    }
     return complete ? ErrorCode::OK : ErrorCode::PERSISTENT_FAIL;
 }
 
@@ -1176,8 +1215,12 @@ void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
 #endif
 }
 
-SlotMetadataExport MasterService::BuildSlotMetadataExport(
+tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExport(
     uint16_t slot) const {
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    if (CheckSlotServiceability(slot) != ErrorCode::SLOT_NOT_OWNED) {
+        return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+    }
     SlotMetadataExport export_payload;
     export_payload.slot = slot;
     export_payload.source_master_id = master_id_;
@@ -1189,7 +1232,7 @@ SlotMetadataExport MasterService::BuildSlotMetadataExport(
         if (snapshot_error == ErrorCode::OK) {
             export_payload.vsegment_partition = std::move(snapshot);
         } else if (snapshot_error != ErrorCode::STALE_ROUTE) {
-            return snapshot_error;
+            return tl::make_unexpected(snapshot_error);
         }
     }
 
@@ -1247,10 +1290,11 @@ ErrorCode MasterService::DropSlotMetadataLocal(uint16_t slot) {
 ErrorCode MasterService::ExportSlotMetadata(uint16_t slot) {
     // on_release：stage 导出到内存缓存，等新 owner RPC 拉取；不删本地、不写
     // etcd——旧 owner 收到 InterMasterAckSlotImported 后才 DropSlotMetadataLocal。
-    SlotMetadataExport export_payload = BuildSlotMetadataExport(slot);
+    auto export_payload = BuildSlotMetadataExport(slot);
+    if (!export_payload) return export_payload.error();
     {
         std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
-        pending_slot_exports_[slot] = std::move(export_payload);
+        pending_slot_exports_[slot] = std::move(*export_payload);
     }
     return ErrorCode::OK;
 }
@@ -1267,13 +1311,16 @@ MasterService::InterMasterExportSlot(uint16_t slot,
             return it->second;
         }
     }
-    SlotMetadataExport export_payload = BuildSlotMetadataExport(slot);
-    return export_payload;
+    return BuildSlotMetadataExport(slot);
 }
 
 tl::expected<bool, ErrorCode>
 MasterService::InterMasterAckSlotImported(uint16_t slot,
                                          const std::string& /*importer_master_id*/) {
+    std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    if (CheckSlotServiceability(slot) != ErrorCode::SLOT_NOT_OWNED) {
+        return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+    }
     bool had_staged = false;
     {
         std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
@@ -1285,6 +1332,18 @@ MasterService::InterMasterAckSlotImported(uint16_t slot,
                      << ", err=" << err;
         return tl::make_unexpected(err);
     }
+    if (vsegment_service_) {
+        const auto partition_id = std::to_string(slot);
+        vsegment::PartitionVSegmentSnapshot state;
+        err = vsegment_service_->SnapshotPartition(partition_id, &state);
+        if (err == ErrorCode::OK) {
+            err = vsegment_service_->RemovePartition(partition_id,
+                                                      state.route_epoch);
+            if (err != ErrorCode::OK) return tl::make_unexpected(err);
+        } else if (err != ErrorCode::STALE_ROUTE) {
+            return tl::make_unexpected(err);
+        }
+    }
     return had_staged;
 }
 
@@ -1292,14 +1351,18 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     // 推导迁移前一任 owner（旧环）。空环 / 无旧 owner（冷启动、旧 owner
     // 消亡）→ 无可拉取对象，直接视为就绪（元数据为空，客户端重建）。
     std::vector<std::string> prev_ids;
+    std::vector<std::string> primary_ids;
+    ViewVersionId ring_revision = 0;
     {
         std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
         prev_ids = cvm_prev_primary_ids_;
+        primary_ids = cvm_last_primary_ids_;
+        ring_revision = cvm_ring_revision_;
     }
     const std::string old_owner = cvm::ResolveSlotOwnerOnRing(prev_ids, slot);
     if (old_owner.empty() || old_owner == master_id_) {
         // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
-        return ErrorCode::OK;
+        return RefreshVSegmentOwnership(std::to_string(slot));
     }
 
     if (!inter_master_rpc_) {
@@ -1336,7 +1399,8 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         partition::PartitionRoute route;
         ViewVersionId version = 0;
         auto route_error = LoadEffectivePartitionRoute(
-            cluster_id_, partition_id, route, version);
+            cluster_id_, partition_id, route, version, primary_ids,
+            ring_revision);
         if (route_error != ErrorCode::OK ||
             route.owner_submaster_id != master_id_) {
             return route_error == ErrorCode::OK ? ErrorCode::STALE_ROUTE
@@ -1502,6 +1566,11 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         }
     }
 
+    // Complete vsegment activation before ACK: a failed activation must leave
+    // the source's export intact for the next acquire attempt.
+    const auto activation = RefreshVSegmentOwnership(std::to_string(slot));
+    if (activation != ErrorCode::OK) return activation;
+
     // RPC 直传：导入完成后通知旧 owner 删除本地元数据（ack）。ack 失败仅告警
     // 不阻断——旧 owner 残留元数据由其观察/lease 逻辑兜底清理。
     auto ack_result =
@@ -1515,7 +1584,9 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
 }
 #else
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
-ErrorCode MasterService::RefreshVSegmentOwnership() { return ErrorCode::OK; }
+ErrorCode MasterService::RefreshVSegmentOwnership(const std::string&) {
+    return ErrorCode::OK;
+}
 ErrorCode MasterService::StartInterMasterRpc() { return ErrorCode::OK; }
 void MasterService::StopInterMasterRpc() {}
 
@@ -1531,9 +1602,9 @@ void MasterService::EnqueueRemoteFreeIfTracked(
     const TenantId& /*tenant_id*/, const std::string& /*key*/,
     QuotaEraseMode /*quota_mode*/) {}
 
-SlotMetadataExport MasterService::BuildSlotMetadataExport(
+tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExport(
     uint16_t /*slot*/) const {
-    return {};
+    return SlotMetadataExport{};
 }
 
 ErrorCode MasterService::DropSlotMetadataLocal(uint16_t /*slot*/) {
@@ -1769,6 +1840,7 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
         }
 
         cvm_last_resolved_owned_slots_ = slots;
+        cvm_ring_revision_ = version;
     }
     return slots;
 }
@@ -1821,9 +1893,12 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
             expected_owned_[slot] = true;
         }
     }
-    // Phase 1：行为等价——ready 全量跟随 expected（Phase 3/4 再解耦，由
-    // MarkSlotsReady 在元数据导入完成后单独置位）。
-    ready_owned_ = expected_owned_;
+    // Retained slots remain ready. Newly acquired slots are not serviceable
+    // until both object metadata and their vsegment state have been installed.
+    ready_owned_.resize(cvm::kSlotCount, false);
+    for (size_t slot = 0; slot < ready_owned_.size(); ++slot) {
+        ready_owned_[slot] = ready_owned_[slot] && expected_owned_[slot];
+    }
     owned_slots_ready_ = true;
     // 一致性哈希环分配结果（3.1）：仅在数量变化（含首次解析）时打印，
     // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
@@ -1844,7 +1919,8 @@ void MasterService::MarkSlotsReady(const std::vector<uint16_t>& slots) {
         ready_owned_.resize(cvm::kSlotCount, false);
     }
     for (uint16_t slot : slots) {
-        if (slot < ready_owned_.size()) {
+        if (slot < ready_owned_.size() && slot < expected_owned_.size() &&
+            expected_owned_[slot]) {
             ready_owned_[slot] = true;
         }
     }
@@ -1870,6 +1946,17 @@ ErrorCode MasterService::CheckSlotServiceability(uint16_t slot) const {
         return ErrorCode::SLOT_MIGRATING;
     }
     return ErrorCode::SLOT_NOT_OWNED;
+}
+
+ErrorCode MasterService::CheckVSegmentServiceability(
+    const std::string& partition_id) const {
+    if (!partition_id.empty() && partition_id.size() <= 5 &&
+        partition_id.find_first_not_of("0123456789") == std::string::npos) {
+        const auto slot = std::stoul(partition_id);
+        if (slot < cvm::kSlotCount)
+            return CheckSlotServiceability(static_cast<uint16_t>(slot));
+    }
+    return ErrorCode::OK;  // Named Partitions use explicit PartitionRoute.
 }
 MasterService::~MasterService() {
     if (ordered_oplog_writer_) {
@@ -4679,6 +4766,9 @@ auto MasterService::GetReplicaList(const std::string& key,
 tl::expected<vsegment::VSegmentView, ErrorCode>
 MasterService::GetVSegmentView(const std::string& partition_id,
                                const std::string& vsegment_id) {
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    const auto ready = CheckVSegmentServiceability(partition_id);
+    if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
     if (!vsegment_service_)
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     vsegment::VSegmentView view;
@@ -4707,6 +4797,10 @@ vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,
     const std::string& profile_name) {
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    const auto ready = CheckVSegmentServiceability(partition_id);
+    if (ready != ErrorCode::OK)
+        return {ready, operation_id, {}, "Partition metadata is not ready"};
     if (!vsegment_service_)
         return {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, operation_id, {},
                 "vsegment service is not initialized"};
@@ -4717,6 +4811,9 @@ vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
 ErrorCode MasterService::VSegmentPutEnd(
     const VSegmentDescriptor& replica, uint64_t route_epoch,
     const std::string& operation_id, const std::string& object_id) {
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    const auto ready = CheckVSegmentServiceability(replica.partition_id);
+    if (ready != ErrorCode::OK) return ready;
     if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     return vsegment_service_->CommitPut(replica, route_epoch, operation_id,
                                         object_id);
@@ -4725,6 +4822,9 @@ ErrorCode MasterService::VSegmentPutEnd(
 ErrorCode MasterService::VSegmentPutRevoke(
     const std::string& partition_id, const std::string& vsegment_id,
     uint64_t route_epoch, const std::string& operation_id) {
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    const auto ready = CheckVSegmentServiceability(partition_id);
+    if (ready != ErrorCode::OK) return ready;
     if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     return vsegment_service_->AbortPut(partition_id, vsegment_id, route_epoch,
                                        operation_id);
@@ -11627,10 +11727,17 @@ MasterService::MetadataSerializer::Serialize() {
     // 4. Serialize all owner-Partition vsegment states. Old readers ignore
     // this unknown map key; new readers accept old snapshots without it.
     packer.pack("vsegment_partitions");
-    const auto snapshots = service_->vsegment_service_
-                               ? service_->vsegment_service_
-                                     ->SnapshotAllPartitions()
-                               : service_->recovered_vsegment_snapshots_;
+    auto snapshots = service_->vsegment_service_
+                         ? service_->vsegment_service_->SnapshotAllPartitions()
+                         : std::vector<vsegment::PartitionVSegmentSnapshot>{};
+    std::unordered_set<std::string> installed;
+    for (const auto& state : snapshots) installed.insert(state.partition_id);
+    // A newly constructed service may still be waiting for individual slot
+    // imports. Preserve their recovered state in snapshots taken meanwhile.
+    for (const auto& state : service_->recovered_vsegment_snapshots_) {
+        if (installed.insert(state.partition_id).second)
+            snapshots.push_back(state);
+    }
     const auto serialized_snapshots = struct_pack::serialize(snapshots);
     packer.pack_bin(serialized_snapshots.size());
     packer.pack_bin_body(serialized_snapshots.data(),

@@ -224,6 +224,28 @@ class MasterServiceHATest : public ::testing::Test {
         return service.ordered_oplog_writer_ != nullptr;
     }
 
+    static void ExpectSlots(MasterService& service,
+                            const std::vector<uint16_t>& slots) {
+        service.UpdateExpectedSlots(slots);
+    }
+
+    static void ReadySlots(MasterService& service,
+                           const std::vector<uint16_t>& slots) {
+        service.MarkSlotsReady(slots);
+    }
+
+    static ErrorCode SlotStatus(const MasterService& service, uint16_t slot) {
+        return service.CheckSlotServiceability(slot);
+    }
+
+    class AcceptVSegmentCommitter : public vsegment::VSegmentStateCommitter {
+       public:
+        ErrorCode Commit(const vsegment::PartitionVSegmentSnapshot&,
+                         const std::string&, std::string*) override {
+            return ErrorCode::OK;
+        }
+    };
+
     static bool IsOpLogEnabled(const MasterService& service) {
         return service.enable_oplog_;
     }
@@ -618,6 +640,73 @@ class MasterServiceHATest : public ::testing::Test {
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
+TEST_F(MasterServiceHATest, GainedSlotsWaitForMetadataAndRemainPendingOnRetry) {
+    MasterService service(MasterServiceConfig{});
+    ExpectSlots(service, {7});
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::SLOT_MIGRATING);
+    ExpectSlots(service, {7});
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::SLOT_MIGRATING);
+    ReadySlots(service, {7});
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::OK);
+    ExpectSlots(service, {7, 8});
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::OK);
+    EXPECT_EQ(SlotStatus(service, 8), ErrorCode::SLOT_MIGRATING);
+    ExpectSlots(service, {8});
+    ReadySlots(service, {7});  // A late completion cannot reacquire a lost slot.
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::SLOT_NOT_OWNED);
+}
+
+TEST_F(MasterServiceHATest, VSegmentRpcRejectsUnreadyAndReleasedPartitions) {
+    MasterService service(MasterServiceConfig{});
+    ExpectSlots(service, {7});
+    auto view = service.GetVSegmentView("7", "vs-7");
+    ASSERT_FALSE(view);
+    EXPECT_EQ(view.error(), ErrorCode::SLOT_MIGRATING);
+    auto start = service.VSegmentPutStart("7", 1, "put", 64, "default");
+    EXPECT_EQ(start.error, ErrorCode::SLOT_MIGRATING);
+    EXPECT_EQ(service.VSegmentPutRevoke("7", "vs-7", 1, "put"),
+              ErrorCode::SLOT_MIGRATING);
+    ExpectSlots(service, {});
+    EXPECT_EQ(service.VSegmentPutRevoke("7", "vs-7", 1, "put"),
+              ErrorCode::SLOT_NOT_OWNED);
+}
+
+#ifdef STORE_USE_ETCD
+TEST_F(MasterServiceHATest, SlotExportRetainsVSegmentStateUntilImportAck) {
+    vsegment::PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "test-policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {{.name = "default",
+                            .member_count = 1,
+                            .stripe_size = 64,
+                            .member_extent_size = 256,
+                            .io_alignment = 8,
+                            .required_medium = "DRAM"}};
+    quota.quotas = {{"7", "default", "DRAM", {{"segment-a", 0, 512}}}};
+    auto vsegments = std::make_shared<vsegment::VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(
+                  "7", 1, std::make_shared<AcceptVSegmentCommitter>()),
+              ErrorCode::OK);
+    MasterService service(MasterServiceConfig{});
+    service.SetVSegmentService(vsegments);
+    ExpectSlots(service, {7});
+    ReadySlots(service, {7});
+    auto early = service.InterMasterExportSlot(7, "target");
+    ASSERT_FALSE(early);
+    EXPECT_EQ(early.error(), ErrorCode::SLOT_MIGRATING);
+    ExpectSlots(service, {});
+    auto exported = service.InterMasterExportSlot(7, "target");
+    ASSERT_TRUE(exported);
+    ASSERT_TRUE(exported->vsegment_partition);
+    EXPECT_EQ(exported->vsegment_partition->partition_id, "7");
+    vsegment::PartitionVSegmentSnapshot state;
+    EXPECT_EQ(vsegments->SnapshotPartition("7", &state), ErrorCode::OK);
+    ASSERT_TRUE(service.InterMasterAckSlotImported(7, "target"));
+    EXPECT_EQ(vsegments->SnapshotPartition("7", &state), ErrorCode::STALE_ROUTE);
+}
+#endif
 
 TEST_F(MasterServiceHATest,
        PutStartWithoutWritableSegmentsDoesNotArmMemoryEviction) {

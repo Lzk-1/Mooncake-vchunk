@@ -2346,6 +2346,8 @@ class MasterService {
     // 归属变更日志（P1）：缓存最近一次解析到的 primary 成员列表（已排序去重），
     // 用于在成员增删时打印 joined/left 根因，仅变化时打印一次。
     std::vector<std::string> cvm_last_primary_ids_;
+    // Revision of the membership read used to derive this local ring.
+    ViewVersionId cvm_ring_revision_{0};
     // 迁移旧环（Phase 3）：成员列表发生变化「前」的 primary 列表，供
     // ImportSlotMetadata 推导 gained slot 的上一任 owner（旧 owner 直传）。
     // 仅在 membership 变化时更新，保持不变时维持旧值以支持 acquire 重试。
@@ -2362,7 +2364,8 @@ class MasterService {
     ErrorCode ImportSlotMetadata(uint16_t slot);
 
     // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
-    SlotMetadataExport BuildSlotMetadataExport(uint16_t slot) const;
+    tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
+        uint16_t slot) const;
     // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
     ErrorCode DropSlotMetadataLocal(uint16_t slot);
     // RPC 直传的 staged 导出缓存：旧 owner 在 on_release 时把导出结果放这里，
@@ -2373,13 +2376,14 @@ class MasterService {
     // A1：读路径 slot 所有权校验。UpdateExpectedSlots 由心跳 resolver 与晋升
     // 路径调用，写 expected_owned_ 位图（ring 推导的应拥有集合）；MarkSlotsReady
     // 把已完成元数据导入的 slot 置入 ready_owned_。OwnsSlot 读 ready_owned_。
-    // Phase 1 行为等价：expected 更新时 ready 全量跟随。
+    // Gained slots become ready only after object/vsegment import succeeds.
     void UpdateExpectedSlots(const std::vector<uint16_t>& slots);
     void MarkSlotsReady(const std::vector<uint16_t>& slots);
     bool OwnsSlot(uint16_t slot) const;
     // 读/写路径 slot 可服务性校验（Phase 4）：ready_owned_ → OK；expected 但
     // !ready → SLOT_MIGRATING（新 owner 正在导入元数据）；否则 → SLOT_NOT_OWNED。
     ErrorCode CheckSlotServiceability(uint16_t slot) const;
+    ErrorCode CheckVSegmentServiceability(const std::string& partition_id) const;
     // 读路径转发：解析任意 slot 的 owner master_id（基于一致性哈希环与
     // etcd 中的 primary master 列表）。解析失败返回 nullopt。供 GetReplicaList
     // / BatchGetReplicaList 在 OwnsSlot 失败时向 slot owner 转发请求。
@@ -2600,7 +2604,7 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
-    ErrorCode RefreshVSegmentOwnership();
+    ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

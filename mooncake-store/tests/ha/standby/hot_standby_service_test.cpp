@@ -57,7 +57,9 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
 }
 
 ha::MasterSources MakeTestSources() {
-    return {{"primary_unused", "primary_unused"}};
+    // These fixtures write BuildBatchRecordKey(cluster_id, ...) without a
+    // source namespace. The reader must use the same legacy namespace.
+    return {{"", "primary_unused"}};
 }
 
 }  // namespace
