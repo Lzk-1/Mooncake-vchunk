@@ -1008,7 +1008,7 @@ vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
 }
 
 ErrorCode MasterClient::VSegmentPutEnd(
-    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
     const std::string& operation_id, const std::string& object_id) {
     auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
         auto target = ResolveVSegmentSubmaster(replica.partition_id);

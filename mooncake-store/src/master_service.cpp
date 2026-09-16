@@ -1516,6 +1516,20 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
 #else
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
 ErrorCode MasterService::RefreshVSegmentOwnership() { return ErrorCode::OK; }
+ErrorCode MasterService::StartInterMasterRpc() { return ErrorCode::OK; }
+void MasterService::StopInterMasterRpc() {}
+
+tl::expected<std::vector<Replica>, ErrorCode>
+MasterService::TryAllocateReplicasRemotely(
+    const std::string& /*key*/, const TenantId& /*tenant_id*/,
+    uint64_t /*value_length*/, size_t /*replica_num*/,
+    const std::vector<std::string>& /*preferred_segments*/) {
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+void MasterService::EnqueueRemoteFreeIfTracked(
+    const TenantId& /*tenant_id*/, const std::string& /*key*/,
+    QuotaEraseMode /*quota_mode*/) {}
 
 SlotMetadataExport MasterService::BuildSlotMetadataExport(
     uint16_t /*slot*/) const {
@@ -4701,7 +4715,7 @@ vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
 }
 
 ErrorCode MasterService::VSegmentPutEnd(
-    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
     const std::string& operation_id, const std::string& object_id) {
     if (!vsegment_service_) return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     return vsegment_service_->CommitPut(replica, route_epoch, operation_id,
@@ -5718,7 +5732,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    std::vector<vsegment::VSegmentDescriptor> committed_vsegments;
+    std::vector<VSegmentDescriptor> committed_vsegments;
     ErrorCode vsegment_commit_error = ErrorCode::OK;
     metadata.VisitReplicas(
         &Replica::fn_is_vsegment_replica,

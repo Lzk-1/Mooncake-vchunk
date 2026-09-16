@@ -1,6 +1,31 @@
 #include "vsegment/vsegment_service.h"
 
+#include "vsegment/vsegment_metrics.h"
+
 namespace mooncake::vsegment {
+
+void VSegmentService::RefreshMetrics() {
+    std::vector<std::shared_ptr<VSegmentManager>> managers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, manager] : partitions_) {
+            (void)id;
+            managers.push_back(manager);
+        }
+    }
+    uint64_t total = 0, free = 0, reservations = 0, committed = 0,
+             pending = 0;
+    for (const auto& manager : managers) {
+        const auto stats = manager->Stats();
+        total += stats.logical_capacity_bytes;
+        free += stats.logical_free_bytes;
+        reservations += stats.reservations;
+        committed += stats.committed_allocations;
+        pending += stats.pending_creations;
+    }
+    VSegmentMetrics::Instance().SetCapacity(total, free, reservations,
+                                            committed, pending);
+}
 
 std::shared_ptr<VSegmentManager> VSegmentService::FindPartition(
     const std::string& partition_id) {
@@ -29,7 +54,10 @@ ErrorCode VSegmentService::AddPartition(
         auto state = *recovered;
         state.route_epoch = route_epoch;
         result = manager->Restore(state, detail);
-        if (result != ErrorCode::OK) return result;
+        if (result != ErrorCode::OK) {
+            VSegmentMetrics::Instance().IncRecoveryFailure();
+            return result;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -40,7 +68,9 @@ ErrorCode VSegmentService::AddPartition(
     // Keep the manager installed if precreation persistence fails. Its
     // already-durable views must remain reserved, and the next ownership
     // reconciliation can safely retry only the missing count.
-    return manager->EnsureInitialVSegments(detail);
+    result = manager->EnsureInitialVSegments(detail);
+    RefreshMetrics();
+    return result;
 }
 
 ErrorCode VSegmentService::RemovePartition(const std::string& partition_id,
@@ -57,6 +87,7 @@ ErrorCode VSegmentService::RemovePartition(const std::string& partition_id,
     }
     // Destruction outside the registry lock waits for any asynchronous
     // creation without blocking unrelated Partitions.
+    RefreshMetrics();
     return ErrorCode::OK;
 }
 
@@ -133,7 +164,11 @@ ErrorCode VSegmentService::ReconcileObjectReferences(
     std::string* detail) {
     auto manager = FindPartition(partition_id);
     if (!manager) return ErrorCode::STALE_ROUTE;
-    return manager->ReconcileObjectReferences(references, detail);
+    const auto result = manager->ReconcileObjectReferences(references, detail);
+    if (result != ErrorCode::OK)
+        VSegmentMetrics::Instance().IncRecoveryFailure();
+    RefreshMetrics();
+    return result;
 }
 
 VSegmentPutStartResult VSegmentService::StartPut(
@@ -144,7 +179,12 @@ VSegmentPutStartResult VSegmentService::StartPut(
     if (!manager)
         return {ErrorCode::STALE_ROUTE, operation_id, {},
                 "Partition is not owned by this SubMaster"};
-    return manager->StartPut(operation_id, length, profile_name, route_epoch);
+    auto result =
+        manager->StartPut(operation_id, length, profile_name, route_epoch);
+    if (result.error == ErrorCode::STALE_ROUTE)
+        VSegmentMetrics::Instance().IncStaleRoute();
+    RefreshMetrics();
+    return result;
 }
 
 VSegmentPutStartResult VSegmentService::StartPutOwned(
@@ -154,8 +194,10 @@ VSegmentPutStartResult VSegmentService::StartPutOwned(
     if (!manager)
         return {ErrorCode::STALE_ROUTE, operation_id, {},
                 "Partition is not owned by this SubMaster"};
-    return manager->StartPut(operation_id, length, profile_name,
-                             manager->Snapshot().route_epoch);
+    auto result = manager->StartPut(operation_id, length, profile_name,
+                                    manager->Snapshot().route_epoch);
+    RefreshMetrics();
+    return result;
 }
 
 tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode>
@@ -173,8 +215,11 @@ VSegmentService::StartPutReplicasOwned(
         auto result = manager->StartPut(operation_id, length, profile_name,
                                         epoch, selected);
         if (!result) {
+            // The group was not returned to the caller. Roll its earlier
+            // reservations back without creating terminal abort tombstones,
+            // allowing the same operation ids to retry after async creation.
             for (const auto& prior : results) {
-                const auto rollback = manager->AbortPut(
+                const auto rollback = manager->RollbackPutReservation(
                     prior.replica.vsegment_id, prior.operation_id, epoch);
                 if (rollback != ErrorCode::OK)
                     return tl::make_unexpected(rollback);
@@ -184,6 +229,7 @@ VSegmentService::StartPutReplicasOwned(
         selected.push_back(result.replica.vsegment_id);
         results.push_back(std::move(result));
     }
+    RefreshMetrics();
     return results;
 }
 
@@ -199,6 +245,7 @@ ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
                                      object_id, &committed, route_epoch,
                                      &expected);
     if (result != ErrorCode::OK) return result;
+    RefreshMetrics();
     return ErrorCode::OK;
 }
 
@@ -216,8 +263,11 @@ ErrorCode VSegmentService::AbortPut(const std::string& partition_id,
                                     uint64_t route_epoch,
                                     const std::string& operation_id) {
     auto manager = FindPartition(partition_id);
-    return manager ? manager->AbortPut(vsegment_id, operation_id, route_epoch)
-                   : ErrorCode::STALE_ROUTE;
+    if (!manager) return ErrorCode::STALE_ROUTE;
+    const auto result =
+        manager->AbortPut(vsegment_id, operation_id, route_epoch);
+    RefreshMetrics();
+    return result;
 }
 
 ErrorCode VSegmentService::AbortPutOwned(
@@ -238,13 +288,19 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
     // Keep the registry lock through release so a concurrent route reconcile
     // cannot detach or advance this manager between ownership validation and
     // the persistent logical-range update.
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     auto found = partitions_.find(replica.partition_id);
     if (found == partitions_.end()) return ErrorCode::STALE_ROUTE;
     const auto epoch = found->second->Snapshot().route_epoch;
     const auto result = found->second->ReleaseObject(
         replica.vsegment_id, object_id,
         {replica.logical_offset, replica.length}, epoch);
+    lock.unlock();
+    if (result == ErrorCode::OK || result == ErrorCode::OBJECT_NOT_FOUND)
+        VSegmentMetrics::Instance().IncReleaseSuccess();
+    else
+        VSegmentMetrics::Instance().IncReleaseFailure();
+    RefreshMetrics();
     return result == ErrorCode::OBJECT_NOT_FOUND ? ErrorCode::OK : result;
 }
 

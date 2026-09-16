@@ -5,6 +5,8 @@
 #include <future>
 #include <set>
 
+#include "vsegment/vsegment_metrics.h"
+
 namespace mooncake::vsegment {
 namespace {
 
@@ -76,7 +78,11 @@ VSegmentAllocationResult VSegmentManager::Create(
     const auto creation_key = partition_id_ + "/" + profile_name;
     auto result = profile_creation_coordinator_.GetOrCreate(
         creation_key,
-        [&] { return CreateSingleFlight(profile_name); });
+        [&] { return CreateSingleFlight(profile_name, 0); });
+    if (result)
+        VSegmentMetrics::Instance().IncCreateSuccess();
+    else
+        VSegmentMetrics::Instance().IncCreateFailure();
     return result;
 }
 
@@ -86,6 +92,11 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
         return ManagerError(ErrorCode::INVALID_PARAMS,
                             "unknown vsegment profile: " + profile_name);
     const auto key = partition_id_ + "/" + profile_name;
+    uint64_t creation_epoch = 0;
+    {
+        std::lock_guard<std::mutex> state_lock(mutex_);
+        creation_epoch = route_epoch_;
+    }
     std::lock_guard<std::mutex> lock(pending_mutex_);
     auto pending = pending_creations_.find(key);
     if (pending != pending_creations_.end()) {
@@ -98,7 +109,23 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
     } else {
         pending_creations_.emplace(
             key, std::async(std::launch::async,
-                            [this, profile_name] { return Create(profile_name); })
+                            [this, profile_name, creation_epoch] {
+                                const auto creation_key =
+                                    partition_id_ + "/" + profile_name;
+                                auto result =
+                                    profile_creation_coordinator_.GetOrCreate(
+                                        creation_key, [&] {
+                                            return CreateSingleFlight(
+                                                profile_name, creation_epoch);
+                                        });
+                                if (result)
+                                    VSegmentMetrics::Instance()
+                                        .IncCreateSuccess();
+                                else
+                                    VSegmentMetrics::Instance()
+                                        .IncCreateFailure();
+                                return result;
+                            })
                      .share());
     }
     return ManagerError(ErrorCode::VSEGMENT_CREATING,
@@ -184,13 +211,18 @@ VSegmentPutStartResult VSegmentManager::StartPut(
 }
 
 VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
-    const std::string& profile_name) {
+    const std::string& profile_name, uint64_t expected_route_epoch) {
     auto profile = profiles_.find(profile_name);
     if (profile == profiles_.end()) {
         return ManagerError(ErrorCode::INVALID_PARAMS,
                             "unknown vsegment profile: " + profile_name);
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (expected_route_epoch != 0 && route_epoch_ != expected_route_epoch) {
+        VSegmentMetrics::Instance().IncStaleRoute();
+        return ManagerError(ErrorCode::STALE_ROUTE,
+                            "vsegment creation route epoch is stale");
+    }
     for (auto& [id, pending] : vsegments_) {
         if (pending.profile_name != profile_name ||
             pending.lifecycle != Lifecycle::PREPARING)
@@ -237,8 +269,10 @@ VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
 
 ErrorCode VSegmentManager::SetRouteEpoch(uint64_t route_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (route_epoch == 0 || route_epoch < route_epoch_)
+    if (route_epoch == 0 || route_epoch < route_epoch_) {
+        VSegmentMetrics::Instance().IncStaleRoute();
         return ErrorCode::STALE_ROUTE;
+    }
     route_epoch_ = route_epoch;
     return ErrorCode::OK;
 }
@@ -370,6 +404,28 @@ ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,
     const auto operations_before = operation_vsegments_;
     TrimOperationTombstonesLocked(managed->second,
                                   max_operation_tombstones_);
+    const auto persisted = PersistLocked("logical_abort");
+    if (persisted != ErrorCode::OK) {
+        managed->second.logical_allocator->Restore(before);
+        operation_vsegments_ = operations_before;
+    }
+    return persisted;
+}
+
+ErrorCode VSegmentManager::RollbackPutReservation(
+    const std::string& vsegment_id, const std::string& operation_id,
+    uint64_t expected_route_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (route_epoch_ != 0 && expected_route_epoch != route_epoch_)
+        return ErrorCode::STALE_ROUTE;
+    auto managed = vsegments_.find(vsegment_id);
+    if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+    const auto before = managed->second.logical_allocator->Snapshot();
+    const auto operations_before = operation_vsegments_;
+    const auto result =
+        managed->second.logical_allocator->CancelReservation(operation_id);
+    if (result != ErrorCode::OK) return result;
+    operation_vsegments_.erase(operation_id);
     const auto persisted = PersistLocked("logical_abort");
     if (persisted != ErrorCode::OK) {
         managed->second.logical_allocator->Restore(before);
@@ -543,7 +599,10 @@ ErrorCode VSegmentManager::PersistLocked(const std::string& mutation,
     }
     ++metadata_revision_;
     auto result = committer_->Commit(SnapshotLocked(), mutation, detail);
-    if (result != ErrorCode::OK) --metadata_revision_;
+    if (result != ErrorCode::OK) {
+        --metadata_revision_;
+        VSegmentMetrics::Instance().IncPersistenceFailure();
+    }
     return result;
 }
 
@@ -745,6 +804,9 @@ VSegmentManagerStats VSegmentManager::Stats() const {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, managed] : vsegments_) {
+            stats.logical_capacity_bytes += managed.view.logical_capacity;
+            stats.logical_free_bytes +=
+                managed.logical_allocator->FreeBytes();
             switch (managed.lifecycle) {
                 case Lifecycle::PREPARING:
                     ++stats.preparing;
@@ -766,7 +828,12 @@ VSegmentManagerStats VSegmentManager::Stats() const {
         }
     }
     std::lock_guard<std::mutex> pending_lock(pending_mutex_);
-    stats.pending_creations = pending_creations_.size();
+    for (const auto& [key, creation] : pending_creations_) {
+        (void)key;
+        if (creation.wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready)
+            ++stats.pending_creations;
+    }
     return stats;
 }
 

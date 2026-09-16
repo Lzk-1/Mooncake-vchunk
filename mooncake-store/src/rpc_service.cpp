@@ -348,7 +348,7 @@ vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
 }
 
 ErrorCode WrappedMasterService::VSegmentPutEnd(
-    const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
     const std::string& operation_id, const std::string& object_id) {
     return master_service_.VSegmentPutEnd(replica, route_epoch, operation_id,
                                           object_id);

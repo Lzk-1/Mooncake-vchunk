@@ -51,6 +51,8 @@ struct VSegmentPutStartResult {
 YLT_REFL(VSegmentPutStartResult, error, operation_id, replica, detail);
 
 struct VSegmentManagerStats {
+    uint64_t logical_capacity_bytes{0};
+    uint64_t logical_free_bytes{0};
     size_t preparing{0};
     size_t active{0};
     size_t draining{0};
@@ -109,6 +111,9 @@ class VSegmentManager {
     ErrorCode AbortPut(const std::string& vsegment_id,
                        const std::string& operation_id,
                        uint64_t expected_route_epoch = 0);
+    ErrorCode RollbackPutReservation(const std::string& vsegment_id,
+                                     const std::string& operation_id,
+                                     uint64_t expected_route_epoch = 0);
     ErrorCode ReleaseObject(const std::string& vsegment_id,
                             const std::string& allocation_id,
                             LogicalRange range,
@@ -134,7 +139,8 @@ class VSegmentManager {
         std::unique_ptr<LogicalRangeAllocator> logical_allocator;
     };
 
-    VSegmentAllocationResult CreateSingleFlight(const std::string& profile_name);
+    VSegmentAllocationResult CreateSingleFlight(const std::string& profile_name,
+                                                 uint64_t expected_route_epoch = 0);
     PartitionVSegmentSnapshot SnapshotLocked() const;
     ErrorCode PersistLocked(const std::string& mutation,
                             std::string* detail = nullptr);

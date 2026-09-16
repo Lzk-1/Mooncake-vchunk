@@ -1,11 +1,93 @@
 #include "vsegment/vsegment_ha.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
+#include <unordered_set>
 
 #include "mooncake_logging.h"
 
 namespace mooncake::vsegment {
+namespace {
+
+bool SameState(const VSegmentStateSnapshot& left,
+               const VSegmentStateSnapshot& right) {
+    std::string left_json;
+    std::string right_json;
+    struct_json::to_json(left, left_json);
+    struct_json::to_json(right, right_json);
+    return left_json == right_json;
+}
+
+VSegmentStateDelta BuildDelta(const PartitionVSegmentSnapshot& before,
+                              const PartitionVSegmentSnapshot& after) {
+    VSegmentStateDelta delta;
+    std::unordered_map<std::string, const VSegmentStateSnapshot*> old;
+    for (const auto& item : before.vsegments)
+        old.emplace(item.view.vsegment_id, &item);
+    std::unordered_set<std::string> present;
+    for (const auto& item : after.vsegments) {
+        present.insert(item.view.vsegment_id);
+        auto found = old.find(item.view.vsegment_id);
+        if (found == old.end() || !SameState(*found->second, item))
+            delta.upserted_vsegments.push_back(item);
+    }
+    for (const auto& item : before.vsegments) {
+        if (!present.count(item.view.vsegment_id))
+            delta.removed_vsegment_ids.push_back(item.view.vsegment_id);
+    }
+    for (const auto& [operation, vsegment] : after.operation_vsegments) {
+        auto found = before.operation_vsegments.find(operation);
+        if (found == before.operation_vsegments.end() ||
+            found->second != vsegment)
+            delta.upserted_operations.emplace(operation, vsegment);
+    }
+    for (const auto& [operation, vsegment] : before.operation_vsegments) {
+        (void)vsegment;
+        if (!after.operation_vsegments.count(operation))
+            delta.removed_operation_ids.push_back(operation);
+    }
+    return delta;
+}
+
+ErrorCode ApplyDelta(const VSegmentOpLogRecord& record,
+                     PartitionVSegmentSnapshot* state,
+                     std::string* detail) {
+    std::unordered_set<std::string> removed(
+        record.delta.removed_vsegment_ids.begin(),
+        record.delta.removed_vsegment_ids.end());
+    state->vsegments.erase(
+        std::remove_if(state->vsegments.begin(), state->vsegments.end(),
+                       [&](const auto& item) {
+                           return removed.count(item.view.vsegment_id) != 0;
+                       }),
+        state->vsegments.end());
+    for (const auto& replacement : record.delta.upserted_vsegments) {
+        if (replacement.view.vsegment_id.empty()) {
+            if (detail) *detail = "delta contains an empty vsegment id";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        auto found = std::find_if(
+            state->vsegments.begin(), state->vsegments.end(),
+            [&](const auto& item) {
+                return item.view.vsegment_id == replacement.view.vsegment_id;
+            });
+        if (found == state->vsegments.end())
+            state->vsegments.push_back(replacement);
+        else
+            *found = replacement;
+    }
+    for (const auto& operation : record.delta.removed_operation_ids)
+        state->operation_vsegments.erase(operation);
+    for (const auto& [operation, vsegment] :
+         record.delta.upserted_operations)
+        state->operation_vsegments[operation] = vsegment;
+    state->route_epoch = record.route_epoch;
+    state->metadata_revision = record.metadata_revision;
+    return ErrorCode::OK;
+}
+
+}  // namespace
 
 ErrorCode OrderedOpLogVSegmentCommitter::Commit(
     const PartitionVSegmentSnapshot& state, const std::string& mutation,
@@ -15,8 +97,21 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
         if (detail) *detail = "invalid vsegment OpLog commit";
         return ErrorCode::INVALID_PARAMS;
     }
-    VSegmentOpLogRecord record{state.partition_id, state.route_epoch,
-                               state.metadata_revision, mutation, state};
+    std::unique_lock<std::mutex> commit_lock(mutex_);
+    VSegmentOpLogRecord record;
+    record.partition_id = state.partition_id;
+    record.route_epoch = state.route_epoch;
+    record.metadata_revision = state.metadata_revision;
+    record.mutation = mutation;
+    auto previous = last_states_.find(state.partition_id);
+    if (previous == last_states_.end() ||
+        previous->second.metadata_revision + 1 != state.metadata_revision) {
+        record.full_state = true;
+        record.state = state;
+    } else {
+        record.full_state = false;
+        record.delta = BuildDelta(previous->second, state);
+    }
     std::string payload;
     struct_json::to_json(record, payload);
     OpLogEntry entry;
@@ -51,6 +146,16 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
         if (detail) *detail = "failed to enqueue vsegment OpLog entry";
         return pending.error();
     }
+    // REMOVE/PUT_END durable callbacks may release vsegment allocations. A
+    // synchronous wait from the writer's callback thread would wait for a
+    // callback queued behind itself. The object-metadata record is already
+    // durable in this context and is authoritative during recovery, so the
+    // accepted vsegment delta may complete asynchronously without weakening
+    // crash consistency.
+    if (writer_->IsCallbackThread()) {
+        last_states_[state.partition_id] = state;
+        return ErrorCode::OK;
+    }
     std::unique_lock<std::mutex> lock(wait->mutex);
     // Once Commit accepts an entry it cannot be cancelled: the ordered writer
     // may persist it after any local timeout. Returning failure here would make
@@ -64,6 +169,7 @@ ErrorCode OrderedOpLogVSegmentCommitter::Commit(
             << pending->sequence_id()
             << ", writer_error=" << writer_->LastError();
     }
+    last_states_[state.partition_id] = state;
     return ErrorCode::OK;
 }
 
@@ -89,25 +195,33 @@ ErrorCode ReplayVSegmentState(
             return ErrorCode::INVALID_PARAMS;
         }
         if (record.partition_id != base.partition_id ||
-            record.state.partition_id != base.partition_id) {
+            (record.full_state &&
+             record.state.partition_id != base.partition_id)) {
             if (detail) *detail = "vsegment OpLog Partition mismatch";
             return ErrorCode::INVALID_PARAMS;
         }
         if (record.metadata_revision <= revision) continue;
+        if (record.route_epoch < recovered->route_epoch ||
+            (record.full_state &&
+             record.state.route_epoch != record.route_epoch)) {
+            if (detail) *detail = "stale vsegment route epoch";
+            return ErrorCode::STALE_ROUTE;
+        }
         if (record.metadata_revision != revision + 1) {
             if (detail) *detail = "vsegment OpLog revision gap";
             return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
         }
-        if (record.route_epoch < recovered->route_epoch ||
-            record.state.route_epoch != record.route_epoch) {
-            if (detail) *detail = "stale vsegment route epoch";
-            return ErrorCode::STALE_ROUTE;
-        }
-        if (record.state.metadata_revision != record.metadata_revision) {
+        if (record.full_state &&
+            record.state.metadata_revision != record.metadata_revision) {
             if (detail) *detail = "vsegment OpLog revision mismatch";
             return ErrorCode::INVALID_VERSION;
         }
-        *recovered = std::move(record.state);
+        if (record.full_state) {
+            *recovered = std::move(record.state);
+        } else {
+            const auto applied = ApplyDelta(record, recovered, detail);
+            if (applied != ErrorCode::OK) return applied;
+        }
         revision = record.metadata_revision;
     }
     return ErrorCode::OK;

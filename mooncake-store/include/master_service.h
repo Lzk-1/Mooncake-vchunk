@@ -189,7 +189,7 @@ class MasterService {
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
         const std::string& profile_name = {});
-    ErrorCode VSegmentPutEnd(const vsegment::VSegmentDescriptor& replica,
+    ErrorCode VSegmentPutEnd(const VSegmentDescriptor& replica,
                              uint64_t route_epoch,
                              const std::string& operation_id,
                              const std::string& object_id);
@@ -1283,6 +1283,10 @@ class MasterService {
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
+                if (replica.is_vsegment_replica()) {
+                    return replica.get_vsegment_descriptor().vsegment_id ==
+                           segment_name;
+                }
                 auto names = replica.get_segment_names();
                 for (auto& name_opt : names) {
                     if (name_opt == segment_name) {

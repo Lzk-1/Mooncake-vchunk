@@ -78,6 +78,7 @@ class VSegmentService final : public VSegmentViewProvider {
                        std::string* detail = nullptr) override;
 
    private:
+    void RefreshMetrics();
     std::shared_ptr<VSegmentManager> FindPartition(
         const std::string& partition_id);
 

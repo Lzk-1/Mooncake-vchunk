@@ -75,6 +75,10 @@ class Client {
         std::shared_ptr<vsegment::VSegmentTransferPlanner> planner) {
         vsegment_transfer_planner_ = std::move(planner);
     }
+    void SetReplicaTransferStagingAllocator(
+        std::shared_ptr<ClientBufferAllocator> allocator) {
+        replica_transfer_staging_allocator_ = std::move(allocator);
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -871,6 +875,9 @@ class Client {
     std::unique_ptr<vsegment::VSegmentViewCache> vsegment_view_cache_;
     std::shared_ptr<vsegment::VSegmentTransferPlanner>
         vsegment_transfer_planner_;
+    // Registered client memory used when Copy/Move reads a non-local source
+    // (notably a striped vsegment) before writing ordinary target replicas.
+    std::shared_ptr<ClientBufferAllocator> replica_transfer_staging_allocator_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

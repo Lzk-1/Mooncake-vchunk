@@ -4189,16 +4189,16 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
     };
 
-    // currently only memory source replica is supported
-    if (!source.is_memory_replica()) {
+    if (!source.is_memory_replica() && !source.is_vsegment_replica()) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
                    << ", key=" << key << ", error=invalid_replica_type";
         revoke_lambda();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source)) {
+    // A local memory source can be transferred zero-copy. A vsegment source
+    // is remote and striped, so read it into registered staging memory first.
+    if (source.is_memory_replica() && !IsReplicaOnLocalMemory(source)) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
                    << ", key=" << key
                    << ", error=source_replica_not_in_local_memory";
@@ -4206,12 +4206,35 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
     }
 
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    auto slices = split_into_slices(buffer, buffer_descriptor.size_);
+    std::optional<BufferHandle> staging;
+    std::vector<Slice> slices;
+    if (source.is_memory_replica()) {
+        const auto& buffer_descriptor =
+            source.get_memory_descriptor().buffer_descriptor;
+        void* buffer =
+            reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
+        slices = split_into_slices(buffer, buffer_descriptor.size_);
+    } else {
+        if (!replica_transfer_staging_allocator_) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key
+                       << ", error=staging_allocator_unavailable";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        const auto length =
+            source.get_vsegment_descriptor().length;
+        staging = replica_transfer_staging_allocator_->allocate(length);
+        if (!staging) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        slices = split_into_slices(*staging);
+        if (TransferRead(source, slices) != ErrorCode::OK) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+    }
 
     // Transfer to each target
     for (const auto& target : targets) {

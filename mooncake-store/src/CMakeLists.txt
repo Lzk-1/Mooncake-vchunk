@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_SOURCES
     vsegment/vsegment_ha.cpp
     vsegment/vsegment_service.cpp
     vsegment/vsegment_manager.cpp
+    vsegment/vsegment_metrics.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp

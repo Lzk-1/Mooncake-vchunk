@@ -6,6 +6,7 @@
 #include "vsegment/vsegment_ha.h"
 #include "vsegment/vsegment_service.h"
 #include "vsegment/vsegment_manager.h"
+#include "vsegment/vsegment_metrics.h"
 #include "vsegment/partition_quota_planner.h"
 #include "master_service.h"
 
@@ -45,6 +46,16 @@ struct LegacyLogicalAllocationSnapshot {
 };
 YLT_REFL(LegacyLogicalAllocationSnapshot, logical_capacity, free_ranges,
          reservations, completed_operations);
+
+struct LegacyVSegmentOpLogRecord {
+    std::string partition_id;
+    uint64_t route_epoch{0};
+    uint64_t metadata_revision{0};
+    std::string mutation;
+    PartitionVSegmentSnapshot state;
+};
+YLT_REFL(LegacyVSegmentOpLogRecord, partition_id, route_epoch,
+         metadata_revision, mutation, state);
 
 TEST(VSegmentKeysTest, PartitionQuotaSnapshotIsClusterScoped) {
     EXPECT_EQ(cvm::VSegmentPartitionQuotaSnapshotKey("cluster-a"),
@@ -455,6 +466,16 @@ TEST(LogicalRangeAllocatorTest, RejectsLengthChangeOnIdempotentRetry) {
     EXPECT_EQ(allocator.ReservationCount(), 1u);
 }
 
+TEST(LogicalRangeAllocatorTest, InternalRollbackAllowsOperationRetry) {
+    LogicalRangeAllocator allocator(128);
+    auto first = allocator.Reserve("put-1", 64);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(allocator.CancelReservation("put-1"), ErrorCode::OK);
+    auto retried = allocator.Reserve("put-1", 64);
+    ASSERT_TRUE(retried);
+    EXPECT_EQ(retried.range.offset, first.range.offset);
+}
+
 TEST(VSegmentResolverTest, SplitsAtStripeAndClientSliceBoundaries) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -648,17 +669,29 @@ TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
 TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
     CreationCoordinator coordinator;
     std::atomic<int> calls{0};
+    std::promise<void> factory_entered;
+    std::promise<void> release_factory;
+    auto release = release_factory.get_future().share();
+    std::atomic<bool> second_started{false};
     VSegmentAllocationResult first;
     VSegmentAllocationResult second;
     auto factory = [&] {
         ++calls;
-        std::this_thread::yield();
+        factory_entered.set_value();
+        release.wait();
         VSegmentAllocationResult result;
         result.view.vsegment_id = "vs-1";
         return result;
     };
     std::thread one([&] { first = coordinator.GetOrCreate("p/default/0", factory); });
-    std::thread two([&] { second = coordinator.GetOrCreate("p/default/0", factory); });
+    factory_entered.get_future().wait();
+    std::thread two([&] {
+        second_started = true;
+        second = coordinator.GetOrCreate("p/default/0", factory);
+    });
+    while (!second_started.load()) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    release_factory.set_value();
     one.join();
     two.join();
     EXPECT_EQ(calls, 1);
@@ -1095,10 +1128,83 @@ TEST(VSegmentHaTest, RejectsRevisionGapAndStaleEpoch) {
     record.route_epoch = 3;
     record.state.metadata_revision = 11;
     record.state.route_epoch = 3;
+    entry.payload.clear();
     struct_json::to_json(record, entry.payload);
     entry.checksum = ComputeOpLogChecksum(entry.payload);
     EXPECT_EQ(ReplayVSegmentState(base, {entry}, &recovered),
               ErrorCode::STALE_ROUTE);
+}
+
+TEST(VSegmentHaTest, ReplaysIncrementalDeltaAndLegacyFullState) {
+    PartitionVSegmentSnapshot base;
+    base.partition_id = "partition-1";
+    base.config_generation = 1;
+    base.route_epoch = 4;
+    base.metadata_revision = 10;
+    base.operation_vsegments["old-op"] = "vs-old";
+
+    VSegmentStateSnapshot added{"default", Lifecycle::ACTIVE, View(), {}};
+    added.view.partition_id = base.partition_id;
+    added.view.vsegment_id = "vs-new";
+    added.logical_allocation.logical_capacity = added.view.logical_capacity;
+    added.logical_allocation.free_ranges = {
+        {0, added.view.logical_capacity}};
+    VSegmentOpLogRecord delta;
+    delta.partition_id = base.partition_id;
+    delta.route_epoch = 4;
+    delta.metadata_revision = 11;
+    delta.mutation = "logical_reserve";
+    delta.full_state = false;
+    delta.delta.upserted_vsegments.push_back(added);
+    delta.delta.removed_operation_ids.push_back("old-op");
+    delta.delta.upserted_operations["new-op"] = "vs-new";
+    OpLogEntry delta_entry;
+    delta_entry.op_type = OpType::VSEGMENT_STATE;
+    struct_json::to_json(delta, delta_entry.payload);
+    delta_entry.checksum = ComputeOpLogChecksum(delta_entry.payload);
+
+    PartitionVSegmentSnapshot recovered;
+    std::string detail;
+    ASSERT_EQ(ReplayVSegmentState(base, {delta_entry}, &recovered, &detail),
+              ErrorCode::OK)
+        << detail;
+    ASSERT_EQ(recovered.vsegments.size(), 1u);
+    EXPECT_EQ(recovered.vsegments.front().view.vsegment_id, "vs-new");
+    EXPECT_FALSE(recovered.operation_vsegments.count("old-op"));
+    EXPECT_EQ(recovered.operation_vsegments.at("new-op"), "vs-new");
+
+    auto legacy_state = recovered;
+    legacy_state.metadata_revision = 12;
+    LegacyVSegmentOpLogRecord legacy{base.partition_id, 4, 12,
+                                     "logical_commit", legacy_state};
+    OpLogEntry legacy_entry;
+    legacy_entry.op_type = OpType::VSEGMENT_STATE;
+    struct_json::to_json(legacy, legacy_entry.payload);
+    legacy_entry.checksum = ComputeOpLogChecksum(legacy_entry.payload);
+    ASSERT_EQ(ReplayVSegmentState(recovered, {legacy_entry}, &recovered,
+                                  &detail),
+              ErrorCode::OK)
+        << detail;
+    EXPECT_EQ(recovered.metadata_revision, 12u);
+}
+
+TEST(VSegmentMetricsTest, ExportsCapacityAndFailureSignals) {
+    auto& metrics = VSegmentMetrics::Instance();
+    metrics.SetCapacity(1024, 256, 2, 3, 1);
+    metrics.IncCreateFailure();
+    metrics.IncPersistenceFailure();
+    metrics.IncStaleRoute();
+    const auto text = metrics.Serialize();
+    EXPECT_NE(text.find("mooncake_vsegment_logical_capacity_bytes 1024"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_logical_free_bytes 256"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_create_failure_total"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_persistence_failure_total"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_vsegment_stale_route_total"),
+              std::string::npos);
 }
 
 TEST(VSegmentHaTest, AcceptedCommitWaitsForDurabilityWithoutRollbackSignal) {
@@ -1125,6 +1231,42 @@ TEST(VSegmentHaTest, AcceptedCommitWaitsForDurabilityWithoutRollbackSignal) {
               std::future_status::timeout);
     allow_write = true;
     EXPECT_EQ(result.get(), ErrorCode::OK);
+    writer.Stop();
+}
+
+TEST(VSegmentHaTest, DurableMetadataCallbackCanPersistReleaseWithoutDeadlock) {
+    OrderedOpLogWriter writer(OrderedOpLogWriterConfig{},
+                              [](const OpLogBatchRecord&,
+                                 const DurablePrefix&) {
+                                  return ErrorCode::OK;
+                              });
+    writer.Start();
+    OrderedOpLogVSegmentCommitter committer(&writer);
+    PartitionVSegmentSnapshot state;
+    state.partition_id = "partition-1";
+    state.config_generation = 1;
+    state.route_epoch = 1;
+    state.metadata_revision = 1;
+    std::promise<ErrorCode> completed;
+    auto completion = completed.get_future();
+
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    OpLogEntry metadata_remove;
+    metadata_remove.op_type = OpType::REMOVE;
+    metadata_remove.object_key = "object-1";
+    metadata_remove.payload = "remove";
+    metadata_remove.checksum = ComputeOpLogChecksum(metadata_remove.payload);
+    auto pending = writer.Commit(
+        std::move(*reservation), std::move(metadata_remove),
+        [&](const OpLogEntry&) {
+            completed.set_value(
+                committer.Commit(state, "logical_release", nullptr));
+        });
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(completion.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(completion.get(), ErrorCode::OK);
     writer.Stop();
 }
 
@@ -1583,7 +1725,7 @@ TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
         if (result || result.error() != ErrorCode::VSEGMENT_CREATING) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
     ASSERT_EQ(result->size(), 2u);
     EXPECT_NE((*result)[0].replica.vsegment_id,
               (*result)[1].replica.vsegment_id);

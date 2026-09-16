@@ -64,6 +64,9 @@ class LogicalRangeAllocator {
     ErrorCode Commit(const std::string& operation_id,
                      const std::string& allocation_id, LogicalRange* range);
     ErrorCode Abort(const std::string& operation_id);
+    // Rolls back an internal, not-yet-returned reservation without recording
+    // a terminal operation outcome, so the same operation id may be retried.
+    ErrorCode CancelReservation(const std::string& operation_id);
     ErrorCode Release(const std::string& allocation_id, LogicalRange range);
 
     LogicalAllocationSnapshot Snapshot() const;

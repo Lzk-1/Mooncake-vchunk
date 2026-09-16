@@ -27,6 +27,7 @@
 #include "metadata_store.h"
 #include "partition/partition_router.h"
 #include "vsegment/vsegment.h"
+#include "vsegment/vsegment_transfer.h"
 
 namespace mooncake {
 
@@ -221,7 +222,7 @@ class MasterClient {
         const std::string& operation_id, uint64_t length,
         const std::string& profile_name = {});
     [[nodiscard]] ErrorCode VSegmentPutEnd(
-        const vsegment::VSegmentDescriptor& replica, uint64_t route_epoch,
+        const VSegmentDescriptor& replica, uint64_t route_epoch,
         const std::string& operation_id, const std::string& object_id);
     [[nodiscard]] ErrorCode VSegmentPutRevoke(
         const std::string& partition_id, const std::string& vsegment_id,
