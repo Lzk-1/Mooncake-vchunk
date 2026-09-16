@@ -1273,8 +1273,8 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
         prev_ids = cvm_prev_primary_ids_;
     }
-    const auto old_owner = cvm::ResolveSlotOwnerOnRing(prev_ids, slot);
-    if (!old_owner || old_owner->empty() || *old_owner == master_id_) {
+    const std::string old_owner = cvm::ResolveSlotOwnerOnRing(prev_ids, slot);
+    if (old_owner.empty() || old_owner == master_id_) {
         // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
         return ErrorCode::OK;
     }
@@ -1288,10 +1288,10 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
 
     // RPC 直传拉取旧 owner 的 slot 元数据导出（不落 etcd）。
     auto pull_result =
-        inter_master_rpc_->ExportSlot(*old_owner, slot, master_id_);
+        inter_master_rpc_->ExportSlot(old_owner, slot, master_id_);
     if (!pull_result.has_value()) {
         LOG(WARNING) << "ImportSlotMetadata: RPC pull failed slot=" << slot
-                     << ", old_owner=" << *old_owner
+                     << ", old_owner=" << old_owner
                      << ", err=" << toString(pull_result.error());
         return pull_result.error();
     }
@@ -1421,10 +1421,10 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     // RPC 直传：导入完成后通知旧 owner 删除本地元数据（ack）。ack 失败仅告警
     // 不阻断——旧 owner 残留元数据由其观察/lease 逻辑兜底清理。
     auto ack_result =
-        inter_master_rpc_->AckSlotImported(*old_owner, slot, master_id_);
+        inter_master_rpc_->AckSlotImported(old_owner, slot, master_id_);
     if (!ack_result.has_value()) {
         LOG(WARNING) << "ImportSlotMetadata: ack failed slot=" << slot
-                     << ", old_owner=" << *old_owner
+                     << ", old_owner=" << old_owner
                      << ", err=" << toString(ack_result.error());
     }
     return ErrorCode::OK;
