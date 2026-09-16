@@ -729,7 +729,7 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
             if (reference.committed) {
                 desired.completed_operations.push_back(
                     {operation_id, reference.allocation_id,
-                     OperationOutcome::COMMITTED, range});
+                     OperationOutcome::COMMITTED, range, 0});
             } else {
                 desired.reservations.push_back({operation_id, range});
             }

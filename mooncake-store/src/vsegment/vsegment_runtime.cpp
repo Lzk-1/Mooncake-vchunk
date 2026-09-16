@@ -100,7 +100,7 @@ ErrorCode LogicalRangeAllocator::Commit(const std::string& operation_id,
     committed_allocations_[allocation_id] = reservation->second;
     CompletedOperationRecord completed_record{
         operation_id, allocation_id, OperationOutcome::COMMITTED,
-        reservation->second};
+        reservation->second, 0};
     completed_record.completion_revision = next_completion_revision_++;
     completed_operations_.emplace(operation_id, std::move(completed_record));
     reservations_.erase(reservation);
@@ -136,7 +136,7 @@ ErrorCode LogicalRangeAllocator::Abort(const std::string& operation_id) {
     if (reservation == reservations_.end()) return ErrorCode::INVALID_WRITE;
     InsertAndMerge(free_ranges_, reservation->second);
     CompletedOperationRecord completed_record{
-        operation_id, {}, OperationOutcome::ABORTED, reservation->second};
+        operation_id, {}, OperationOutcome::ABORTED, reservation->second, 0};
     completed_record.completion_revision = next_completion_revision_++;
     completed_operations_.emplace(operation_id, std::move(completed_record));
     reservations_.erase(reservation);

@@ -56,6 +56,10 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     return snapshot;
 }
 
+ha::MasterSources MakeTestSources() {
+    return {{"primary_unused", "primary_unused"}};
+}
+
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -122,7 +126,7 @@ TEST_F(HotStandbyServiceTest, TestStart) {
         << "Requires real etcd connection, run in integration environment.";
 #else
     ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+        service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -136,10 +140,10 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
     // After the first Start fails and state becomes FAILED, the second Start
     // should still return INTERNAL_ERROR
     ErrorCode err1 =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+        service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
     ErrorCode err2 =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+        service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
 #endif
 }
@@ -150,7 +154,7 @@ TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
 #else
     std::string invalid_endpoints = "invalid_endpoint";
     ErrorCode err =
-        service_->Start("primary_unused", invalid_endpoints, cluster_id_);
+        service_->Start(MakeTestSources(), invalid_endpoints, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 #endif
 }
@@ -179,7 +183,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
     // to FAILED
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
     ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+        service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -193,7 +197,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
     // In non-etcd mode we cannot distinguish detailed connection errors; only
     // verify it doesn't crash
     ErrorCode err =
-        service_->Start("primary_unused", "bad_endpoint", cluster_id_);
+        service_->Start(MakeTestSources(), "bad_endpoint", cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 #endif
 }
@@ -206,7 +210,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
     // In non-etcd mode, the sync phase is not actually executed; just ensure
     // the call is safe
     ErrorCode err =
-        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+        service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 #endif
 }
@@ -230,7 +234,7 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
 #else
     // In non-etcd mode, calling Start will not change applied/primary, but the
     // state machine enters FAILED
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     StandbySyncStatus status = service_->GetSyncStatus();
     EXPECT_EQ(StandbyState::FAILED, status.state);
 #endif
@@ -311,7 +315,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
                     "test warm start.";
 #else
     // In non-etcd mode, only verify that Start is safe to call
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -320,7 +324,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd and snapshot provider configuration.";
 #else
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -333,7 +337,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     config_.enable_snapshot_bootstrap = true;
     // Recreate service to apply the new configuration
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -502,7 +506,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
 #else
     config_.enable_verification = true;
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif
@@ -514,7 +518,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd connection to start service.";
 #else
-    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    (void)service_->Start(MakeTestSources(), oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif
@@ -623,7 +627,7 @@ OpLogBatchRecord MakeVSegmentBatch(
     const vsegment::PartitionVSegmentSnapshot& state) {
     vsegment::VSegmentOpLogRecord record{
         state.partition_id, state.route_epoch, state.metadata_revision,
-        "test", state};
+        "test", state, true, {}};
     std::string payload;
     struct_json::to_json(record, payload);
     OpLogBatchRecord batch;
@@ -657,7 +661,7 @@ TEST_F(HotStandbyServiceTest,
     auto service = std::make_unique<HotStandbyService>(config);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK,
-              service->Start("primary_unused", "unused", cluster_id));
+              service->Start(MakeTestSources(), "unused", cluster_id));
 
     for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 1; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -692,7 +696,7 @@ TEST_F(HotStandbyServiceTest, ReplaysAndExportsVSegmentState) {
     auto service = std::make_unique<HotStandbyService>(config);
     service->SetCatchUpBatchKvBackendForTesting(backend);
     ASSERT_EQ(ErrorCode::OK,
-              service->Start("primary_unused", "unused", cluster_id));
+              service->Start(MakeTestSources(), "unused", cluster_id));
     for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 1;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -727,7 +731,7 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
     auto service = std::make_unique<HotStandbyService>(config);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK,
-              service->Start("primary_unused", "unused", cluster_id));
+              service->Start(MakeTestSources(), "unused", cluster_id));
 
     for (int i = 0;
          i < 100 && (service->GetLatestAppliedSequenceId() < 1 ||
@@ -753,8 +757,9 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
 
     auto service = std::make_unique<HotStandbyService>(config);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
-    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
-                                            "batch-standby-timeout"));
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start(MakeTestSources(), "unused",
+                             "batch-standby-timeout"));
 
     for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
          ++i) {
@@ -778,8 +783,9 @@ TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
 
     auto service = std::make_unique<HotStandbyService>(config);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
-    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
-                                            "batch-standby-restart"));
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start(MakeTestSources(), "unused",
+                             "batch-standby-restart"));
     for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -787,8 +793,9 @@ TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
     ASSERT_EQ(StandbyState::FAILED, service->GetState());
 
     batch_backend->SetGetError(ErrorCode::OK);
-    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
-                                            "batch-standby-restart"));
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start(MakeTestSources(), "unused",
+                             "batch-standby-restart"));
 
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
     EXPECT_EQ(ErrorCode::OK, service->GetSyncStatus().last_error);
@@ -843,7 +850,7 @@ TEST_F(HotStandbyServiceTest,
 
     auto service = std::make_unique<HotStandbyService>(config);
     ASSERT_EQ(ErrorCode::OK,
-              service->Start("primary_unused", etcd_endpoints, cluster_id));
+              service->Start(MakeTestSources(), etcd_endpoints, cluster_id));
 
     const uint64_t expected_seq = prefix.last_seq + 1;
     constexpr int kMaxAttempts = 100;
