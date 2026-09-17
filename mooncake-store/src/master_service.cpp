@@ -207,6 +207,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cvm_http_port_(config.cvm_http_port),
       cvm_http_host_(config.cvm_http_host),
       submaster_count_(config.submaster_count),
+      cvm_segment_default_medium_(config.cvm_segment_default_medium),
+      cvm_segments_vsegment_exclusive_(config.cvm_segments_vsegment_exclusive),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
@@ -1673,7 +1675,11 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     const std::string seg_id = UuidToString(segment.id);
 
     // 1. Write neutral SegmentDescriptor to segments/{seg_id} (idempotent,
-    //    without lease — one copy per segment, no owner).
+    //    without lease — one copy per segment, no owner).资源事实字段
+    //    （medium / io_alignment / supports_unaligned_io / failure_domain /
+    //    vsegment_exclusive）由本集群配置填充，供 vsegment 自动发现使用，
+    //    不应由用户在配额文件中手写。未来由底层 allocator 在 mount 时上报
+    //    真实介质/对齐能力后，可改为按 segment 粒度覆盖。
     cvm::SegmentDescriptor desc;
     desc.segment_id = seg_id;
     desc.segment_name = segment.name;
@@ -1681,6 +1687,12 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     desc.te_endpoint = segment.te_endpoint;
     desc.protocol = segment.protocol;
     desc.host_id = segment.host_id;
+    desc.medium = cvm_segment_default_medium_;
+    desc.io_alignment = 1;  // 保守默认；Planner 取 max(profile, segment)
+    desc.supports_unaligned_io = true;
+    desc.failure_domain =
+        segment.host_id.empty() ? desc.segment_id : segment.host_id;
+    desc.vsegment_exclusive = cvm_segments_vsegment_exclusive_;
     ErrorCode err =
         cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
     if (err != ErrorCode::OK) {

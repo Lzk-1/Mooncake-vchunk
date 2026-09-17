@@ -1775,5 +1775,162 @@ TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
               1);
 }
 
+// ---- 自动发现：BuildDiscoveredQuotaPlan ----
+
+TEST(BuildDiscoveredQuotaPlanTest, RejectsNonExclusiveSegmentsByDefault) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg_a;
+    seg_a.segment_id = "seg-a";
+    seg_a.capacity = 4096;
+    seg_a.te_endpoint = "host-a:1234";
+    seg_a.host_id = "host-a";
+    seg_a.medium = "DRAM";
+    seg_a.io_alignment = 8;
+    seg_a.vsegment_exclusive = false;  // 未声明专用 → 必须拒绝
+    cvm::SegmentDescriptor seg_b = seg_a;
+    seg_b.segment_id = "seg-b";
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg_a, seg_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount_a, mount_b;
+    mount_a.segment_id = "seg-a";
+    mount_b.segment_id = "seg-b";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount_a}, {"master-a", mount_b}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    EXPECT_EQ(error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+    EXPECT_NE(detail.find("vsegment_exclusive"), std::string::npos);
+    EXPECT_NE(detail.find("seg-a"), std::string::npos);
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg_a;
+    seg_a.segment_id = "seg-a";
+    seg_a.capacity = 4096;
+    seg_a.te_endpoint = "host-a:1234";
+    seg_a.host_id = "host-a";
+    seg_a.medium = "DRAM";
+    seg_a.io_alignment = 8;
+    seg_a.supports_unaligned_io = true;
+    seg_a.failure_domain = "rack-1";
+    seg_a.vsegment_exclusive = true;
+    cvm::SegmentDescriptor seg_b = seg_a;
+    seg_b.segment_id = "seg-b";
+    seg_b.host_id = "host-b";
+    seg_b.failure_domain.clear();  // 验证 host_id 兜底
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg_a, seg_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount_a, mount_b;
+    mount_a.segment_id = "seg-a";
+    mount_b.segment_id = "seg-b";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount_a}, {"master-a", mount_b}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    ASSERT_EQ(error, ErrorCode::OK) << detail;
+    ASSERT_EQ(request.segments.size(), 2u);
+    // 资源事实从 SegmentDescriptor 读取，不再硬编码。
+    EXPECT_EQ(request.segments[0].medium, "DRAM");
+    EXPECT_EQ(request.segments[0].io_alignment, 8u);
+    EXPECT_EQ(request.segments[0].failure_domain, "rack-1");
+    EXPECT_EQ(request.segments[1].failure_domain, "host-b");  // host_id 兜底
+    EXPECT_TRUE(request.segments[0].supports_unaligned_io);
+    // Partition 列表由 KV PT 生成（slot 数）。
+    EXPECT_EQ(request.partition_ids.size(), cvm::kSlotCount);
+    EXPECT_EQ(request.profile_specs.size(), 1u);
+    EXPECT_EQ(request.profile_specs[0].member_count, 2u);
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, RejectsEmptyMediumFromAllocator) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 1;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+
+    cvm::SegmentDescriptor seg;
+    seg.segment_id = "seg-a";
+    seg.capacity = 4096;
+    seg.te_endpoint = "host-a:1234";
+    seg.medium = "";  // allocator 未上报 → 拒绝
+    seg.vsegment_exclusive = true;
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount;
+    mount.segment_id = "seg-a";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    EXPECT_EQ(error, ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("empty medium"), std::string::npos);
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveOverridesForAdvancedUsers) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg_a;
+    seg_a.segment_id = "seg-a";
+    seg_a.capacity = 4096;
+    seg_a.te_endpoint = "host-a:1234";
+    seg_a.host_id = "host-a";
+    seg_a.medium = "DRAM";
+    seg_a.io_alignment = 8;
+    seg_a.vsegment_exclusive = false;  // 非专用
+    cvm::SegmentDescriptor seg_b = seg_a;
+    seg_b.segment_id = "seg-b";
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg_a, seg_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount_a, mount_b;
+    mount_a.segment_id = "seg-a";
+    mount_b.segment_id = "seg-b";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount_a}, {"master-a", mount_b}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    // 高级用户显式声明已通过空间管理机制确认可分配范围。
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail,
+                                          /*allow_non_exclusive=*/true);
+    ASSERT_EQ(error, ErrorCode::OK) << detail;
+    EXPECT_EQ(request.segments.size(), 2u);
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment

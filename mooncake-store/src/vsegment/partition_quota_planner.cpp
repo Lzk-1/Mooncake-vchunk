@@ -9,6 +9,8 @@
 #include <unordered_map>
 
 #include "etcd_helper.h"
+#include "crc32c.h"
+#include "cvm/slot_hash.h"
 
 namespace mooncake::vsegment {
 namespace {
@@ -22,6 +24,140 @@ uint64_t AlignDown(uint64_t value, uint64_t alignment) {
 }
 
 }  // namespace
+
+ErrorCode BuildDiscoveredQuotaPlan(
+    const VSegmentUserPolicy& policy,
+    const std::vector<cvm::SegmentDescriptor>& descriptors,
+    const std::vector<cvm::MasterRegistration>& masters,
+    const std::vector<std::pair<std::string, cvm::MountEntry>>& mounts,
+    PartitionQuotaPlanRequest* request, std::string* detail,
+    bool allow_non_exclusive) {
+    if (!request) return ErrorCode::INVALID_PARAMS;
+    if (policy.member_count == 0 || policy.stripe_size == 0 ||
+        policy.member_extent_size == 0) {
+        if (detail)
+            *detail = "member_count, stripe_size and member_extent_size are "
+                      "required user policy parameters";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (policy.reserved_ratio < 0.0 || policy.reserved_ratio >= 1.0) {
+        if (detail) *detail = "reserved_ratio must be in [0, 1)";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (policy.default_profile.empty() || policy.profile_name.empty() ||
+        policy.required_medium.empty()) {
+        if (detail)
+            *detail = "default_profile, profile_name and required_medium "
+                      "must not be empty";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    PartitionQuotaPlanRequest next;
+    next.config_generation = policy.config_generation;
+    next.default_profile = policy.default_profile;
+    next.reserved_ratio = policy.reserved_ratio;
+    next.profile_specs = {{policy.profile_name, policy.member_count,
+                           policy.stripe_size, policy.member_extent_size,
+                           policy.io_alignment, policy.required_medium,
+                           policy.initial_vsegment_count}};
+    auto error = ValidateProfile(next.profile_specs.front(), detail);
+    if (error != ErrorCode::OK) return error;
+
+    // 在线 master 集合（用于过滤 mount 记录：仅 live master 的 mount 才算
+    // 该 psegment 在线）。
+    std::set<std::string> live_masters;
+    for (const auto& master : masters)
+        if (!master.master_id.empty()) live_masters.insert(master.master_id);
+    std::set<std::string> mounted;
+    for (const auto& [master, mount] : mounts)
+        if (live_masters.count(master)) mounted.insert(mount.segment_id);
+
+    // 从 SegmentDescriptor 自动发现资源事实（介质/对齐/对齐能力/故障域），
+    // 不再硬编码。同时校验 vsegment_exclusive：自动发现「总容量」≠「空闲
+    // 空间」，仅 vsegment_exclusive=true 的 psegment 才可按 capacity 切分。
+    std::set<std::string> seen;
+    std::vector<std::string> rejected_non_exclusive;
+    for (const auto& desc : descriptors) {
+        if (desc.segment_id.empty() || !seen.insert(desc.segment_id).second) {
+            if (detail) *detail = "empty or duplicate CVM segment id";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (!mounted.count(desc.segment_id) || desc.capacity == 0 ||
+            desc.te_endpoint.empty())
+            continue;  // 离线或无效，跳过
+        if (!desc.vsegment_exclusive) {
+            rejected_non_exclusive.push_back(desc.segment_id);
+            continue;
+        }
+        if (desc.medium.empty()) {
+            if (detail) {
+                *detail = "segment " + desc.segment_id +
+                          " has empty medium; allocator must report resource "
+                          "facts at mount time";
+            }
+            return ErrorCode::INVALID_PARAMS;
+        }
+        // failure_domain 缺省由 host_id 兜底，仍为空时用 segment_id 兜底，
+        // 保证 PSegmentGeometry.failure_domain 非空（便于后续故障域隔离）。
+        std::string failure_domain = desc.failure_domain;
+        if (failure_domain.empty())
+            failure_domain = desc.host_id.empty() ? desc.segment_id
+                                                  : desc.host_id;
+        next.segments.push_back({desc.segment_id, desc.capacity,
+                                 desc.io_alignment == 0 ? 1 : desc.io_alignment,
+                                 desc.medium, /*healthy=*/true,
+                                 desc.supports_unaligned_io, failure_domain});
+    }
+    if (!rejected_non_exclusive.empty() && !allow_non_exclusive) {
+        if (detail) {
+            std::ostringstream os;
+            os << "automatic discovery refuses to treat total capacity as "
+                  "free space. The following psegments are not declared "
+                  "vsegment_exclusive and may be in use by other "
+                  "allocators; reserve their allocatable ranges via the "
+                  "space management mechanism first, or set "
+                  "cvm_segments_vsegment_exclusive=true on a cluster "
+                  "dedicated to vsegment at init time. Rejected: ";
+            for (size_t i = 0; i < rejected_non_exclusive.size(); ++i) {
+                if (i) os << ",";
+                os << rejected_non_exclusive[i];
+            }
+            os << " (pass --allow_non_exclusive only if you have confirmed "
+                   "allocatable ranges out of band)";
+            *detail = os.str();
+        }
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    }
+    if (next.segments.size() < policy.member_count) {
+        if (detail) {
+            std::ostringstream os;
+            os << "insufficient live mounted vsegment_exclusive segments for "
+                  "member_count="
+               << policy.member_count
+               << ", discovered=" << next.segments.size();
+            if (!rejected_non_exclusive.empty()) {
+                os << " (additionally " << rejected_non_exclusive.size()
+                   << " non-exclusive segments rejected)";
+            }
+            *detail = os.str();
+        }
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    }
+    std::sort(next.segments.begin(), next.segments.end(),
+              [](const auto& a, const auto& b) {
+                  return a.segment_id < b.segment_id;
+              });
+    // Partition 列表由 KV PT 生成（确定性哈希方案，slot 即 partition）。
+    for (uint16_t slot = 0; slot < cvm::kSlotCount; ++slot)
+        next.partition_ids.push_back(std::to_string(slot));
+    std::string serialized;
+    struct_json::to_json(next, serialized);
+    Crc32c crc;
+    crc.Extend(serialized.data(), serialized.size());
+    next.policy_digest = "plan-crc32c-" + std::to_string(crc.Final());
+    *request = std::move(next);
+    return ErrorCode::OK;
+}
 
 PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
     const PartitionQuotaPlanRequest& request) const {

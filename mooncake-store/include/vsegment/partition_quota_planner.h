@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "cvm/cvm_keys.h"
+#include "cvm/cvm_types.h"
 #include "vsegment/vsegment.h"
 
 namespace mooncake::vsegment {
@@ -25,6 +26,41 @@ struct PartitionQuotaPlanRequest {
 YLT_REFL(PartitionQuotaPlanRequest, config_generation, policy_digest,
          default_profile, partition_ids, profile_specs, segments,
          reserved_ratio);
+
+// 用户策略：只要求 member_count / stripe_size / member_extent_size 三个核心
+// 参数。其余字段为可选策略，提供默认值，不应强制用户填写。
+struct VSegmentUserPolicy {
+    uint32_t member_count{0};       // 必填
+    uint64_t stripe_size{0};        // 必填
+    uint64_t member_extent_size{0}; // 必填
+    // 可选策略（提供默认值）
+    std::string default_profile = "default";
+    std::string profile_name = "default";
+    std::string required_medium = "REGISTERED_MEMORY";
+    uint64_t io_alignment = 1;
+    uint32_t initial_vsegment_count = 1;
+    double reserved_ratio = 0.0;    // 默认不预留
+    uint64_t config_generation = 1;
+};
+YLT_REFL(VSegmentUserPolicy, member_count, stripe_size, member_extent_size,
+         default_profile, profile_name, required_medium, io_alignment,
+         initial_vsegment_count, reserved_ratio, config_generation);
+
+// 从 CVM 自动发现的资源事实（SegmentDescriptor + MountEntry +
+// MasterRegistration）构建配额规划请求。资源事实（psegment ID、容量、介质、
+// 对齐能力、在线状态）由系统自动发现，不应由用户在配额文件中手写。
+//
+// 安全约束：自动发现「总容量」≠「空闲空间」。仅对 vsegment_exclusive=true
+// 的 psegment 直接按 capacity 切分；vsegment_exclusive=false 的 psegment
+// 被拒绝（需通过空间管理机制显式声明可分配范围），除非 allow_non_exclusive
+// =true（仅供已通过其他空间管理机制确认可分配范围的高级用户/测试使用）。
+ErrorCode BuildDiscoveredQuotaPlan(
+    const VSegmentUserPolicy& policy,
+    const std::vector<cvm::SegmentDescriptor>& descriptors,
+    const std::vector<cvm::MasterRegistration>& masters,
+    const std::vector<std::pair<std::string, cvm::MountEntry>>& mounts,
+    PartitionQuotaPlanRequest* request, std::string* detail = nullptr,
+    bool allow_non_exclusive = false);
 
 struct PartitionQuotaPlanResult {
     ErrorCode error{ErrorCode::OK};
