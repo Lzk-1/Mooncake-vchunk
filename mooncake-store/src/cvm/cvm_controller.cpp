@@ -220,22 +220,41 @@ void CvmController::MastersWatchLoop() {
         }
         masters_watch_armed_.store(true);
 
-        std::unique_lock<std::mutex> lock(masters_watch_state_->mutex);
-        masters_watch_state_->cv.wait(lock, [this] {
-            return masters_watch_state_->dirty ||
-                   masters_watch_state_->broken || !running_.load();
-        });
+        // Go 侧 watch 是持久 watch（一次注册，持续派发事件），普通事件后
+        // 不会自动注销；仅在真正断开（broken）时才需要重新 arm。因此用内层
+        // 循环等待事件：普通事件清 dirty 后继续等，绝不重复注册同前缀——
+        // 否则会命中 "already being watched" 并以 1s 间隔刷屏。
+        while (running_.load()) {
+            std::unique_lock<std::mutex> lock(masters_watch_state_->mutex);
+            masters_watch_state_->cv.wait(lock, [this] {
+                return masters_watch_state_->dirty || !running_.load();
+            });
+            if (!running_.load()) {
+                break;
+            }
 
-        // 成员增删（lease 过期）→ 先探测成员集变化并记录日志，再重算角色。
-        std::vector<MasterRegistration> members;
-        if (LoadRankedMembers(members)) {
-            LogMembershipChange(members);
-        }
-        ReconcileRole();
-        // 成员集变化：即使本机角色不变（仍是 standby），也要通知 delegate
-        // 重新从最新成员列表本地推导回放源（替代已删除的 kv_view watch）。
-        if (delegate_) {
-            delegate_->OnMembershipChanged();
+            const bool broken = masters_watch_state_->broken;
+            masters_watch_state_->dirty = false;
+            masters_watch_state_->broken = false;
+            lock.unlock();
+
+            // 成员增删（lease 过期）→ 先探测成员集变化并记录日志，再重算角色。
+            std::vector<MasterRegistration> members;
+            if (LoadRankedMembers(members)) {
+                LogMembershipChange(members);
+            }
+            ReconcileRole();
+            // 成员集变化：即使本机角色不变（仍是 standby），也要通知 delegate
+            // 重新从最新成员列表本地推导回放源（替代已删除的 kv_view watch）。
+            if (delegate_) {
+                delegate_->OnMembershipChanged();
+            }
+
+            if (broken) {
+                // watch 已断开（goroutine 已自清理并退出），退出内层循环
+                // 重新 arm；普通事件则继续等待下一个事件。
+                break;
+            }
         }
     }
 }
