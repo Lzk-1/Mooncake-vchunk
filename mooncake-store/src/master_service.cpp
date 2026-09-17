@@ -1369,6 +1369,30 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         !alive_ids.empty() &&
         std::find(alive_ids.begin(), alive_ids.end(), old_owner) ==
             alive_ids.end();
+    if (old_owner_gone && !old_owner.empty() && old_owner != master_id_ &&
+        vsegment_service_) {
+        const auto partition_id = std::to_string(slot);
+        const auto& quotas = vsegment_service_->quota_snapshot().quotas;
+        const bool has_quota = std::any_of(
+            quotas.begin(), quotas.end(), [&](const auto& quota) {
+                return quota.partition_id == partition_id;
+            });
+        const bool has_recovered_state = std::any_of(
+            recovered_vsegment_snapshots_.begin(),
+            recovered_vsegment_snapshots_.end(), [&](const auto& state) {
+                return state.partition_id == partition_id;
+            });
+        vsegment::PartitionVSegmentSnapshot installed;
+        if (has_quota && !has_recovered_state &&
+            vsegment_service_->SnapshotPartition(partition_id, &installed) !=
+                ErrorCode::OK) {
+            // A dead owner does not make its physical quota empty. Recreating
+            // an allocator without its snapshot could overwrite live extents.
+            LOG(ERROR) << "Missing vsegment recovery state for lost owner "
+                       << old_owner << ", Partition=" << partition_id;
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+    }
     if (old_owner.empty() || old_owner == master_id_ || old_owner_gone) {
         // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
         return RefreshVSegmentOwnership(std::to_string(slot));
@@ -1826,13 +1850,18 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
             cvm_prev_primary_ids_ = cvm_last_primary_ids_;
             std::vector<std::string> joined;
             std::vector<std::string> left;
-            std::set_difference(ids.begin(), ids.end(),
-                                cvm_last_primary_ids_.begin(),
-                                cvm_last_primary_ids_.end(),
+            // Membership is ranked by registration revision, not by id.
+            // Sort copies for set_difference; preserve ring tie-break order.
+            auto current_ids = ids;
+            auto previous_ids = cvm_last_primary_ids_;
+            std::sort(current_ids.begin(), current_ids.end());
+            std::sort(previous_ids.begin(), previous_ids.end());
+            std::set_difference(current_ids.begin(), current_ids.end(),
+                                previous_ids.begin(), previous_ids.end(),
                                 std::back_inserter(joined));
-            std::set_difference(cvm_last_primary_ids_.begin(),
-                                cvm_last_primary_ids_.end(), ids.begin(),
-                                ids.end(), std::back_inserter(left));
+            std::set_difference(previous_ids.begin(), previous_ids.end(),
+                                current_ids.begin(), current_ids.end(),
+                                std::back_inserter(left));
             auto join = [](const std::vector<std::string>& v) {
                 std::string s;
                 for (const auto& e : v) {
