@@ -239,10 +239,9 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static ErrorCode ImportFromLostOwner(MasterService& service, uint16_t slot) {
-        service.master_id_ = "new-owner";
         service.cvm_prev_primary_ids_ = {"lost-owner"};
-        service.cvm_last_primary_ids_ = {"new-owner"};
-        service.cvm_alive_master_ids_ = {"new-owner"};
+        service.cvm_last_primary_ids_ = {service.master_id()};
+        service.cvm_alive_master_ids_ = {service.master_id()};
         service.cvm_ring_revision_ = 10;
         return service.ImportSlotMetadata(slot);
     }
@@ -695,7 +694,9 @@ TEST_F(MasterServiceHATest, LostOwnerCannotRecreateUnrecoveredVSegmentQuota) {
                             .required_medium = "DRAM"}};
     quota.quotas = {{"7", "default", "DRAM", {{"segment-a", 0, 512}}}};
     auto vsegments = std::make_shared<vsegment::VSegmentService>(quota);
-    MasterService service(MasterServiceConfig{});
+    MasterServiceConfig config;
+    config.master_id = "new-owner";
+    MasterService service(config);
     service.SetVSegmentService(vsegments);
     ExpectSlots(service, {7});
     EXPECT_EQ(ImportFromLostOwner(service, 7), ErrorCode::PERSISTENT_FAIL);
