@@ -1000,12 +1000,13 @@ func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey
 	}
 
 	type kvPair struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+		Key            string `json:"key"`
+		Value          string `json:"value"`
+		CreateRevision int64  `json:"create_revision"`
 	}
 	kvs := make([]kvPair, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value)})
+		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value), CreateRevision: kv.CreateRevision})
 	}
 	b, jerr := json.Marshal(kvs)
 	if jerr != nil {

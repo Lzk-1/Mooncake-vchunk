@@ -279,11 +279,10 @@ bool CvmController::LoadRankedMembers(
         return false;
     }
 
-    // 收集所有存活 master（含本机）作为候选，按 master_id 稳定排序。
-    // 排序键必须用 master_id（rpc_address:rpc_port），而非节点本地时钟
-    // registered_at_ms：同时启动时 registered_at_ms 随机，会导致「谁是
-    // primary」竞态（standby 随机拿到 slot）。master_id 重启稳定且可字节级
-    // 一致地复现，客户端与服务端据此推导出相同的 primary 序列。
+    // 收集所有存活 master（含本机）作为候选，按「先到先得」排序：etcd
+    // create_revision 升序（谁先注册谁排前），revision 缺失时回退 master_id。
+    // create_revision 由 etcd 全局单调分配，不存在本地时钟偏差，节点/客户端
+    // 可字节级一致地推导出相同 primary 序列（见 MasterRegistrationRankLess）。
     out.clear();
     out.reserve(masters.size());
     for (const auto& m : masters) {
@@ -292,10 +291,7 @@ bool CvmController::LoadRankedMembers(
         }
     }
 
-    std::sort(out.begin(), out.end(),
-              [](const MasterRegistration& a, const MasterRegistration& b) {
-                  return a.master_id < b.master_id;
-              });
+    std::sort(out.begin(), out.end(), MasterRegistrationRankLess);
     return true;
 }
 
@@ -308,7 +304,7 @@ void CvmController::LogMembershipChange(
             ids.push_back(m.master_id);
         }
     }
-    // LoadRankedMembers 已按 master_id 排序，ids 继承该顺序。成员集未变则不打
+    // LoadRankedMembers 已按 create_revision 排序，ids 继承该顺序。成员集未变则不打
     // 日志（watch 可能因等值事件重复唤醒）。
     if (ids == last_member_ids_) {
         return;
@@ -381,7 +377,7 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
     const size_t primary_count =
         std::min<size_t>(members.size(), config_.submaster_count);
 
-    // 本机在「先到先得」（master_id 稳定排序）列表中的位置。
+    // 本机在「先到先得」（create_revision 稳定排序）列表中的位置。
     size_t my_index = members.size();
     for (size_t i = 0; i < members.size(); ++i) {
         if (members[i].master_id == config_.master_id) {

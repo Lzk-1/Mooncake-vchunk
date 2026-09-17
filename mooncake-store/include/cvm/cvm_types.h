@@ -84,13 +84,30 @@ struct MasterRegistration {
     std::string address;  // RPC endpoint, e.g. "host:port"
     int32_t role{0};      // MasterRole
     int64_t registered_at_ms{0};
+    // etcd key create_revision（全局单调）。用于「先到先得」的 primary 推导：
+    // 谁先注册 revision 越小。NOT 序列化进 value（YLT_REFL 不含此字段），
+    // 由 LoadAllMasters 从 key 元数据填充。
+    int64_t create_revision{0};
 };
 YLT_REFL(MasterRegistration, master_id, address, role, registered_at_ms);
 
+// 确定性 primary 排序键（先到先得）：按 etcd create_revision 升序，谁先注册
+// 谁排前；revision 缺失或相等的退化时按 master_id 稳定排序，保证节点/客户端
+// 推导结果字节级一致。所有建环路径（服务端角色、slot 归属、客户端路由）必须
+// 使用同一比较器，否则环不一致会导致转发/震荡。
+inline bool MasterRegistrationRankLess(const MasterRegistration& a,
+                                       const MasterRegistration& b) {
+    if (a.create_revision != b.create_revision) {
+        return a.create_revision < b.create_revision;
+    }
+    return a.master_id < b.master_id;
+}
+
 // Cluster-wide ring configuration persisted under /cvm/{ns}/cluster_meta
 // (确定性哈希方案 §15.3). Clients and masters derive the same primary_ids =
-// sort(members by master_id)[0:submaster_count] from this count, so slot
-// ownership no longer needs to be persisted per slot.
+// sort(members by create_revision)[0:submaster_count]（先到先得，见
+// MasterRegistrationRankLess）from this count, so slot ownership no longer
+// needs to be persisted per slot.
 struct RingMeta {
     uint32_t submaster_count{1};
 };

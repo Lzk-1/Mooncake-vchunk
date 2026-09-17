@@ -58,8 +58,9 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
         return err;
     }
 
-    // 稳定排序（by master_id）+ 去重 → 取前 submaster_count 作为 primary_ids。
+    // 先到先得排序（by create_revision）→ 取前 submaster_count 作为 primary_ids。
     // 与服务端 ResolveOwnedSlotsForCvm 完全一致的推导规则（不依赖 role）。
+    std::sort(members.begin(), members.end(), cvm::MasterRegistrationRankLess);
     std::vector<std::string> ids;
     ids.reserve(members.size());
     for (const auto& m : members) {
@@ -67,8 +68,6 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
             ids.push_back(m.master_id);
         }
     }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     const uint32_t submaster_count = meta.submaster_count;
     if (submaster_count > 0 && ids.size() > submaster_count) {
         ids.resize(submaster_count);

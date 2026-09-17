@@ -1764,9 +1764,10 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
         return cvm_last_resolved_owned_slots_;
     }
 
-    // 确定性哈希（§15.2）：primary_ids = 稳定排序(存活成员)[0:submaster_count]。
+    // 确定性哈希（§15.2）：primary_ids = 先到先得排序(存活成员)[0:submaster_count]。
     // 不再依赖 etcd 的 role 字段过滤——role 由「本机是否在 primary_ids 内」
     // 纯函数推导，消除 role 未收敛时 standby 随机拿 slot 的竞态（§15.8 P2）。
+    std::sort(masters.begin(), masters.end(), cvm::MasterRegistrationRankLess);
     std::vector<std::string> ids;
     ids.reserve(masters.size());
     for (const auto& m : masters) {
@@ -1774,15 +1775,15 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
             ids.push_back(m.master_id);
         }
     }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (submaster_count_ > 0 && ids.size() > submaster_count_) {
         ids.resize(submaster_count_);
     }
 
     // 本机是否在推导出的 primary_ids 内（而非 etcd role 字段）。
+    // ids 已按 create_revision 排序（非 master_id 字典序），不能用
+    // binary_search，改线性查找（submaster_count 很小）。
     const bool self_primary =
-        std::binary_search(ids.begin(), ids.end(), master_id_);
+        std::find(ids.begin(), ids.end(), master_id_) != ids.end();
     std::vector<uint16_t> slots;
     if (self_primary) {
         // 技术债 3.1：一致性哈希环分配已提取到 cvm::ResolveOwnedSlotsOnRing
@@ -1857,6 +1858,7 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
         return std::nullopt;
     }
 
+    std::sort(masters.begin(), masters.end(), cvm::MasterRegistrationRankLess);
     std::vector<std::string> ids;
     ids.reserve(masters.size());
     for (const auto& m : masters) {
@@ -1864,13 +1866,11 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
             ids.push_back(m.master_id);
         }
     }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (submaster_count_ > 0 && ids.size() > submaster_count_) {
         ids.resize(submaster_count_);
     }
 
-    // 与 ResolveOwnedSlotsForCvm 保持一致：primary_ids = 稳定排序(存活成员)
+    // 与 ResolveOwnedSlotsForCvm 保持一致：primary_ids = 先到先得排序(存活成员)
     // [0:submaster_count]，不依赖 etcd role 字段，客户端/服务端推导同环。
     // 解析结果为空（无存活成员）时由调用方跳过转发。
     return cvm::ResolveSlotOwnerOnRing(ids, slot);

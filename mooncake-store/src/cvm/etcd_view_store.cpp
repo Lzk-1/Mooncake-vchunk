@@ -48,6 +48,45 @@ ErrorCode ParseRangeJson(const std::string& json,
     return ErrorCode::OK;
 }
 
+// key/value 之外额外解析 etcd key create_revision，用于「先到先得」的 primary
+// 排序（MasterRegistrationRankLess）。create_revision 缺失时记为 0，由其
+// 排序比较器回退 master_id 兜底。
+struct RangeKvWithRevision {
+    std::string key;
+    std::string value;
+    int64_t create_revision{0};
+};
+
+ErrorCode ParseRangeJsonWithRevision(
+    const std::string& json, std::vector<RangeKvWithRevision>& kvs) {
+    Json::Value root;
+    Json::CharReaderBuilder reader;
+    std::string errors;
+    std::istringstream stream(json);
+    if (!Json::parseFromStream(reader, stream, &root, &errors) ||
+        !root.isArray()) {
+        LOG(ERROR) << "Failed to parse etcd range JSON: " << errors;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    kvs.clear();
+    kvs.reserve(root.size());
+    for (const auto& item : root) {
+        if (!item.isObject() || !item["key"].isString() ||
+            !item["value"].isString()) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        RangeKvWithRevision kv;
+        kv.key = item["key"].asString();
+        kv.value = item["value"].asString();
+        if (item.isMember("create_revision") && item["create_revision"].isNumeric()) {
+            kv.create_revision = item["create_revision"].asInt64();
+        }
+        kvs.push_back(std::move(kv));
+    }
+    return ErrorCode::OK;
+}
+
 }  // namespace
 
 // ---- JSON serialization ----
@@ -394,8 +433,8 @@ ErrorCode EtcdViewStore::LoadAllMasters(
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
-    err = ParseRangeJson(json, kvs);
+    std::vector<RangeKvWithRevision> kvs;
+    err = ParseRangeJsonWithRevision(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -403,10 +442,11 @@ ErrorCode EtcdViewStore::LoadAllMasters(
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
         MasterRegistration reg;
-        err = DeserializeMasterRegistration(kv.second, reg);
+        err = DeserializeMasterRegistration(kv.value, reg);
         if (err != ErrorCode::OK) {
             return err;
         }
+        reg.create_revision = kv.create_revision;
         out.push_back(std::move(reg));
     }
     return ErrorCode::OK;
