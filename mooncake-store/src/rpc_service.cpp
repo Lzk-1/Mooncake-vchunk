@@ -2040,53 +2040,6 @@ WrappedMasterService::InterMasterAckSlotImported(
         },
         [] {}, [] {});
 }
-
-// ---- vsegment 预留物理分配 RPC 接口占位实现 ----
-tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
-WrappedMasterService::GetExtentSummary(
-    const partition::GetExtentSummaryRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "GetExtentSummary not implemented (vsegment reserved interface)");
-}
-
-tl::expected<partition::ReserveExtentResponse, ErrorCode>
-WrappedMasterService::ReserveExtent(
-    const partition::ReserveExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "ReserveExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::CommitExtent(
-    const partition::CommitExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "CommitExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::AbortExtent(
-    const partition::AbortExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "AbortExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
-WrappedMasterService::QueryExtentAllocation(
-    const partition::QueryExtentAllocationRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "QueryExtentAllocation not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::ReleaseCommittedExtent(
-    const partition::ReleaseCommittedExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "ReleaseCommittedExtent not implemented (vsegment reserved interface)");
-}
-
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {

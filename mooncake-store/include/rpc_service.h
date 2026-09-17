@@ -366,22 +366,6 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
         uint16_t slot, const std::string& importer_master_id);
 
-    // ---- vsegment 预留物理分配 RPC 接口（§5.2）----
-    // 元数据面的 GetVSegmentView 已由上面的 partition-aware 接口实现。
-    // 物理分配面（幂等，幂等键 = allocation_id + segment_id）。
-    tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
-    GetExtentSummary(const partition::GetExtentSummaryRequest& request);
-    tl::expected<partition::ReserveExtentResponse, ErrorCode> ReserveExtent(
-        const partition::ReserveExtentRequest& request);
-    tl::expected<void, ErrorCode> CommitExtent(
-        const partition::CommitExtentRequest& request);
-    tl::expected<void, ErrorCode> AbortExtent(
-        const partition::AbortExtentRequest& request);
-    tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
-    QueryExtentAllocation(const partition::QueryExtentAllocationRequest& request);
-    tl::expected<void, ErrorCode> ReleaseCommittedExtent(
-        const partition::ReleaseCommittedExtentRequest& request);
-
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
