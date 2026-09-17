@@ -1352,15 +1352,24 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     // 消亡）→ 无可拉取对象，直接视为就绪（元数据为空，客户端重建）。
     std::vector<std::string> prev_ids;
     std::vector<std::string> primary_ids;
+    std::vector<std::string> alive_ids;
     ViewVersionId ring_revision = 0;
     {
         std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
         prev_ids = cvm_prev_primary_ids_;
         primary_ids = cvm_last_primary_ids_;
         ring_revision = cvm_ring_revision_;
+        alive_ids = cvm_alive_master_ids_;
     }
     const std::string old_owner = cvm::ResolveSlotOwnerOnRing(prev_ids, slot);
-    if (old_owner.empty() || old_owner == master_id_) {
+    // old_owner 已从存活成员集中消亡（lease 过期删 key）时，无法再 RPC 拉取其
+    // 元数据，应视为空元数据、由客户端重建，而不是去拉一个已死节点——否则会
+    // 一直 INVALID_PARAMS 且每轮重试刷屏。
+    const bool old_owner_gone =
+        !alive_ids.empty() &&
+        std::find(alive_ids.begin(), alive_ids.end(), old_owner) ==
+            alive_ids.end();
+    if (old_owner.empty() || old_owner == master_id_ || old_owner_gone) {
         // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
         return RefreshVSegmentOwnership(std::to_string(slot));
     }
@@ -1842,6 +1851,18 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
 
         cvm_last_resolved_owned_slots_ = slots;
         cvm_ring_revision_ = version;
+
+        // 存活成员集（primary + standby）：供 ImportSlotMetadata 判断旧 owner
+        // 是否已消亡。旧 owner 消亡（lease 过期删 key）时无法 RPC 拉取，改走
+        // 空元数据 + 客户端重建。每次成功解析后刷新；LoadAllMasters 失败时
+        // sticky 沿用旧值（与 owned slots 一致）。
+        cvm_alive_master_ids_.clear();
+        cvm_alive_master_ids_.reserve(masters.size());
+        for (const auto& m : masters) {
+            if (!m.master_id.empty()) {
+                cvm_alive_master_ids_.push_back(m.master_id);
+            }
+        }
     }
     return slots;
 }

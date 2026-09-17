@@ -2352,6 +2352,11 @@ class MasterService {
     // ImportSlotMetadata 推导 gained slot 的上一任 owner（旧 owner 直传）。
     // 仅在 membership 变化时更新，保持不变时维持旧值以支持 acquire 重试。
     std::vector<std::string> cvm_prev_primary_ids_;
+    // 当前存活的全部 master_id（含 primary 与 standby）。由
+    // ResolveOwnedSlotsForCvm 在 LoadAllMasters 成功时刷新，供
+    // ImportSlotMetadata 判断旧 owner 是否已消亡（消亡则无法 RPC 拉取，
+    // 改走空元数据 + 客户端重建，避免对死节点无限拉取刷屏）。
+    std::vector<std::string> cvm_alive_master_ids_;
     mutable std::mutex cvm_resolver_mutex_;
     // live primary → live primary 的 slot 元数据交接（确定性哈希方案 §15.7，
     // RPC 直传替代 etcd slot_meta 中转）。
