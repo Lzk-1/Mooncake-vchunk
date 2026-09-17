@@ -823,6 +823,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
+    client_->SetReplicaTransferStagingAllocator(client_buffer_allocator_);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";

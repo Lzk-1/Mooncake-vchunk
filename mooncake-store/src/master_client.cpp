@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <csignal>
+#include <charconv>
 #include <future>
 #include <string>
 #include <thread>
@@ -19,12 +20,31 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "etcd_helper.h"
+#include "cvm/etcd_view_store.h"
+#include "cvm/slot_hash.h"
 #include "partition/kv_hash_map.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
 namespace mooncake {
+
+namespace {
+
+std::optional<uint16_t> ParsePartitionSlot(
+    const std::string& partition_id) {
+    uint32_t value = 0;
+    const char* begin = partition_id.data();
+    const char* end = begin + partition_id.size();
+    const auto [ptr, error] = std::from_chars(begin, end, value);
+    if (partition_id.empty() || error != std::errc{} || ptr != end ||
+        value >= cvm::kSlotCount) {
+        return std::nullopt;
+    }
+    return static_cast<uint16_t>(value);
+}
+
+}  // namespace
 
 template <auto Method>
 struct RpcNameTraits;
@@ -42,6 +62,31 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetVSegmentView> {
+    static constexpr const char* value = "GetVSegmentView";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetPSegmentEndpoint> {
+    static constexpr const char* value = "GetPSegmentEndpoint";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutStart> {
+    static constexpr const char* value = "VSegmentPutStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutEnd> {
+    static constexpr const char* value = "VSegmentPutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::VSegmentPutRevoke> {
+    static constexpr const char* value = "VSegmentPutRevoke";
 };
 
 template <>
@@ -92,35 +137,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
     static constexpr const char* value = "PutRevoke";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutStart> {
-    static constexpr const char* value = "VChunkPutStart";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutEnd> {
-    static constexpr const char* value = "VChunkPutEnd";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::VChunkPutRevoke> {
-    static constexpr const char* value = "VChunkPutRevoke";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetVChunk> {
-    static constexpr const char* value = "GetVChunk";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::ReleaseVChunkReadLease> {
-    static constexpr const char* value = "ReleaseVChunkReadLease";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::RemoveVChunk> {
-    static constexpr const char* value = "RemoveVChunk";
-};
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetVChunkRuntimeInfo> {
-    static constexpr const char* value = "GetVChunkRuntimeInfo";
 };
 
 template <>
@@ -769,6 +785,41 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
     return ErrorCode::OK;
 }
 
+tl::expected<std::string, ErrorCode>
+MasterClient::ResolveVSegmentSubmaster(const std::string& partition_id) {
+    std::string cluster_namespace;
+    {
+        std::lock_guard<std::mutex> lock(routing_config_mutex_);
+        cluster_namespace = routing_cluster_namespace_;
+    }
+    // No routing configuration means an intentional legacy single-master
+    // deployment. An empty slot table alone is not sufficient evidence: it
+    // also occurs during startup and failed refreshes.
+    if (cluster_namespace.empty()) return std::string{};
+
+    if (auto slot = ParsePartitionSlot(partition_id)) {
+        auto target = partition_router_.ResolveSubmaster(*slot);
+        if (!target) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return *target;
+    }
+
+    partition::PartitionRoute route;
+    ViewVersionId version = 0;
+    auto error = cvm::EtcdViewStore::LoadPartitionRoute(
+        cluster_namespace, partition_id, route, version);
+    if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    if (route.partition_id.partition_id != partition_id ||
+        route.owner_submaster_id.empty() ||
+        route.state !=
+            static_cast<int32_t>(partition::PartitionState::kActive)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    return route.owner_submaster_id;
+}
+
 std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
     std::map<std::string, std::vector<size_t>> groups;
@@ -910,6 +961,87 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     const std::string& object_key) {
     return GetReplicaList(object_key, tenant_id_.value());
+}
+
+tl::expected<vsegment::VSegmentView, ErrorCode>
+MasterClient::GetVSegmentView(const std::string& partition_id,
+                              const std::string& vsegment_id) {
+    auto target = ResolveVSegmentSubmaster(partition_id);
+    if (!target) return tl::make_unexpected(target.error());
+    if (!target->empty()) {
+        return invoke_rpc_to<&WrappedMasterService::GetVSegmentView,
+                             vsegment::VSegmentView>(*target, partition_id,
+                                                     vsegment_id);
+    }
+    return invoke_rpc<&WrappedMasterService::GetVSegmentView,
+                      vsegment::VSegmentView>(partition_id, vsegment_id);
+}
+
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+MasterClient::GetPSegmentEndpoint(const std::string& segment_id) {
+    return invoke_rpc<&WrappedMasterService::GetPSegmentEndpoint,
+                      vsegment::PSegmentLocation>(segment_id);
+}
+
+vsegment::VSegmentPutStartResult MasterClient::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    auto invoke = [&]()
+        -> tl::expected<vsegment::VSegmentPutStartResult, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutStart,
+                              vsegment::VSegmentPutStartResult>(
+                partition_id, route_epoch, operation_id, length,
+                profile_name);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutStart,
+                             vsegment::VSegmentPutStartResult>(
+            *target, partition_id, route_epoch, operation_id, length,
+            profile_name);
+    };
+    auto result = invoke();
+    if (result) return std::move(result.value());
+    return {result.error(), operation_id, {}, "vsegment PutStart RPC failed"};
+}
+
+ErrorCode MasterClient::VSegmentPutEnd(
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(replica.partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutEnd,
+                              ErrorCode>(replica, route_epoch, operation_id,
+                                         object_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutEnd, ErrorCode>(
+            *target, replica, route_epoch, operation_id, object_id);
+    };
+    auto result = invoke();
+    return result ? result.value() : result.error();
+}
+
+ErrorCode MasterClient::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    auto invoke = [&]() -> tl::expected<ErrorCode, ErrorCode> {
+        auto target = ResolveVSegmentSubmaster(partition_id);
+        if (!target) return tl::make_unexpected(target.error());
+        if (target->empty()) {
+            return invoke_rpc<&WrappedMasterService::VSegmentPutRevoke,
+                              ErrorCode>(partition_id, vsegment_id,
+                                         route_epoch, operation_id);
+        }
+        return invoke_rpc_to<&WrappedMasterService::VSegmentPutRevoke,
+                             ErrorCode>(*target, partition_id, vsegment_id,
+                                        route_epoch, operation_id);
+    };
+    auto result = invoke();
+    return result ? result.value() : result.error();
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
@@ -1174,84 +1306,6 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
         tenant_id_.value(), operation_id);
     timer.LogResponseExpected(result);
     return result;
-}
-
-tl::expected<VChunkMetadataRecord, ErrorCode> MasterClient::VChunkPutStart(
-    const std::string& tenant_id, const std::string& key, uint64_t total_size,
-    int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutStart,
-                                     VChunkMetadataRecord>(
-        tenant_id, key, tenant_id, key, total_size, now_ms);
-}
-
-tl::expected<void, ErrorCode> MasterClient::VChunkPutEnd(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutEnd, void>(
-        tenant_id, key, tenant_id, key, vchunk_id, now_ms);
-}
-
-tl::expected<void, ErrorCode> MasterClient::VChunkPutRevoke(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return InvokeRoutedWithSlotRetry<&WrappedMasterService::VChunkPutRevoke,
-                                     void>(tenant_id, key, tenant_id, key,
-                                           vchunk_id);
-}
-
-tl::expected<VChunkReadLease, ErrorCode> MasterClient::GetVChunk(
-    const std::string& tenant_id, const std::string& key) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return InvokeRoutedWithSlotRetry<&WrappedMasterService::GetVChunk,
-                                     VChunkReadLease>(tenant_id, key, tenant_id,
-                                                      key);
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReleaseVChunkReadLease(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& lease_id) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return invoke_rpc<&WrappedMasterService::ReleaseVChunkReadLease, void>(
-        lease_id);
-}
-
-tl::expected<void, ErrorCode> MasterClient::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
-    std::lock_guard<std::mutex> routed_lock(vchunk_routed_rpc_mutex_);
-    const auto switch_err = SwitchToSubmaster(tenant_id, key);
-    if (switch_err != ErrorCode::OK) {
-        return tl::make_unexpected(switch_err);
-    }
-    return InvokeRoutedWithSlotRetry<&WrappedMasterService::RemoveVChunk, void>(
-        tenant_id, key, tenant_id, key, now_ms);
-}
-
-tl::expected<VChunkRuntimeInfo, ErrorCode> MasterClient::GetVChunkRuntimeInfo() {
-    return invoke_rpc<&WrappedMasterService::GetVChunkRuntimeInfo,
-                      VChunkRuntimeInfo>();
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(

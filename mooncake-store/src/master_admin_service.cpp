@@ -19,6 +19,7 @@
 #include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
+#include "vsegment/vsegment_metrics.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -366,6 +367,8 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    metrics = AppendMetricSections(
+        std::move(metrics), vsegment::VSegmentMetrics::Instance().Serialize());
     auto tenant_metrics = BuildTenantQuotaMetricsText();
     if (tenant_metrics.empty()) {
         return metrics;

@@ -223,6 +223,9 @@ class HotStandbyService {
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void CollectSegmentsLocked(std::vector<StandbySegmentInfo>& out) const;
+    bool ApplyVSegmentState(const OpLogEntry& entry);
+    void CollectVSegmentPartitions(
+        std::vector<vsegment::PartitionVSegmentSnapshot>& out) const;
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
     void StopReplicationLoop();
@@ -282,6 +285,9 @@ class HotStandbyService {
     // Segment baseline loaded from snapshot bootstrap, applied to each
     // per-source applier when OpLog following starts.
     std::vector<StandbySegmentInfo> baseline_segments_;
+    mutable std::mutex vsegment_mutex_;
+    std::unordered_map<std::string, vsegment::PartitionVSegmentSnapshot>
+        vsegment_partitions_;
 
     // Per-source OpLog replication components. Keyed by source master_id. All
     // appliers share the single metadata_store_ (sources own disjoint slots).

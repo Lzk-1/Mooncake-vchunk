@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "vsegment/vsegment_manager.h"
 #include "types.h"
 #include "partition/vsegment_types.h"
 
@@ -90,8 +91,11 @@ struct SlotMetadataExport {
     uint16_t slot{0};
     std::string source_master_id;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<vsegment::PartitionVSegmentSnapshot, 1>
+        vsegment_partition;
 
-    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects);
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects,
+             vsegment_partition);
 };
 
 /**
@@ -103,54 +107,11 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             vsegment_partitions);
 };
-
-// ---------------------------------------------------------------------------
-// vsegment 持久化快照协议（§12.3.8 预留）
-//
-// 参照 SlotMetadataExport 的字段契约风格：仅冻结序列化字段，运行期对账与
-// 恢复语义由 vsegment 实现方负责。partition / psegment allocation 的快照相互
-// 独立，分别携带各自的单调递增 revision。
-// ---------------------------------------------------------------------------
-
-// 两阶段写中已预留（PutStart 已生成 operation_id）但尚未 PutEnd 提交的挂起
-// 操作。恢复对账据此决定撤销（Abort）或继续提交（Commit）。
-struct PendingOperation {
-    std::string operation_id;
-    std::string object_key;
-    uint64_t route_epoch{0};
-    // TODO(vsegment): 预留逻辑区间 / 关联 VSegmentAllocationState 引用等字段
-    // 由 vsegment 实现方定义后补充，并同步更新 YLT_REFL。
-};
-YLT_REFL(PendingOperation, operation_id, object_key, route_epoch);
-
-// Partition 级持久化快照：分区内对象元数据、不可变 view 布局、逻辑分配状态，
-// 以及被挂起的两阶段写操作。metadata_revision 为分区内元数据单调递增版本。
-struct PartitionSnapshot {
-    std::string partition_id;
-    uint64_t route_epoch{0};
-    uint64_t metadata_revision{0};
-    std::vector<StandbyObjectMetadata> objects;
-    std::vector<partition::VSegmentView> views;
-    std::vector<partition::VSegmentAllocationState> allocation_states;
-    std::vector<PendingOperation> pending_operations;
-};
-YLT_REFL(PartitionSnapshot, partition_id, route_epoch, metadata_revision,
-         objects, views, allocation_states, pending_operations);
-
-// psegment 物理分配持久化快照：free/reserved/committed extent 全集。
-// allocation_revision 为该 allocator 的单调递增版本，独立于 Partition revision。
-// TODO(vsegment): free/reserved/committed extent 的容器类型由 vsegment 实现方
-// 定义后补充，并同步更新 YLT_REFL。
-struct PSegmentAllocationSnapshot {
-    std::string segment_id;
-    uint64_t allocator_epoch{0};
-    uint64_t allocation_revision{0};
-};
-YLT_REFL(PSegmentAllocationSnapshot, segment_id, allocator_epoch,
-         allocation_revision);
 
 /**
  * @brief Payload structure for struct_pack serialization (msgpack binary

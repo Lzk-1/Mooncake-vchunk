@@ -26,7 +26,8 @@
 #include "task_manager.h"
 #include "metadata_store.h"
 #include "partition/partition_router.h"
-#include "vchunk_metadata.h"
+#include "vsegment/vsegment.h"
+#include "vsegment/vsegment_transfer.h"
 
 namespace mooncake {
 
@@ -211,6 +212,21 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<vsegment::VSegmentView, ErrorCode>
+    GetVSegmentView(const std::string& partition_id,
+                    const std::string& vsegment_id);
+    [[nodiscard]] tl::expected<vsegment::PSegmentLocation, ErrorCode>
+    GetPSegmentEndpoint(const std::string& segment_id);
+    [[nodiscard]] vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name = {});
+    [[nodiscard]] ErrorCode VSegmentPutEnd(
+        const VSegmentDescriptor& replica, uint64_t route_epoch,
+        const std::string& operation_id, const std::string& object_id);
+    [[nodiscard]] ErrorCode VSegmentPutRevoke(
+        const std::string& partition_id, const std::string& vsegment_id,
+        uint64_t route_epoch, const std::string& operation_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -290,25 +306,6 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type,
         const std::string& operation_id = "");
-
-    [[nodiscard]] tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
-        const std::string& tenant_id, const std::string& key,
-        uint64_t total_size, int64_t now_ms);
-    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutEnd(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id, int64_t now_ms);
-    [[nodiscard]] tl::expected<void, ErrorCode> VChunkPutRevoke(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id);
-    [[nodiscard]] tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
-        const std::string& tenant_id, const std::string& key);
-    [[nodiscard]] tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& lease_id);
-    [[nodiscard]] tl::expected<void, ErrorCode> RemoveVChunk(
-        const std::string& tenant_id, const std::string& key, int64_t now_ms);
-    [[nodiscard]] tl::expected<VChunkRuntimeInfo, ErrorCode>
-    GetVChunkRuntimeInfo();
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -833,6 +830,13 @@ class MasterClient {
     // SLOT_NOT_OWNED. The caller remains responsible for a bounded retry.
     [[nodiscard]] ErrorCode RefreshSubmasterRouting();
 
+    // Resolves a vsegment Partition to its owner. Decimal partition ids map
+    // directly to the existing KV slot table; named partitions use the
+    // cluster-scoped PartitionRoute record. An empty address denotes the
+    // legacy single-master mode.
+    [[nodiscard]] tl::expected<std::string, ErrorCode>
+    ResolveVSegmentSubmaster(const std::string& partition_id);
+
     /**
      * @brief 带 slot 迁移重试语义的单 RPC 调用（Phase 6）。
      * 对「已 SwitchToSubmaster 的 key」执行一次 RPC，并按错误码闭环处理：
@@ -906,10 +910,6 @@ class MasterClient {
     partition::PartitionRouter partition_router_;
     mutable std::mutex routing_config_mutex_;
     std::string routing_cluster_namespace_;
-    // Protects the target switch and the following vchunk RPC as one unit.
-    // RpcClientPool itself is thread-safe, but its selected target is shared.
-    mutable std::mutex vchunk_routed_rpc_mutex_;
-
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>

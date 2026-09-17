@@ -38,6 +38,12 @@ class MasterSnapshotCodecTest : public ::testing::Test {
                                        service.task_manager_);
     }
 
+    static void SetRecoveredVSegmentSnapshots(
+        MasterService& service,
+        std::vector<vsegment::PartitionVSegmentSnapshot> snapshots) {
+        service.recovered_vsegment_snapshots_ = std::move(snapshots);
+    }
+
     std::unique_ptr<MasterService> master_service_;
 };
 
@@ -70,6 +76,33 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTrip) {
     auto decode_result = codec.Decode(target_service.get(), payloads);
     ASSERT_TRUE(decode_result.has_value())
         << "Decode failed: " << decode_result.error().message;
+}
+
+TEST_F(MasterSnapshotCodecTest, EncodeDecodePreservesVSegmentPartitions) {
+    vsegment::PartitionVSegmentSnapshot partition;
+    partition.partition_id = "partition-17";
+    partition.config_generation = 3;
+    partition.route_epoch = 9;
+    partition.metadata_revision = 12;
+    partition.operation_vsegments.emplace("put-1", "vsegment-1");
+    SetRecoveredVSegmentSnapshots(*master_service_, {partition});
+
+    MasterSnapshotCodec codec;
+    MasterSnapshotStateView state_view = MakeStateView(*master_service_);
+    auto encoded = codec.Encode(state_view);
+    ASSERT_TRUE(encoded.has_value());
+
+    auto target_service = MakeMasterService();
+    auto decoded = codec.Decode(target_service.get(), encoded.value());
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    const auto& recovered = target_service->recovered_vsegment_snapshots();
+    ASSERT_EQ(recovered.size(), 1u);
+    EXPECT_EQ(recovered.front().partition_id, partition.partition_id);
+    EXPECT_EQ(recovered.front().route_epoch, partition.route_epoch);
+    EXPECT_EQ(recovered.front().metadata_revision,
+              partition.metadata_revision);
+    EXPECT_EQ(recovered.front().operation_vsegments,
+              partition.operation_vsegments);
 }
 
 TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {

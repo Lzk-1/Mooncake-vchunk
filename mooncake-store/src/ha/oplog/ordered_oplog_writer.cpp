@@ -207,6 +207,12 @@ bool OrderedOpLogWriter::IsAccepting() const {
     return impl_->accepting;
 }
 
+bool OrderedOpLogWriter::IsCallbackThread() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->callback_thread.joinable() &&
+           impl_->callback_thread.get_id() == std::this_thread::get_id();
+}
+
 ErrorCode OrderedOpLogWriter::LastError() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->last_error;

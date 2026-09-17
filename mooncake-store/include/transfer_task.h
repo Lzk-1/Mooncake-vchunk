@@ -18,10 +18,10 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
+#include "vsegment/vsegment_transfer.h"
 #include "rpc_types.h"
 #include "storage_backend.h"
 #include "client_metric.h"
-#include "partition/vsegment_types.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -535,23 +535,6 @@ class FilereadWorkerPool {
 };
 
 /**
- * @brief vsegment 视图缓存（§12.3.8 预留）。
- *
- * 缓存 vsegment_id -> partition::VSegmentView，供 TransferSubmitter 把 vsegment
- * 副本引用的逻辑区间展开为物理 extent。缓存校验、淘汰策略与并发可见性由
- * vsegment 实现方负责；当前预留阶段恒未命中（Find 返回 nullopt）。
- */
-class VSegmentViewCache {
-   public:
-    std::optional<partition::VSegmentView> Find(
-        const std::string& /*vsegment_id*/) const {
-        return std::nullopt;
-    }
-
-    // TODO(vsegment): 缓存容器、淘汰策略、并发访问控制。
-};
-
-/**
  * @brief Submitter class for asynchronous transfer operations
  *
  * This class analyzes transfer requirements, selects optimal strategies, and
@@ -597,6 +580,10 @@ class TransferSubmitter {
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code);
 
+    std::optional<TransferFuture> submitVSegment(
+        const vsegment::VSegmentTransferPlan& plan,
+        TransferRequest::OpCode op_code);
+
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
@@ -640,9 +627,6 @@ class TransferSubmitter {
     bool memcpy_enabled_;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
-    // vsegment 视图缓存（§12.3.8 预留）：submit 展开 vsegment 副本逻辑区间时使用。
-    VSegmentViewCache vsegment_view_cache_;
-
     /**
      * @brief Select the optimal transfer strategy
      */
@@ -693,17 +677,6 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         TransferRequest::OpCode op_code);
-
-    /**
-     * @brief vsegment 逻辑区间展开入口（§12.3.8 预留）。
-     *
-     * 将 vsegment 副本引用的 (vsegment_id, logical_offset, length) 按给定 view
-     * 的条带映射展开为成员 psegment 上的物理 Memory Descriptor 列表。拆分数学
-     * （条带切分、边界对齐、成员缺失）由 vsegment 实现方填充；未实现时返回空。
-     */
-    std::vector<Replica::Descriptor> expandLogicalRange(
-        const Replica::Descriptor& replica,
-        const partition::VSegmentView& view) const;
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics

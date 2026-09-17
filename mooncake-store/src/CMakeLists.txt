@@ -23,6 +23,14 @@ set(MOONCAKE_STORE_SOURCES
     cvm/cvm_http_server.cpp
     cvm/inter_master_rpc.cpp
     partition/partition_router.cpp
+    vsegment/vsegment.cpp
+    vsegment/partition_quota_planner.cpp
+    vsegment/vsegment_runtime.cpp
+    vsegment/vsegment_transfer.cpp
+    vsegment/vsegment_ha.cpp
+    vsegment/vsegment_service.cpp
+    vsegment/vsegment_manager.cpp
+    vsegment/vsegment_metrics.cpp
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
@@ -82,15 +90,6 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     memory_alloc.cpp
-    vchunk_config.cpp
-    vchunk_metadata.cpp
-    vchunk_allocation_strategy.cpp
-    vchunk_master_manager.cpp
-    vchunk_client.cpp
-    vchunk_control_plane.cpp
-    vchunk_transfer_engine.cpp
-    vchunk_metadata_store.cpp
-    vchunk_metrics.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
 
@@ -355,6 +354,10 @@ check_pie_supported(LANGUAGES CXX)
 
 add_executable(mooncake_master master.cpp)
 
+add_executable(vsegment_quota_planner ../tools/vsegment_quota_planner.cpp)
+target_link_libraries(vsegment_quota_planner PRIVATE mooncake_store glog::glog
+                                                        gflags::gflags)
+
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
 
@@ -465,7 +468,8 @@ if(USE_SUNRISE)
                             ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
-install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+install(TARGETS mooncake_master mooncake_client vsegment_quota_planner
+        DESTINATION bin)
 
 # ---------------------------------------------------------------------------
 # Optional: a self-contained libmooncake_store.so exporting only the store_c.h

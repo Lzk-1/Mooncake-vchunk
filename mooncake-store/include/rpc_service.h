@@ -63,6 +63,22 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default",
         uint64_t client_trace_id = 0, const UUID& client_id = {});
+    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& partition_id, const std::string& vsegment_id);
+    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
+    vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name);
+    ErrorCode VSegmentPutEnd(const VSegmentDescriptor& replica,
+                             uint64_t route_epoch,
+                             const std::string& operation_id,
+                             const std::string& object_id);
+    ErrorCode VSegmentPutRevoke(const std::string& partition_id,
+                                const std::string& vsegment_id,
+                                uint64_t route_epoch,
+                                const std::string& operation_id);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
@@ -95,24 +111,6 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
-
-    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
-        const std::string& tenant_id, const std::string& key,
-        uint64_t total_size, int64_t now_ms);
-    tl::expected<void, ErrorCode> VChunkPutEnd(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id, int64_t now_ms);
-    tl::expected<void, ErrorCode> VChunkPutRevoke(
-        const std::string& tenant_id, const std::string& key,
-        const std::string& vchunk_id);
-    tl::expected<VChunkReadLease, ErrorCode> GetVChunk(
-        const std::string& tenant_id, const std::string& key);
-    tl::expected<void, ErrorCode> ReleaseVChunkReadLease(
-        const std::string& lease_id);
-    tl::expected<void, ErrorCode> RemoveVChunk(const std::string& tenant_id,
-                                               const std::string& key,
-                                               int64_t now_ms);
-    VChunkRuntimeInfo GetVChunkRuntimeInfo();
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
@@ -288,7 +286,10 @@ class WrappedMasterService {
     // endpoint.
     void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
                             uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+                            const std::vector<StandbySegmentInfo>& segments,
+                            const std::vector<
+                                vsegment::PartitionVSegmentSnapshot>&
+                                vsegment_partitions = {});
 
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).
@@ -364,25 +365,6 @@ class WrappedMasterService {
     // the staged export). Returns true when a staged export existed.
     tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
         uint16_t slot, const std::string& importer_master_id);
-
-    // ---- vsegment 预留 RPC 接口（§5.2，方法体由 vsegment 实现方落地）----
-    // 元数据面：cache miss 时拉取完整不可变 view。
-    tl::expected<partition::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& vsegment_id);
-
-    // 物理分配面（幂等，幂等键 = allocation_id + segment_id）。
-    tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
-    GetExtentSummary(const partition::GetExtentSummaryRequest& request);
-    tl::expected<partition::ReserveExtentResponse, ErrorCode> ReserveExtent(
-        const partition::ReserveExtentRequest& request);
-    tl::expected<void, ErrorCode> CommitExtent(
-        const partition::CommitExtentRequest& request);
-    tl::expected<void, ErrorCode> AbortExtent(
-        const partition::AbortExtentRequest& request);
-    tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
-    QueryExtentAllocation(const partition::QueryExtentAllocationRequest& request);
-    tl::expected<void, ErrorCode> ReleaseCommittedExtent(
-        const partition::ReleaseCommittedExtentRequest& request);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

@@ -63,6 +63,7 @@ class OrderedOpLogWriter {
     void Abort(Reservation&& reservation);
 
     bool IsAccepting() const;
+    bool IsCallbackThread() const;
     ErrorCode LastError() const;
     void Start();
     void Stop();

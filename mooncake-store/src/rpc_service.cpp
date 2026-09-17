@@ -8,7 +8,6 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "common.h"
 #include "ha_metric_manager.h"
 #include "master_admin_service.h"
 #include "master_metric_manager.h"
@@ -328,6 +327,40 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return result;
 }
 
+tl::expected<vsegment::VSegmentView, ErrorCode>
+WrappedMasterService::GetVSegmentView(const std::string& partition_id,
+                                      const std::string& vsegment_id) {
+    return master_service_.GetVSegmentView(partition_id, vsegment_id);
+}
+
+tl::expected<vsegment::PSegmentLocation, ErrorCode>
+WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
+    return master_service_.GetPSegmentEndpoint(segment_id);
+}
+
+vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
+    const std::string& partition_id, uint64_t route_epoch,
+    const std::string& operation_id, uint64_t length,
+    const std::string& profile_name) {
+    return master_service_.VSegmentPutStart(partition_id, route_epoch,
+                                            operation_id, length,
+                                            profile_name);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutEnd(
+    const VSegmentDescriptor& replica, uint64_t route_epoch,
+    const std::string& operation_id, const std::string& object_id) {
+    return master_service_.VSegmentPutEnd(replica, route_epoch, operation_id,
+                                          object_id);
+}
+
+ErrorCode WrappedMasterService::VSegmentPutRevoke(
+    const std::string& partition_id, const std::string& vsegment_id,
+    uint64_t route_epoch, const std::string& operation_id) {
+    return master_service_.VSegmentPutRevoke(partition_id, vsegment_id,
+                                             route_epoch, operation_id);
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id,
@@ -477,19 +510,18 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_id, master_service_.IsTenantQuotaEnabled(),
                 [&](const TenantId& resolved_tenant_id)
                     -> tl::expected<PutStartResult, ErrorCode> {
+                    auto vsegment = master_service_.TryVSegmentPutStart(
+                        client_id, key, resolved_tenant_id, slice_length,
+                        config);
+                    if (!vsegment) return tl::make_unexpected(vsegment.error());
+                    if (vsegment->has_value()) return std::move(**vsegment);
                     auto descriptors = master_service_.PutStart(
                         client_id, key, resolved_tenant_id, slice_length,
                         config);
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    // vsegment 两阶段写：由 VSegmentServiceDelegate 预留逻辑
-                    // 区间并生成 operation_id；未注入 delegate 时回退旧直达写
-                    // （operation_id 为空）。
-                    auto operation_id =
-                        master_service_.GeneratePutStartOperationId(
-                            key, slice_length, config);
-                    return PutStartResult{std::move(operation_id),
+                    return PutStartResult{{},
                                           std::move(descriptors.value())};
                 });
         },
@@ -559,81 +591,6 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                      << (result.has_value() ? "ok" : toString(result.error()));
     }
     return result;
-}
-
-tl::expected<VChunkMetadataRecord, ErrorCode>
-WrappedMasterService::VChunkPutStart(const std::string& tenant_id,
-                                     const std::string& key,
-                                     uint64_t total_size, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            return master_service_.VChunkPutStart(resolved_tenant_id, key,
-                                                  total_size, false, now_ms);
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutEnd(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.VChunkPutEnd(
-                resolved_tenant_id, key, vchunk_id, now_ms);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::VChunkPutRevoke(
-    const std::string& tenant_id, const std::string& key,
-    const std::string& vchunk_id) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.VChunkPutRevoke(
-                resolved_tenant_id, key, vchunk_id);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-tl::expected<VChunkReadLease, ErrorCode> WrappedMasterService::GetVChunk(
-    const std::string& tenant_id, const std::string& key) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            return master_service_.AcquireVChunkReadLease(
-                resolved_tenant_id, key, getCurrentTimeInMilli());
-        });
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::ReleaseVChunkReadLease(
-    const std::string& lease_id) {
-    const auto error = master_service_.ReleaseVChunkReadLease(lease_id);
-    return error == ErrorCode::OK
-               ? tl::expected<void, ErrorCode>{}
-               : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::RemoveVChunk(
-    const std::string& tenant_id, const std::string& key, int64_t now_ms) {
-    return WithRequestTenant(
-        tenant_id,
-        [&](const TenantId& resolved_tenant_id) {
-            const auto error = master_service_.RemoveVChunk(
-                resolved_tenant_id, key, now_ms);
-            return error == ErrorCode::OK
-                       ? tl::expected<void, ErrorCode>{}
-                       : tl::expected<void, ErrorCode>{tl::unexpected(error)};
-        });
-}
-
-VChunkRuntimeInfo WrappedMasterService::GetVChunkRuntimeInfo() {
-    return master_service_.GetVChunkRuntimeInfo();
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
@@ -890,12 +847,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    // 与 PutStart 对称：由 VSegmentServiceDelegate 预留逻辑
-                    // 区间并生成 operation_id（未注入时回退旧直达写）。
-                    auto operation_id =
-                        master_service_.GeneratePutStartOperationId(
-                            key, slice_length, config);
-                    return PutStartResult{std::move(operation_id),
+                    return PutStartResult{{},
                                           std::move(descriptors.value())};
                 });
         },
@@ -1930,9 +1882,11 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
 void WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+        vsegment_partitions) {
     master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments);
+        objects, initial_oplog_sequence_id, segments, vsegment_partitions);
 }
 
 void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
@@ -2086,60 +2040,6 @@ WrappedMasterService::InterMasterAckSlotImported(
         },
         [] {}, [] {});
 }
-
-// ---- vsegment 预留 RPC 接口占位实现（方法体由 vsegment 实现方落地）----
-tl::expected<partition::VSegmentView, ErrorCode>
-WrappedMasterService::GetVSegmentView(const std::string& vsegment_id) {
-    (void)vsegment_id;
-    throw std::runtime_error(
-        "GetVSegmentView not implemented (vsegment reserved interface)");
-}
-
-tl::expected<partition::GetExtentSummaryResponse, ErrorCode>
-WrappedMasterService::GetExtentSummary(
-    const partition::GetExtentSummaryRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "GetExtentSummary not implemented (vsegment reserved interface)");
-}
-
-tl::expected<partition::ReserveExtentResponse, ErrorCode>
-WrappedMasterService::ReserveExtent(
-    const partition::ReserveExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "ReserveExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::CommitExtent(
-    const partition::CommitExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "CommitExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::AbortExtent(
-    const partition::AbortExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "AbortExtent not implemented (vsegment reserved interface)");
-}
-
-tl::expected<partition::QueryExtentAllocationResponse, ErrorCode>
-WrappedMasterService::QueryExtentAllocation(
-    const partition::QueryExtentAllocationRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "QueryExtentAllocation not implemented (vsegment reserved interface)");
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::ReleaseCommittedExtent(
-    const partition::ReleaseCommittedExtentRequest& request) {
-    (void)request;
-    throw std::runtime_error(
-        "ReleaseCommittedExtent not implemented (vsegment reserved interface)");
-}
-
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -2185,6 +2085,18 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetPSegmentEndpoint>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::VSegmentPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::VSegmentPutRevoke>(
+        &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
@@ -2193,22 +2105,6 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutStart>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::VChunkPutRevoke>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetVChunk>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::ReleaseVChunkReadLease>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::RemoveVChunk>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetVChunkRuntimeInfo>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);
@@ -2337,23 +2233,6 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
-    // vsegment 预留 RPC 接口。
-    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetExtentSummary>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ReserveExtent>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CommitExtent>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::AbortExtent>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::QueryExtentAllocation>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::ReleaseCommittedExtent>(
-        &wrapped_master_service);
 }
 
 }  // namespace mooncake

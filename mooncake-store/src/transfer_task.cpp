@@ -999,51 +999,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
-std::vector<Replica::Descriptor> TransferSubmitter::expandLogicalRange(
-    const Replica::Descriptor& /*replica*/,
-    const partition::VSegmentView& /*view*/) const {
-    // TODO(vsegment): 实现条带映射展开逻辑。
-    return {};
-}
-
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size) {
     std::optional<TransferFuture> future;
-
-    if (replica.is_vsegment_replica()) {
-        // vsegment 副本（§12.3.8 预留）：经 VSegmentViewCache 查 view 后由
-        // expandLogicalRange 展开为成员 psegment 的物理 extent 再落地。展开与
-        // 条带切分逻辑由 vsegment 实现方填充，就绪前返回失败关闭，不落旧直达写。
-        const auto& vseg_desc = replica.get_vsegment_descriptor();
-        MC_LOG(INFO) << "VSegmentSubmit vsegment_id=" << vseg_desc.vsegment_id
-                     << " logical_offset=" << vseg_desc.logical_offset
-                     << " length=" << vseg_desc.length
-                     << " op=" << static_cast<int>(op_code)
-                     << " slices=" << slices.size();
-
-        auto view = vsegment_view_cache_.Find(vseg_desc.vsegment_id);
-        if (!view) {
-            MC_LOG(WARNING) << "VSegmentViewMiss vsegment_id="
-                            << vseg_desc.vsegment_id;
-            return std::nullopt;
-        }
-        auto physical_replicas = expandLogicalRange(replica, *view);
-        if (physical_replicas.empty()) {
-            MC_LOG(ERROR) << "VSegmentExpandEmpty vsegment_id="
-                          << vseg_desc.vsegment_id
-                          << " logical_offset=" << vseg_desc.logical_offset
-                          << " length=" << vseg_desc.length;
-            return std::nullopt;
-        }
-        MC_LOG(INFO) << "VSegmentExpand vsegment_id=" << vseg_desc.vsegment_id
-                     << " physical_replicas=" << physical_replicas.size();
-        // TODO(vsegment): 将 slices 按条带切分并与 physical_replicas 对应后经
-        // submit_batch 落地到物理 extent。
-        MC_LOG(WARNING) << "VSegmentSubmitNotImplemented vsegment_id="
-                        << vseg_desc.vsegment_id;
-        return std::nullopt;
-    }
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();
@@ -1085,6 +1044,9 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
         return std::nullopt;
 #endif
+    } else if (replica.is_vsegment_replica()) {
+        LOG(ERROR) << "VSegment transfer requires an expanded transfer plan";
+        return std::nullopt;
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1097,6 +1059,39 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitVSegment(
+    const vsegment::VSegmentTransferPlan& plan,
+    TransferRequest::OpCode op_code) {
+    if (!plan || plan.requests.empty()) return std::nullopt;
+    std::vector<TransferRequest> requests;
+    requests.reserve(plan.requests.size());
+    for (const auto& subrequest : plan.requests) {
+        SegmentHandle segment = engine_.openSegment(subrequest.endpoint);
+        if (segment == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open vsegment member endpoint='"
+                       << subrequest.endpoint << "'";
+            return std::nullopt;
+        }
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = reinterpret_cast<void*>(
+            subrequest.transfer.client_address);
+        request.target_id = segment;
+        request.target_offset = subrequest.transfer.physical_offset;
+        request.length = subrequest.transfer.length;
+        requests.push_back(request);
+    }
+    auto future = submitTransfer(requests);
+    if (future) {
+        size_t bytes = 0;
+        for (const auto& request : plan.requests)
+            bytes += request.transfer.length;
+        std::vector<Slice> metric_slices{{nullptr, bytes}};
+        updateTransferMetrics(metric_slices, op_code);
+    }
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
@@ -1106,6 +1101,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << "Batch transfer only supports memory replicas";
+            return std::nullopt;
+        }
         auto& mem_desc = replica.get_memory_descriptor();
         if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
             return std::nullopt;

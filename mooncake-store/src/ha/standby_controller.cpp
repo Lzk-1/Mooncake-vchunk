@@ -276,6 +276,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.applied_seq_id = snapshot.oplog_sequence_id;
         ctx.objects = std::move(snapshot.objects);
         ctx.segments = std::move(snapshot.segments);
+        ctx.vsegment_partitions = std::move(snapshot.vsegment_partitions);
 
         return ctx;
     }

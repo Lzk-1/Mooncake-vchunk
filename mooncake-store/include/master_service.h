@@ -37,7 +37,6 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "vchunk_master_manager.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -49,6 +48,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "vsegment/vsegment_service.h"
 
 namespace mooncake {
 
@@ -88,33 +88,6 @@ class MasterServiceHATest;
 namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
-
-// vsegment 依赖反转接口（§12.3.8 预留）。MasterService 通过该抽象接口把
-// 两阶段写（PutStart 预留 → PutEnd 提交 / PutRevoke 撤销）与 vsegment
-// 生命周期变化委托给 vsegment 实现方，避免反向依赖其内部分配状态机。
-// 当前仅定义契约：未注入实现（指针为 null）时 MasterService 回退旧直达写
-// 路径，operation_id 恒为空字符串。
-class VSegmentServiceDelegate {
-   public:
-    virtual ~VSegmentServiceDelegate() = default;
-
-    // PutStart 时预留逻辑区间并生成两阶段写 operation_id。返回空字符串
-    // 表示该 key 不启用 vsegment，回退旧直达写路径。
-    virtual std::string ReserveOperation(const std::string& key,
-                                         uint64_t slice_length,
-                                         const ReplicateConfig& config) = 0;
-
-    // PutEnd 成功时提交该 operation 预留的区间。
-    virtual void CommitOperation(const std::string& operation_id) = 0;
-
-    // PutRevoke / PutEnd 失败时撤销该 operation 预留的区间。
-    virtual void AbortOperation(const std::string& operation_id) = 0;
-
-    // vsegment 生命周期变化通知。lifecycle 取 partition::Lifecycle 枚举值
-    // （见 partition/vsegment_types.h）。
-    virtual void OnLifecycleChanged(const std::string& vsegment_id,
-                                    int32_t lifecycle) {}
-};
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -198,19 +171,37 @@ class MasterService {
     const std::string& master_id() const { return master_id_; }
     EtcdLeaseId cvm_lease_id() const { return cvm_lease_id_; }
     uint32_t GetOwnedSlotCount() const;
-
-    // vsegment 依赖注入（§12.3.8 预留）：PutStart/PutEnd/PutRevoke 的两阶段
-    // 写语义委托给 vsegment 实现方。未注入时回退旧直达写路径。
-    void SetVSegmentServiceDelegate(VSegmentServiceDelegate* delegate);
-    VSegmentServiceDelegate* vsegment_service_delegate() const {
-        return vsegment_service_delegate_;
+    void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
+        vsegment_service_ = std::move(service);
     }
+    const std::vector<vsegment::PartitionVSegmentSnapshot>&
+    recovered_vsegment_snapshots() const {
+        return recovered_vsegment_snapshots_;
+    }
+    void ClearRecoveredVSegmentSnapshots() {
+        recovered_vsegment_snapshots_.clear();
+    }
+    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
+        const std::string& partition_id, const std::string& vsegment_id);
+    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
+        const std::string& segment_id);
+    vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name = {});
+    ErrorCode VSegmentPutEnd(const VSegmentDescriptor& replica,
+                             uint64_t route_epoch,
+                             const std::string& operation_id,
+                             const std::string& object_id);
+    ErrorCode VSegmentPutRevoke(const std::string& partition_id,
+                                const std::string& vsegment_id,
+                                uint64_t route_epoch,
+                                const std::string& operation_id);
 
-    // PutStart 时生成两阶段写 operation_id：delegate 存在则委托其预留逻辑，
-    // 否则返回空字符串（旧直达写路径，不使用 vsegment）。
-    std::string GeneratePutStartOperationId(
-        const std::string& key, uint64_t slice_length,
-        const ReplicateConfig& config) const;
+    tl::expected<std::optional<PutStartResult>, ErrorCode>
+    TryVSegmentPutStart(const UUID& client_id, const std::string& key,
+                        const TenantId& tenant_id, uint64_t slice_length,
+                        const ReplicateConfig& config);
 
     // Inter-master allocation forwarding (CVM plan B phase 2). Called by
     // WrappedMasterService when a slot-owning peer asks this submaster
@@ -296,29 +287,6 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
-
-    tl::expected<VChunkMetadataRecord, ErrorCode> VChunkPutStart(
-        const TenantId& tenant_id, const std::string& key,
-        uint64_t total_size, bool is_ssd_segment, int64_t now_ms,
-        const std::set<std::string>& excluded_segments = {});
-    ErrorCode VChunkPutEnd(const TenantId& tenant_id, const std::string& key,
-                           const std::string& vchunk_id, int64_t now_ms);
-    ErrorCode VChunkPutRevoke(const TenantId& tenant_id,
-                              const std::string& key,
-                              const std::string& vchunk_id);
-    tl::expected<VChunkMetadataRecord, ErrorCode> GetVChunk(
-        const TenantId& tenant_id, const std::string& key) const;
-    tl::expected<VChunkMasterManager::ReadHandle, ErrorCode> AcquireVChunkRead(
-        const TenantId& tenant_id, const std::string& key) const;
-    tl::expected<VChunkReadLease, ErrorCode> AcquireVChunkReadLease(
-        const TenantId& tenant_id, const std::string& key, int64_t now_ms);
-    ErrorCode ReleaseVChunkReadLease(const std::string& lease_id);
-    ErrorCode RemoveVChunk(const TenantId& tenant_id, const std::string& key,
-                           int64_t now_ms);
-    VChunkRuntimeInfo GetVChunkRuntimeInfo() const;
-    tl::expected<size_t, ErrorCode> ReapExpiredVChunks(int64_t now_ms,
-                                                       size_t max_scan);
-    VChunkMetricsSnapshot GetVChunkMetrics() const;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -997,7 +965,9 @@ class MasterService {
     void RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<vsegment::PartitionVSegmentSnapshot>&
+            vsegment_partitions = {});
 
     /**
      * @brief Query the status of a task
@@ -1295,6 +1265,10 @@ class MasterService {
             return HasReplica(&Replica::fn_is_memory_replica);
         }
 
+        bool HasVSegmentReplica() const {
+            return HasReplica(&Replica::fn_is_vsegment_replica);
+        }
+
         bool HasNoFReplica() const {
             return HasReplica(&Replica::fn_is_nof_replica);
         }
@@ -1309,6 +1283,10 @@ class MasterService {
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
+                if (replica.is_vsegment_replica()) {
+                    return replica.get_vsegment_descriptor().vsegment_id ==
+                           segment_name;
+                }
                 auto names = replica.get_segment_names();
                 for (auto& name_opt : names) {
                     if (name_opt == segment_name) {
@@ -1532,6 +1510,9 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
+    void ReleaseVSegmentReplicaState(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& pred_fn);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
@@ -2287,10 +2268,11 @@ class MasterService {
     // member table + per-peer cached coro_rpc pools. Started/stopped by the
     // supervisor around serve phases, mirroring the heartbeat above.
     std::unique_ptr<cvm::InterMasterRpcClient> inter_master_rpc_;
-
-    // vsegment 两阶段写委托（§12.3.8 预留）。nullptr 表示未启用 vsegment，
-    // 回退旧直达写路径；由 vsegment 实现方经 SetVSegmentServiceDelegate 注入。
-    VSegmentServiceDelegate* vsegment_service_delegate_{nullptr};
+    std::shared_ptr<vsegment::VSegmentService> vsegment_service_;
+    // Decoded before Partition ownership is activated. The route lifecycle
+    // consumes the matching state when it creates each local manager.
+    std::vector<vsegment::PartitionVSegmentSnapshot>
+        recovered_vsegment_snapshots_;
 
     // ----- Inter-master allocation forwarding (CVM plan B phase 2) -----
 
@@ -2364,6 +2346,8 @@ class MasterService {
     // 归属变更日志（P1）：缓存最近一次解析到的 primary 成员列表（已排序去重），
     // 用于在成员增删时打印 joined/left 根因，仅变化时打印一次。
     std::vector<std::string> cvm_last_primary_ids_;
+    // Revision of the membership read used to derive this local ring.
+    ViewVersionId cvm_ring_revision_{0};
     // 迁移旧环（Phase 3）：成员列表发生变化「前」的 primary 列表，供
     // ImportSlotMetadata 推导 gained slot 的上一任 owner（旧 owner 直传）。
     // 仅在 membership 变化时更新，保持不变时维持旧值以支持 acquire 重试。
@@ -2380,7 +2364,8 @@ class MasterService {
     ErrorCode ImportSlotMetadata(uint16_t slot);
 
     // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
-    SlotMetadataExport BuildSlotMetadataExport(uint16_t slot) const;
+    tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
+        uint16_t slot) const;
     // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
     ErrorCode DropSlotMetadataLocal(uint16_t slot);
     // RPC 直传的 staged 导出缓存：旧 owner 在 on_release 时把导出结果放这里，
@@ -2391,13 +2376,14 @@ class MasterService {
     // A1：读路径 slot 所有权校验。UpdateExpectedSlots 由心跳 resolver 与晋升
     // 路径调用，写 expected_owned_ 位图（ring 推导的应拥有集合）；MarkSlotsReady
     // 把已完成元数据导入的 slot 置入 ready_owned_。OwnsSlot 读 ready_owned_。
-    // Phase 1 行为等价：expected 更新时 ready 全量跟随。
+    // Gained slots become ready only after object/vsegment import succeeds.
     void UpdateExpectedSlots(const std::vector<uint16_t>& slots);
     void MarkSlotsReady(const std::vector<uint16_t>& slots);
     bool OwnsSlot(uint16_t slot) const;
     // 读/写路径 slot 可服务性校验（Phase 4）：ready_owned_ → OK；expected 但
     // !ready → SLOT_MIGRATING（新 owner 正在导入元数据）；否则 → SLOT_NOT_OWNED。
     ErrorCode CheckSlotServiceability(uint16_t slot) const;
+    ErrorCode CheckVSegmentServiceability(const std::string& partition_id) const;
     // 读路径转发：解析任意 slot 的 owner master_id（基于一致性哈希环与
     // etcd 中的 primary master 列表）。解析失败返回 nullopt。供 GetReplicaList
     // / BatchGetReplicaList 在 OwnsSlot 失败时向 slot owner 转发请求。
@@ -2412,7 +2398,6 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                              const TenantId& tenant_id);
-    bool OwnsVChunkSlot(uint16_t slot) const;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -2459,24 +2444,6 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     NoFSegmentManager nof_segment_manager_;
-    VChunkMasterManager vchunk_manager_;
-    bool vchunk_enabled_{false};
-    uint64_t vchunk_reaper_interval_ms_{1000};
-    size_t vchunk_reaper_max_scan_{128};
-    std::atomic<bool> vchunk_reaper_running_{false};
-    bool vchunk_recovery_pending_{false};
-    struct VChunkRemoteReadLease {
-        VChunkMasterManager::ReadHandle handle;
-        int64_t expires_at_ms{0};
-    };
-    std::mutex vchunk_read_leases_mutex_;
-    std::unordered_map<std::string, VChunkRemoteReadLease>
-        vchunk_read_leases_;
-    std::thread vchunk_reaper_thread_;
-    std::mutex vchunk_reaper_mutex_;
-    std::condition_variable vchunk_reaper_cv_;
-    void StartVChunkReaper();
-    void VChunkReaperThreadFunc();
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
@@ -2637,6 +2604,7 @@ class MasterService {
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

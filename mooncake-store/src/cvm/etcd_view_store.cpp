@@ -96,6 +96,75 @@ ErrorCode EtcdViewStore::DeserializeRingMeta(const std::string& in,
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdViewStore::SerializePartitionRoute(
+    const partition::PartitionRoute& route, std::string& out) {
+    try {
+        struct_json::to_json(route, out);
+        return ErrorCode::OK;
+    } catch (...) {
+        return ErrorCode::SERIALIZE_FAIL;
+    }
+}
+
+ErrorCode EtcdViewStore::DeserializePartitionRoute(
+    const std::string& in, partition::PartitionRoute& out) {
+    try {
+        struct_json::from_json(out, in);
+        return ErrorCode::OK;
+    } catch (...) {
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+}
+
+ErrorCode EtcdViewStore::SavePartitionRoute(
+    const std::string& ns, const partition::PartitionRoute& route) {
+    if (route.partition_id.partition_id.empty() ||
+        route.owner_submaster_id.empty() ||
+        route.route_epoch == 0)
+        return ErrorCode::INVALID_PARAMS;
+    std::string value;
+    auto error = SerializePartitionRoute(route, value);
+    if (error != ErrorCode::OK) return error;
+    const auto key =
+        PartitionRouteKey(ns, route.partition_id.partition_id);
+    return EtcdHelper::Put(key.data(), key.size(), value.data(), value.size());
+}
+
+ErrorCode EtcdViewStore::LoadPartitionRoute(
+    const std::string& ns, const std::string& partition_id,
+    partition::PartitionRoute& out, ViewVersionId& version) {
+    const auto key = PartitionRouteKey(ns, partition_id);
+    std::string value;
+    auto error = EtcdHelper::Get(key.data(), key.size(), value, version);
+    return error == ErrorCode::OK ? DeserializePartitionRoute(value, out)
+                                  : error;
+}
+
+ErrorCode EtcdViewStore::CASSwitchPartitionOwner(
+    const std::string& ns, const std::string& partition_id,
+    uint64_t expected_epoch, const std::string& new_owner,
+    partition::PartitionState state, const std::string& target,
+    partition::PartitionRoute& out) {
+    partition::PartitionRoute current;
+    ViewVersionId version = 0;
+    auto error = LoadPartitionRoute(ns, partition_id, current, version);
+    if (error != ErrorCode::OK) return error;
+    if (current.route_epoch != expected_epoch) return ErrorCode::STALE_ROUTE;
+    std::string old_value;
+    SerializePartitionRoute(current, old_value);
+    out = {{partition_id}, new_owner, expected_epoch + 1,
+           static_cast<int32_t>(state), target};
+    std::string new_value;
+    SerializePartitionRoute(out, new_value);
+    const auto key = PartitionRouteKey(ns, partition_id);
+    error = EtcdHelper::TxnCompareAndPut(
+        {{key, EtcdHelper::TxnCompareKind::kValueEquals, old_value}},
+        {{key, new_value}});
+    return error == ErrorCode::ETCD_TRANSACTION_FAIL ? ErrorCode::STALE_ROUTE
+                                                      : error;
+}
+
+
 // ---- Segment neutral entity (segments/{segment_id}) ----
 
 ErrorCode EtcdViewStore::SerializeSegmentDescriptor(

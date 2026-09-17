@@ -444,10 +444,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             // Restore from standby if we have context.
             if (promotion_ctx.applied_seq_id > 0 ||
                 !promotion_ctx.objects.empty() ||
-                !promotion_ctx.segments.empty()) {
+                !promotion_ctx.segments.empty() ||
+                !promotion_ctx.vsegment_partitions.empty()) {
                 wrapped_master_service->RestoreFromStandby(
                     promotion_ctx.objects, promotion_ctx.applied_seq_id,
-                    promotion_ctx.segments);
+                    promotion_ctx.segments,
+                    promotion_ctx.vsegment_partitions);
             }
 
             mooncake::RegisterRpcService(server, *wrapped_master_service);

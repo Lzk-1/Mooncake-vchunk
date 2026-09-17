@@ -351,6 +351,33 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
     return snapshot;
 }
 
+tl::expected<std::vector<vsegment::PartitionVSegmentSnapshot>, ErrorCode>
+DeserializeVSegmentPartitions(const std::vector<uint8_t>& data) {
+    try {
+        auto root_handle = msgpack::unpack(
+            reinterpret_cast<const char*>(data.data()), data.size());
+        const auto* encoded =
+            FindMapField(root_handle.get(), "vsegment_partitions");
+        if (encoded == nullptr) return std::vector<
+            vsegment::PartitionVSegmentSnapshot>{};
+        if (encoded->type != msgpack::type::BIN) {
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        std::vector<vsegment::PartitionVSegmentSnapshot> partitions;
+        const std::string_view bytes(encoded->via.bin.ptr,
+                                     encoded->via.bin.size);
+        if (struct_pack::deserialize_to(partitions, bytes) !=
+            struct_pack::errc{}) {
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        return partitions;
+    } catch (const std::exception& ex) {
+        LOG(ERROR) << "Failed to parse vsegment snapshot payload: "
+                   << ex.what();
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+}
+
 class CatalogBackedSnapshotProvider final : public SnapshotProvider {
    public:
     explicit CatalogBackedSnapshotProvider(
@@ -490,11 +517,20 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
                        << ", error=" << toString(deserialize_metadata.error());
             return tl::make_unexpected(deserialize_metadata.error());
         }
+        auto deserialize_vsegments =
+            DeserializeVSegmentPartitions(metadata_content);
+        if (!deserialize_vsegments) {
+            LOG(ERROR) << "Failed to deserialize vsegment snapshot payload, "
+                       << "snapshot_id=" << descriptor.snapshot_id;
+            return tl::make_unexpected(deserialize_vsegments.error());
+        }
 
         LoadedSnapshot snapshot;
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+        snapshot.vsegment_partitions =
+            std::move(deserialize_vsegments.value());
 
         // Extract standby segment registry entries from the deserialized
         // SegmentManager. The snapshot's SegmentSerializer::Serialize()
