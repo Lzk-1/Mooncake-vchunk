@@ -1674,12 +1674,21 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     }
     const std::string seg_id = UuidToString(segment.id);
 
+    // 查询 allocator 实时已用字节数，供 planner 按 [used_bytes, capacity)
+    // 切分 vsegment 可分配范围，避免与其他分配器占用范围重叠。查询失败
+    // 时保守上报 0（等同 exclusive 空集群），由 planner 后续校验兜底。
+    size_t used_bytes = 0;
+    size_t capacity_bytes = 0;
+    {
+        auto segment_access = segment_manager_.getSegmentAccess();
+        segment_access.QuerySegments(segment.name, used_bytes, capacity_bytes);
+    }
+
     // 1. Write neutral SegmentDescriptor to segments/{seg_id} (idempotent,
     //    without lease — one copy per segment, no owner).资源事实字段
     //    （medium / io_alignment / supports_unaligned_io / failure_domain /
-    //    vsegment_exclusive）由本集群配置填充，供 vsegment 自动发现使用，
-    //    不应由用户在配额文件中手写。未来由底层 allocator 在 mount 时上报
-    //    真实介质/对齐能力后，可改为按 segment 粒度覆盖。
+    //    used_bytes / vsegment_exclusive）由本集群配置 + allocator 实时
+    //    状态填充，供 vsegment 自动发现使用，不应由用户在配额文件中手写。
     cvm::SegmentDescriptor desc;
     desc.segment_id = seg_id;
     desc.segment_name = segment.name;
@@ -1692,6 +1701,7 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     desc.supports_unaligned_io = true;
     desc.failure_domain =
         segment.host_id.empty() ? desc.segment_id : segment.host_id;
+    desc.used_bytes = used_bytes;
     desc.vsegment_exclusive = cvm_segments_vsegment_exclusive_;
     ErrorCode err =
         cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);

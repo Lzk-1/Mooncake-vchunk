@@ -1777,7 +1777,9 @@ TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
 
 // ---- 自动发现：BuildDiscoveredQuotaPlan ----
 
-TEST(BuildDiscoveredQuotaPlanTest, RejectsNonExclusiveSegmentsByDefault) {
+TEST(BuildDiscoveredQuotaPlanTest, AcceptsNonExclusiveSegmentsByDefault) {
+    // 非独占 segment 默认接受：按 [used_bytes, capacity) 切分。
+    // used_bytes=0（空集群）时等同独占，base_offset=0。
     VSegmentUserPolicy policy;
     policy.member_count = 2;
     policy.stripe_size = 64;
@@ -1791,7 +1793,8 @@ TEST(BuildDiscoveredQuotaPlanTest, RejectsNonExclusiveSegmentsByDefault) {
     seg_a.host_id = "host-a";
     seg_a.medium = "DRAM";
     seg_a.io_alignment = 8;
-    seg_a.vsegment_exclusive = false;  // 未声明专用 → 必须拒绝
+    seg_a.vsegment_exclusive = false;  // 非独占，默认接受
+    seg_a.used_bytes = 0;              // 空集群
     cvm::SegmentDescriptor seg_b = seg_a;
     seg_b.segment_id = "seg-b";
 
@@ -1809,9 +1812,11 @@ TEST(BuildDiscoveredQuotaPlanTest, RejectsNonExclusiveSegmentsByDefault) {
     std::string detail;
     auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
                                           &request, &detail);
-    EXPECT_EQ(error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
-    EXPECT_NE(detail.find("vsegment_exclusive"), std::string::npos);
-    EXPECT_NE(detail.find("seg-a"), std::string::npos);
+    ASSERT_EQ(error, ErrorCode::OK) << detail;
+    ASSERT_EQ(request.segments.size(), 2u);
+    // used_bytes=0 → base_offset=0，capacity=全部可用。
+    EXPECT_EQ(request.segments[0].base_offset, 0u);
+    EXPECT_EQ(request.segments[0].capacity, 4096u);
 }
 
 TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
@@ -1831,6 +1836,7 @@ TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
     seg_a.supports_unaligned_io = true;
     seg_a.failure_domain = "rack-1";
     seg_a.vsegment_exclusive = true;
+    seg_a.used_bytes = 0;  // 独占必须 used_bytes=0
     cvm::SegmentDescriptor seg_b = seg_a;
     seg_b.segment_id = "seg-b";
     seg_b.host_id = "host-b";
@@ -1858,6 +1864,9 @@ TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
     EXPECT_EQ(request.segments[0].failure_domain, "rack-1");
     EXPECT_EQ(request.segments[1].failure_domain, "host-b");  // host_id 兜底
     EXPECT_TRUE(request.segments[0].supports_unaligned_io);
+    // 独占 + used_bytes=0 → base_offset=0，capacity=全部可用。
+    EXPECT_EQ(request.segments[0].base_offset, 0u);
+    EXPECT_EQ(request.segments[0].capacity, 4096u);
     // Partition 列表由 KV PT 生成（slot 数）。
     EXPECT_EQ(request.partition_ids.size(), cvm::kSlotCount);
     EXPECT_EQ(request.profile_specs.size(), 1u);
@@ -1894,7 +1903,10 @@ TEST(BuildDiscoveredQuotaPlanTest, RejectsEmptyMediumFromAllocator) {
     EXPECT_NE(detail.find("empty medium"), std::string::npos);
 }
 
-TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveOverridesForAdvancedUsers) {
+TEST(BuildDiscoveredQuotaPlanTest,
+     AcceptsNonExclusiveWithUsedBytesAndSlicesCorrectly) {
+    // 非独占 + used_bytes>0 → 按 [used_bytes, capacity) 切分，
+    // base_offset=used_bytes，capacity=available。
     VSegmentUserPolicy policy;
     policy.member_count = 2;
     policy.stripe_size = 64;
@@ -1903,12 +1915,13 @@ TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveOverridesForAdvancedUsers) {
 
     cvm::SegmentDescriptor seg_a;
     seg_a.segment_id = "seg-a";
-    seg_a.capacity = 4096;
+    seg_a.capacity = 8192;
     seg_a.te_endpoint = "host-a:1234";
     seg_a.host_id = "host-a";
     seg_a.medium = "DRAM";
     seg_a.io_alignment = 8;
-    seg_a.vsegment_exclusive = false;  // 非专用
+    seg_a.vsegment_exclusive = false;
+    seg_a.used_bytes = 4096;  // 前半段已被其他分配器占用
     cvm::SegmentDescriptor seg_b = seg_a;
     seg_b.segment_id = "seg-b";
 
@@ -1924,12 +1937,131 @@ TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveOverridesForAdvancedUsers) {
 
     PartitionQuotaPlanRequest request;
     std::string detail;
-    // 高级用户显式声明已通过空间管理机制确认可分配范围。
     auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
-                                          &request, &detail,
-                                          /*allow_non_exclusive=*/true);
+                                          &request, &detail);
     ASSERT_EQ(error, ErrorCode::OK) << detail;
-    EXPECT_EQ(request.segments.size(), 2u);
+    ASSERT_EQ(request.segments.size(), 2u);
+    // base_offset=used_bytes，capacity=available=capacity-used_bytes。
+    EXPECT_EQ(request.segments[0].base_offset, 4096u);
+    EXPECT_EQ(request.segments[0].capacity, 4096u);  // 8192 - 4096
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, RejectsExclusiveWithNonZeroUsedBytes) {
+    // exclusive=true 但 used_bytes>0 → 声明与实际不符，拒绝。
+    VSegmentUserPolicy policy;
+    policy.member_count = 1;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg;
+    seg.segment_id = "seg-a";
+    seg.capacity = 8192;
+    seg.te_endpoint = "host-a:1234";
+    seg.medium = "DRAM";
+    seg.vsegment_exclusive = true;
+    seg.used_bytes = 100;  // 声明独占但有占用 → 拒绝
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount;
+    mount.segment_id = "seg-a";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    EXPECT_EQ(error, ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("vsegment_exclusive=true but used_bytes"), std::string::npos);
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, SkipsSegmentsWithInsufficientFreeSpace) {
+    // available < member_extent_size → 跳过该 segment。
+    VSegmentUserPolicy policy;
+    policy.member_count = 1;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 512;  // 需要至少 512 字节可用
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg;
+    seg.segment_id = "seg-a";
+    seg.capacity = 4096;
+    seg.te_endpoint = "host-a:1234";
+    seg.medium = "DRAM";
+    seg.vsegment_exclusive = false;
+    seg.used_bytes = 3900;  // available=196 < 512 → 跳过
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount;
+    mount.segment_id = "seg-a";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount}};
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    EXPECT_EQ(error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+    EXPECT_NE(detail.find("insufficient"), std::string::npos);
+    EXPECT_NE(detail.find("seg-a"), std::string::npos);
+}
+
+TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveIsDeprecatedNoop) {
+    // allow_non_exclusive 现在是 no-op：非独占 segment 默认接受，
+    // 传 true/false 行为一致。
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium = "DRAM";
+
+    cvm::SegmentDescriptor seg_a;
+    seg_a.segment_id = "seg-a";
+    seg_a.capacity = 4096;
+    seg_a.te_endpoint = "host-a:1234";
+    seg_a.host_id = "host-a";
+    seg_a.medium = "DRAM";
+    seg_a.io_alignment = 8;
+    seg_a.vsegment_exclusive = false;
+    cvm::SegmentDescriptor seg_b = seg_a;
+    seg_b.segment_id = "seg-b";
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {seg_a, seg_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    cvm::MountEntry mount_a, mount_b;
+    mount_a.segment_id = "seg-a";
+    mount_b.segment_id = "seg-b";
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", mount_a}, {"master-a", mount_b}};
+
+    // 不传 allow_non_exclusive（默认 false）→ 接受。
+    {
+        PartitionQuotaPlanRequest request;
+        std::string detail;
+        auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters,
+                                              mounts, &request, &detail);
+        ASSERT_EQ(error, ErrorCode::OK) << detail;
+        EXPECT_EQ(request.segments.size(), 2u);
+    }
+    // 传 allow_non_exclusive=true → 行为一致。
+    {
+        PartitionQuotaPlanRequest request;
+        std::string detail;
+        auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters,
+                                              mounts, &request, &detail,
+                                              /*allow_non_exclusive=*/true);
+        ASSERT_EQ(error, ErrorCode::OK) << detail;
+        EXPECT_EQ(request.segments.size(), 2u);
+    }
 }
 
 }  // namespace

@@ -47,13 +47,15 @@ YLT_REFL(VSegmentUserPolicy, member_count, stripe_size, member_extent_size,
          initial_vsegment_count, reserved_ratio, config_generation);
 
 // 从 CVM 自动发现的资源事实（SegmentDescriptor + MountEntry +
-// MasterRegistration）构建配额规划请求。资源事实（psegment ID、容量、介质、
-// 对齐能力、在线状态）由系统自动发现，不应由用户在配额文件中手写。
+// MasterRegistration）构建配额规划请求。资源事实（psegment ID、容量、
+// 介质、对齐能力、已用字节、在线状态）由系统自动发现，不应由用户在配额
+// 文件中手写。
 //
-// 安全约束：自动发现「总容量」≠「空闲空间」。仅对 vsegment_exclusive=true
-// 的 psegment 直接按 capacity 切分；vsegment_exclusive=false 的 psegment
-// 被拒绝（需通过空间管理机制显式声明可分配范围），除非 allow_non_exclusive
-// =true（仅供已通过其他空间管理机制确认可分配范围的高级用户/测试使用）。
+// 空间安全：按 [used_bytes, capacity) 作为 vsegment 可切分范围，避免与
+// 其他分配器占用范围 [0, used_bytes) 重叠。vsegment_exclusive=true 时
+// 校验 used_bytes==0（快路径，直接按 capacity 切分）；false 时按
+// [used_bytes, capacity) 切分。allow_non_exclusive 为兼容旧调用方保留，
+// 当前实现已默认接受非独占 segment，该参数不再有实际效果。
 ErrorCode BuildDiscoveredQuotaPlan(
     const VSegmentUserPolicy& policy,
     const std::vector<cvm::SegmentDescriptor>& descriptors,

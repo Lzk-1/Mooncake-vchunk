@@ -312,11 +312,12 @@ DEFINE_string(cvm_segment_default_medium, "REGISTERED_MEMORY",
               "Must match VSegmentProfile.required_medium used by the vsegment "
               "quota planner. Default \"REGISTERED_MEMORY\".");
 DEFINE_bool(cvm_segments_vsegment_exclusive, false,
-            "Declare that this cluster's segments are dedicated to vsegment "
-            "and currently empty. true lets the vsegment quota planner treat "
-            "registered capacity as free space for automatic discovery; false "
-            "makes it refuse (capacity != free space). Only set true on a "
-            "cluster dedicated to vsegment at init time.");
+            "Optional hint: declare that this cluster's segments are "
+            "dedicated to vsegment and currently empty. true makes the "
+            "planner verify used_bytes==0 (fast path, full capacity used); "
+            "false (default) makes the planner use [used_bytes, capacity) "
+            "as the allocatable range. No longer required — users need not "
+            "set this for normal deployment.");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,

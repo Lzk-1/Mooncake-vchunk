@@ -8,16 +8,15 @@
 //       [--publish]
 //
 //   系统从 CVM 自动获取已注册 psegment（含 medium/io_alignment/
-//   supports_unaligned_io/failure_domain/vsegment_exclusive 等资源事实），
+//   supports_unaligned_io/failure_domain/used_bytes 等资源事实），
 //   从 KV PT 自动获取 Partition 列表，校验容量/介质/对齐能力和可分配范围
 //   后，计算各 Partition 的静态配额并（可选）发布到 ETCD。默认 dry-run，
 //   加 --publish 才真正发布。
 //
-//   安全约束：自动发现「总容量」≠「空闲空间」。仅 vsegment_exclusive=true
-//   的 psegment 才会按 capacity 切分；非专用 psegment 会被拒绝。要声明本
-//   集群 segment 为 vsegment 专用且空，在 master 启动时设置
-//   cvm_segments_vsegment_exclusive=true（仅初始化阶段整个集群专供 vsegment
-//   时置 true）。
+//   空间安全：按 [used_bytes, capacity) 作为 vsegment 可切分范围，避免与
+//   其他分配器占用范围重叠。vsegment_exclusive=true 时校验 used_bytes==0
+//   （快路径）；false 时按 [used_bytes, capacity) 切分。用户无需手动声明
+//   exclusive。
 //
 // 离线规划/单元测试（手写完整 JSON，不作为正式部署方式）：
 //   vsegment_quota_planner --input request.json [--dry_run]
@@ -77,10 +76,10 @@ DEFINE_bool(publish, false,
             "Publish the snapshot to ETCD (requires --dry_run=false). "
             "Default false (safe).");
 DEFINE_bool(allow_non_exclusive, false,
-            "Allow automatic discovery to treat non-vsegment_exclusive "
-            "psegments as allocatable. ONLY for advanced users who have "
-            "confirmed allocatable ranges via the space management "
-            "mechanism out of band, or for tests. Default false.");
+            "[DEPRECATED] Kept for backward compatibility. Automatic "
+            "discovery now uses [used_bytes, capacity) as the allocatable "
+            "range by default, so non-exclusive segments are accepted "
+            "without this flag. No longer has any effect.");
 
 namespace {
 
@@ -163,7 +162,7 @@ int RunFromDiscovery(mooncake::vsegment::PartitionQuotaPlanRequest& request) {
         return 3;
     }
     LOG(INFO) << "Discovered " << request.segments.size()
-              << " live vsegment_exclusive psegments from CVM; "
+              << " psegments with usable free space from CVM; "
               << request.partition_ids.size() << " partitions";
     return 0;
 }

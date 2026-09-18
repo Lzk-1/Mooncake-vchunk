@@ -87,14 +87,20 @@ struct SegmentDescriptor {
     bool supports_unaligned_io{true};
     // 故障域标识，缺省由 host_id 兜底，可由部署标签补充。
     std::string failure_domain;
-    // 是否为「vsegment 专用且当前为空」的 psegment。true 时自动发现可
-    // 直接按 capacity 切分；false 时自动发现拒绝，需通过空间管理机制
-    // 显式声明可分配范围（避免把总容量当作空闲空间）。
+    // 当前已分配字节数（由 allocator 实时维护）。自动发现按
+    // [used_bytes, capacity) 作为 vsegment 可切分范围，避免与其他
+    // 分配器占用范围重叠。旧 JSON 缺该字段时反序列化为 0，等同
+    // exclusive 空集群，向后兼容。
+    uint64_t used_bytes{0};
+    // 可选 hint：是否为「vsegment 专用且当前为空」的 psegment。true 时
+    // 自动发现要求 used_bytes==0，快路径直接按 capacity 切分；false 时
+    // 自动发现按 [used_bytes, capacity) 切分。不再强制声明。
     bool vsegment_exclusive{false};
 };
 YLT_REFL(SegmentDescriptor, segment_id, segment_name, capacity, te_endpoint,
          protocol, host_id, partitions, medium, io_alignment,
-         supports_unaligned_io, failure_domain, vsegment_exclusive);
+         supports_unaligned_io, failure_domain, used_bytes,
+         vsegment_exclusive);
 
 // ---------------------------------------------------------------------------
 // Master registration: liveness + role, persisted under an etcd lease
