@@ -1,7 +1,7 @@
 // vsegment_quota_planner: vsegment 静态配额规划工具。
 //
 // 正常部署方式（自动发现，用户只需 3 个核心策略参数）：
-//   vsegment_quota_planner \
+//   vsegment_quota_planner
 //       --etcd_endpoints 127.0.0.1:2379 \
 //       --cluster_namespace my-cluster \
 //       --member_count 4 --stripe_size 65536 --member_extent_size 1048576 \

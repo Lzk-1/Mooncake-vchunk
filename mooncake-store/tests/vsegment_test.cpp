@@ -201,8 +201,8 @@ TEST(VSegmentConfigTest, ValidatesPublishedConfigAgainstSegmentGeometry) {
     auto profile = Profile();
     auto config = Config();
     std::vector<PSegmentGeometry> segments = {
-        {"segment-a", 2048, 8, "DRAM"},
-        {"segment-b", 2048, 8, "DRAM"}};
+        {"segment-a", 2048, 0, 8, "DRAM"},
+        {"segment-b", 2048, 0, 8, "DRAM"}};
     EXPECT_EQ(ValidatePublishedConfig({profile}, {config}, segments, {}),
               ErrorCode::OK);
 
@@ -236,10 +236,10 @@ TEST(PartitionQuotaPlannerTest, SplitsEveryMediumAcrossAllPartitions) {
          .member_extent_size = 128,
          .io_alignment = 8,
          .required_medium = "NVMe"}};
-    request.segments = {{"dram-a", 1024, 8, "DRAM"},
-                        {"dram-b", 1024, 8, "DRAM"},
-                        {"nvme-a", 2048, 8, "NVMe"},
-                        {"nvme-b", 2048, 8, "NVMe"}};
+    request.segments = {{"dram-a", 1024, 0, 8, "DRAM"},
+                        {"dram-b", 1024, 0, 8, "DRAM"},
+                        {"nvme-a", 2048, 0, 8, "NVMe"},
+                        {"nvme-b", 2048, 0, 8, "NVMe"}};
 
     auto result = PartitionQuotaPlanner().Plan(request);
     ASSERT_TRUE(result) << result.detail;
@@ -267,7 +267,7 @@ TEST(PartitionQuotaPlannerTest, RejectsInsufficientMemberSegments) {
     request.default_profile = "default";
     request.partition_ids = {"partition-a"};
     request.profile_specs = {Profile(2)};
-    request.segments = {{"only-one", 4096, 8, "DRAM"}};
+    request.segments = {{"only-one", 4096, 0, 8, "DRAM"}};
     auto result = PartitionQuotaPlanner().Plan(request);
     EXPECT_EQ(result.error, ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
     EXPECT_NE(result.detail.find("requires 2 psegments"), std::string::npos);
@@ -285,10 +285,10 @@ TEST(VSegmentConfigTest, AllowsMultipleProfilesForOnePartition) {
     nvme_config.profile_name = "nvme";
     nvme_config.quotas = {{"nvme-a", 0, 512}, {"nvme-b", 0, 512}};
     std::vector<PSegmentGeometry> segments = {
-        {"segment-a", 2048, 8, "DRAM"},
-        {"segment-b", 2048, 8, "DRAM"},
-        {"nvme-a", 2048, 8, "NVMe"},
-        {"nvme-b", 2048, 8, "NVMe"}};
+        {"segment-a", 2048, 0, 8, "DRAM"},
+        {"segment-b", 2048, 0, 8, "DRAM"},
+        {"nvme-a", 2048, 0, 8, "NVMe"},
+        {"nvme-b", 2048, 0, 8, "NVMe"}};
     EXPECT_EQ(ValidatePublishedConfig({dram, nvme},
                                       {dram_config, nvme_config}, segments,
                                       {}),
@@ -306,8 +306,8 @@ TEST(PartitionQuotaPlannerTest, RejectsOverlappingBalancedProfilePools) {
     auto second = Profile();
     second.name = "second";
     request.profile_specs = {first, second};
-    request.segments = {{"segment-a", 1024, 8, "DRAM", true, true},
-                        {"segment-b", 1024, 8, "DRAM", true, true}};
+    request.segments = {{"segment-a", 1024, 0, 8, "DRAM", true, true},
+                        {"segment-b", 1024, 0, 8, "DRAM", true, true}};
     auto result = PartitionQuotaPlanner().Plan(request);
     EXPECT_EQ(result.error, ErrorCode::INVALID_PARAMS);
     EXPECT_NE(result.detail.find("overlap"), std::string::npos);
@@ -320,8 +320,8 @@ TEST(PartitionQuotaPlannerTest, ExcludesUnhealthySegments) {
     request.default_profile = "default";
     request.partition_ids = {"partition-a"};
     request.profile_specs = {Profile(2)};
-    request.segments = {{"healthy", 4096, 8, "DRAM", true, true, "host-a"},
-                        {"unhealthy", 4096, 8, "DRAM", false, true,
+    request.segments = {{"healthy", 4096, 0, 8, "DRAM", true, true, "host-a"},
+                        {"unhealthy", 4096, 0, 8, "DRAM", false, true,
                          "host-b"}};
     EXPECT_EQ(PartitionQuotaPlanner().Plan(request).error,
               ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
@@ -334,8 +334,8 @@ TEST(PartitionQuotaPlannerTest, AppliesReservedRatioAndAlignment) {
     request.default_profile = "default";
     request.partition_ids = {"partition-b", "partition-a"};
     request.profile_specs = {Profile(2)};
-    request.segments = {{"segment-a", 1000, 16, "DRAM"},
-                        {"segment-b", 1000, 16, "DRAM"}};
+    request.segments = {{"segment-a", 1000, 0, 16, "DRAM"},
+                        {"segment-b", 1000, 0, 16, "DRAM"}};
     request.reserved_ratio = 0.1;
 
     auto result = PartitionQuotaPlanner().Plan(request);
