@@ -2095,10 +2095,10 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeBuildsProfilePerMedium) {
     master.master_id = "master-a";
     std::vector<cvm::MasterRegistration> masters = {master};
     std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
-        {"master-a", {{"dram-a"}, {}, {}, {}, {}}},
-        {"master-a", {{"dram-b"}, {}, {}, {}, {}}},
-        {"master-a", {{"nvme-a"}, {}, {}, {}, {}}},
-        {"master-a", {{"nvme-b"}, {}, {}, {}, {}}},
+        {"master-a", {{"dram-a"}, {}, {}}},
+        {"master-a", {{"dram-b"}, {}, {}}},
+        {"master-a", {{"nvme-a"}, {}, {}}},
+        {"master-a", {{"nvme-b"}, {}, {}}},
     };
 
     PartitionQuotaPlanRequest request;
@@ -2162,9 +2162,9 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeSkipsInsufficientMedium) {
     master.master_id = "master-a";
     std::vector<cvm::MasterRegistration> masters = {master};
     std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
-        {"master-a", {{"dram-a"}, {}, {}, {}, {}}},
-        {"master-a", {{"nvme-a"}, {}, {}, {}, {}}},
-        {"master-a", {{"nvme-b"}, {}, {}, {}, {}}},
+        {"master-a", {{"dram-a"}, {}, {}}},
+        {"master-a", {{"nvme-a"}, {}, {}}},
+        {"master-a", {{"nvme-b"}, {}, {}}},
     };
 
     PartitionQuotaPlanRequest request;
