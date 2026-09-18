@@ -1696,7 +1696,10 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     desc.te_endpoint = segment.te_endpoint;
     desc.protocol = segment.protocol;
     desc.host_id = segment.host_id;
-    desc.medium = cvm_segment_default_medium_;
+    // 优先用 client 上报的 segment.medium（支持混合介质集群：不同 segment
+    // 可上报不同 medium，如 "cpu:0"/"cuda:0"/"ssd:0"）；缺省回退集群默认。
+    desc.medium = segment.medium.empty() ? cvm_segment_default_medium_
+                                         : segment.medium;
     desc.io_alignment = 1;  // 保守默认；Planner 取 max(profile, segment)
     desc.supports_unaligned_io = true;
     desc.failure_domain =

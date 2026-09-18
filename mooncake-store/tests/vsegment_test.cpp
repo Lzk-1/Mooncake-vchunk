@@ -2064,5 +2064,120 @@ TEST(BuildDiscoveredQuotaPlanTest, AllowNonExclusiveIsDeprecatedNoop) {
     }
 }
 
+// auto 模式：required_medium 为空时，系统自动发现所有介质，为每种介质
+// 建独立 profile。混合介质集群（DRAM + NVMe）无需用户手动配置 required_medium。
+TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeBuildsProfilePerMedium) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium.clear();  // auto 模式
+
+    cvm::SegmentDescriptor dram_a;
+    dram_a.segment_id = "dram-a";
+    dram_a.capacity = 4096;
+    dram_a.te_endpoint = "host-a:1234";
+    dram_a.host_id = "host-a";
+    dram_a.medium = "DRAM";
+    dram_a.io_alignment = 8;
+    dram_a.used_bytes = 0;
+    cvm::SegmentDescriptor dram_b = dram_a;
+    dram_b.segment_id = "dram-b";
+    cvm::SegmentDescriptor nvme_a = dram_a;
+    nvme_a.segment_id = "nvme-a";
+    nvme_a.medium = "NVMe";
+    cvm::SegmentDescriptor nvme_b = nvme_a;
+    nvme_b.segment_id = "nvme-b";
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {dram_a, dram_b,
+                                                       nvme_a, nvme_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", {{"dram-a"}, {}, {}, {}, {}}},
+        {"master-a", {{"dram-b"}, {}, {}, {}, {}}},
+        {"master-a", {{"nvme-a"}, {}, {}, {}, {}}},
+        {"master-a", {{"nvme-b"}, {}, {}, {}, {}}},
+    };
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    ASSERT_EQ(error, ErrorCode::OK) << detail;
+    // 两种介质各 2 个 segment，都 >= member_count=2，都建 profile。
+    ASSERT_EQ(request.segments.size(), 4u);
+    ASSERT_EQ(request.profile_specs.size(), 2u);
+    // profile 名格式：profile_name-medium
+    EXPECT_EQ(request.profile_specs[0].name, "default-DRAM");
+    EXPECT_EQ(request.profile_specs[0].required_medium, "DRAM");
+    EXPECT_EQ(request.profile_specs[1].name, "default-NVMe");
+    EXPECT_EQ(request.profile_specs[1].required_medium, "NVMe");
+    // default_profile 选字典序首个介质对应的 profile。
+    EXPECT_EQ(request.default_profile, "default-DRAM");
+    // 每个 profile 继承用户配的 3 个核心参数。
+    for (const auto& profile : request.profile_specs) {
+        EXPECT_EQ(profile.member_count, 2u);
+        EXPECT_EQ(profile.stripe_size, 64u);
+        EXPECT_EQ(profile.member_extent_size, 256u);
+    }
+
+    // Plan 应成功，每种介质各建一套 quota。
+    PartitionQuotaPlanner planner;
+    auto result = planner.Plan(request);
+    ASSERT_EQ(result.error, ErrorCode::OK) << result.detail;
+    // 每个 partition 有 2 个 quota（DRAM 一个、NVMe 一个）。
+    // partition_ids.size() == kSlotCount，quotas.size() == 2 * kSlotCount。
+    EXPECT_EQ(result.snapshot.quotas.size(),
+              request.partition_ids.size() * 2);
+}
+
+// auto 模式：介质 segment 数 < member_count 时跳过该介质。
+TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeSkipsInsufficientMedium) {
+    VSegmentUserPolicy policy;
+    policy.member_count = 2;
+    policy.stripe_size = 64;
+    policy.member_extent_size = 256;
+    policy.required_medium.clear();  // auto 模式
+
+    cvm::SegmentDescriptor seg;
+    seg.capacity = 4096;
+    seg.te_endpoint = "host-a:1234";
+    seg.host_id = "host-a";
+    seg.io_alignment = 8;
+    seg.used_bytes = 0;
+    // DRAM 只有 1 个（不足 member_count=2），NVMe 有 2 个（足够）。
+    cvm::SegmentDescriptor dram_a = seg;
+    dram_a.segment_id = "dram-a";
+    dram_a.medium = "DRAM";
+    cvm::SegmentDescriptor nvme_a = seg;
+    nvme_a.segment_id = "nvme-a";
+    nvme_a.medium = "NVMe";
+    cvm::SegmentDescriptor nvme_b = nvme_a;
+    nvme_b.segment_id = "nvme-b";
+
+    std::vector<cvm::SegmentDescriptor> descriptors = {dram_a, nvme_a, nvme_b};
+    cvm::MasterRegistration master;
+    master.master_id = "master-a";
+    std::vector<cvm::MasterRegistration> masters = {master};
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts = {
+        {"master-a", {{"dram-a"}, {}, {}, {}, {}}},
+        {"master-a", {{"nvme-a"}, {}, {}, {}, {}}},
+        {"master-a", {{"nvme-b"}, {}, {}, {}, {}}},
+    };
+
+    PartitionQuotaPlanRequest request;
+    std::string detail;
+    auto error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                          &request, &detail);
+    ASSERT_EQ(error, ErrorCode::OK) << detail;
+    // DRAM 跳过，只保留 NVMe 的 2 个 segment。
+    ASSERT_EQ(request.segments.size(), 2u);
+    ASSERT_EQ(request.profile_specs.size(), 1u);
+    EXPECT_EQ(request.profile_specs[0].required_medium, "NVMe");
+    EXPECT_EQ(request.default_profile, "default-NVMe");
+}
+
 }  // namespace
 }  // namespace mooncake::vsegment

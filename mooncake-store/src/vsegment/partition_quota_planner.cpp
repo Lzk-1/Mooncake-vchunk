@@ -45,11 +45,9 @@ ErrorCode BuildDiscoveredQuotaPlan(
         if (detail) *detail = "reserved_ratio must be in [0, 1)";
         return ErrorCode::INVALID_PARAMS;
     }
-    if (policy.default_profile.empty() || policy.profile_name.empty() ||
-        policy.required_medium.empty()) {
+    if (policy.default_profile.empty() || policy.profile_name.empty()) {
         if (detail)
-            *detail = "default_profile, profile_name and required_medium "
-                      "must not be empty";
+            *detail = "default_profile and profile_name must not be empty";
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -57,12 +55,21 @@ ErrorCode BuildDiscoveredQuotaPlan(
     next.config_generation = policy.config_generation;
     next.default_profile = policy.default_profile;
     next.reserved_ratio = policy.reserved_ratio;
-    next.profile_specs = {{policy.profile_name, policy.member_count,
-                           policy.stripe_size, policy.member_extent_size,
-                           policy.io_alignment, policy.required_medium,
-                           policy.initial_vsegment_count}};
-    auto error = ValidateProfile(next.profile_specs.front(), detail);
-    if (error != ErrorCode::OK) return error;
+    // required_medium 模式：
+    //   - 非空（用户显式指定）：单一 profile，只接受匹配 medium 的 segment
+    //   - 空（auto）：系统自动发现所有介质，为每种介质建独立 profile
+    //     （继承 member_count/stripe_size/member_extent_size），每种介质
+    //     的 segment 分别切分给各 partition。default_profile 选首个发现的
+    //     介质对应的 profile。
+    const bool auto_medium_mode = policy.required_medium.empty();
+    if (!auto_medium_mode) {
+        next.profile_specs = {{policy.profile_name, policy.member_count,
+                               policy.stripe_size, policy.member_extent_size,
+                               policy.io_alignment, policy.required_medium,
+                               policy.initial_vsegment_count}};
+        auto error = ValidateProfile(next.profile_specs.front(), detail);
+        if (error != ErrorCode::OK) return error;
+    }
 
     // 在线 master 集合（用于过滤 mount 记录：仅 live master 的 mount 才算
     // 该 psegment 在线）。
@@ -127,23 +134,83 @@ ErrorCode BuildDiscoveredQuotaPlan(
                                  desc.medium, /*healthy=*/true,
                                  desc.supports_unaligned_io, failure_domain});
     }
-    if (next.segments.size() < policy.member_count) {
-        if (detail) {
-            std::ostringstream os;
-            os << "insufficient segments with usable free space for "
-                  "member_count="
-               << policy.member_count << ", discovered=" << next.segments.size();
-            if (!insufficient_space.empty()) {
-                os << " (additionally " << insufficient_space.size()
-                   << " segments skipped due to insufficient free space: ";
-                for (size_t i = 0; i < insufficient_space.size(); ++i) {
-                    if (i) os << ",";
-                    os << insufficient_space[i];
-                }
-                os << ")";
-            }
-            *detail = os.str();
+    // auto 模式：按介质分组，为每种 segment 数 >= member_count 的介质自动
+    // 建独立 profile；segment 数不足的介质跳过（其 segment 不参与分配）。
+    // 非 auto 模式：保留匹配 required_medium 的 segment，总数 < member_count
+    // 即失败（原行为）。
+    if (auto_medium_mode) {
+        std::map<std::string, size_t> per_medium_count;
+        for (const auto& seg : next.segments)
+            ++per_medium_count[seg.medium];
+        std::set<std::string> accepted_media;
+        for (const auto& [medium, count] : per_medium_count) {
+            if (count >= policy.member_count) accepted_media.insert(medium);
         }
+        std::vector<PSegmentGeometry> accepted_segments;
+        for (const auto& seg : next.segments)
+            if (accepted_media.count(seg.medium))
+                accepted_segments.push_back(seg);
+        next.segments = std::move(accepted_segments);
+        // 为每个接受的介质建独立 profile（继承用户配的 3 个核心参数）。
+        for (const auto& medium : accepted_media) {
+            next.profile_specs.push_back(
+                {policy.profile_name + "-" + medium, policy.member_count,
+                 policy.stripe_size, policy.member_extent_size,
+                 policy.io_alignment, medium,
+                 policy.initial_vsegment_count});
+        }
+        if (next.profile_specs.empty()) {
+            if (detail) {
+                std::ostringstream os;
+                os << "auto medium mode: no medium has >= member_count="
+                   << policy.member_count
+                   << " segments; per-medium counts: ";
+                bool first = true;
+                for (const auto& [medium, count] : per_medium_count) {
+                    if (!first) os << ", ";
+                    first = false;
+                    os << medium << "=" << count;
+                }
+                *detail = os.str();
+            }
+            return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+        }
+        // default_profile 选首个接受的介质（按字典序，确定性好复现）。
+        next.default_profile = next.profile_specs.front().name;
+        // 校验每个自动建的 profile。
+        for (const auto& profile : next.profile_specs) {
+            auto error = ValidateProfile(profile, detail);
+            if (error != ErrorCode::OK) return error;
+        }
+    } else {
+        // 非 auto 模式：校验匹配 required_medium 的 segment 数 >= member_count。
+        size_t matched = 0;
+        for (const auto& seg : next.segments)
+            if (seg.medium == policy.required_medium) ++matched;
+        if (matched < policy.member_count) {
+            if (detail) {
+                std::ostringstream os;
+                os << "insufficient segments with usable free space for "
+                      "member_count="
+                   << policy.member_count
+                   << ", medium=" << policy.required_medium
+                   << ", discovered=" << matched;
+                if (!insufficient_space.empty()) {
+                    os << " (additionally " << insufficient_space.size()
+                       << " segments skipped due to insufficient free space: ";
+                    for (size_t i = 0; i < insufficient_space.size(); ++i) {
+                        if (i) os << ",";
+                        os << insufficient_space[i];
+                    }
+                    os << ")";
+                }
+                *detail = os.str();
+            }
+            return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+        }
+    }
+    if (next.segments.empty()) {
+        if (detail) *detail = "no segments with usable free space discovered";
         return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
     }
     std::sort(next.segments.begin(), next.segments.end(),

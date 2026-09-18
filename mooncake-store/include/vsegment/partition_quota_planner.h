@@ -36,7 +36,11 @@ struct VSegmentUserPolicy {
     // 可选策略（提供默认值）
     std::string default_profile = "default";
     std::string profile_name = "default";
-    std::string required_medium = "REGISTERED_MEMORY";
+    // 必填介质筛选。空字符串表示 auto：系统自动发现所有介质，为每种介质
+    // 自动建独立 profile（继承 member_count/stripe_size/member_extent_size），
+    // 每种介质的 segment 分别切分给各 partition。支持混合介质集群，用户
+    // 无需为每种介质单独配置。default_profile 选首个发现的介质。
+    std::string required_medium{};
     uint64_t io_alignment = 1;
     uint32_t initial_vsegment_count = 1;
     double reserved_ratio = 0.0;    // 默认不预留

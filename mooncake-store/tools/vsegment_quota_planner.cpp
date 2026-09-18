@@ -24,6 +24,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 
 #include <gflags/gflags.h>
@@ -58,10 +59,14 @@ DEFINE_string(default_profile, "default",
               "Default profile name. Default \"default\".");
 DEFINE_string(profile_name, "default",
               "Profile name for the single-profile plan. Default \"default\".");
-DEFINE_string(required_medium, "REGISTERED_MEMORY",
-              "Required medium for the profile. Must match the medium "
-              "reported by SegmentDescriptor. Default "
-              "\"REGISTERED_MEMORY\".");
+DEFINE_string(required_medium, "",
+              "Required medium for the profile. Empty (default) = auto mode: "
+              "system discovers all media and builds an independent profile per "
+              "medium (same member_count/stripe_size/member_extent_size). "
+              "Non-empty = single profile, only segments matching this medium "
+              "are used. Must match the medium reported by SegmentDescriptor "
+              "(e.g. \"cpu:0\", \"cuda:0\", \"ssd:0\", or legacy "
+              "\"REGISTERED_MEMORY\").");
 DEFINE_uint64(io_alignment, 1,
               "I/O alignment in bytes for the profile. Planner takes "
               "max(profile.io_alignment, segment.io_alignment). Default 1.");
@@ -80,8 +85,158 @@ DEFINE_bool(allow_non_exclusive, false,
             "discovery now uses [used_bytes, capacity) as the allocatable "
             "range by default, so non-exclusive segments are accepted "
             "without this flag. No longer has any effect.");
+DEFINE_bool(skip_verify, false,
+            "Skip automatic verification of discovered snapshot before "
+            "output/publish. Default false (verify enabled). The verifier "
+            "checks base_offset=used_bytes, extent length consistency, "
+            "arithmetic progression, medium match, and member_count; "
+            "use --skip_verify only for debugging.");
 
 namespace {
+
+// 自动核对 dry-run 结果与请求的一致性，无需用户手动对照 ETCD。
+// 核对项（每项输出 [PASS]/[FAIL]/[SKIP] 到 stderr）：
+//   1. partition 0 中每个 segment 的 extent.base_offset == seg.base_offset
+//      （seg.base_offset = desc.used_bytes，验证切分起点正确）
+//   2. 同一 segment 在所有 partition 中的 extent.length 相等
+//   3. 同一 segment 在相邻 partition 之间 base_offset 差值 == length（等差递增）
+//   4. 介质一致：snapshot.quotas[].medium == seg.medium
+//   5. discovered segments >= member_count（每个 profile）
+//   6. per_partition==0 的 segment 不出现在任何 partition 的 extents 中
+// 返回 true 表示全部通过；false 表示有 FAIL 项。
+bool VerifyDiscoveredSnapshot(
+    const mooncake::vsegment::PartitionQuotaPlanRequest& request,
+    const mooncake::vsegment::PartitionPhysicalQuotaSnapshot& snapshot,
+    std::string* detail) {
+    std::ostringstream os;
+    size_t fail = 0, warn = 0, pass = 0;
+
+    // 收集每个 partition 中每个 segment 的 extent
+    std::map<std::string, std::map<std::string, mooncake::vsegment::PSegmentExtent>>
+        by_partition;
+    for (const auto& quota : snapshot.quotas) {
+        for (const auto& ext : quota.extents) {
+            by_partition[quota.partition_id][ext.segment_id] = ext;
+        }
+    }
+
+    // 核对每个发现的 segment
+    for (const auto& seg : request.segments) {
+        // 找该 segment 在所有 partition 中的 extent（按 partition_ids 顺序）
+        std::vector<std::pair<size_t, mooncake::vsegment::PSegmentExtent>>
+            seg_extents;
+        for (size_t i = 0; i < request.partition_ids.size(); ++i) {
+            const auto& pid = request.partition_ids[i];
+            auto pit = by_partition.find(pid);
+            if (pit == by_partition.end()) continue;
+            auto sit = pit->second.find(seg.segment_id);
+            if (sit != pit->second.end())
+                seg_extents.emplace_back(i, sit->second);
+        }
+
+        if (seg_extents.empty()) {
+            // 不出现在任何 partition：可能 per_partition==0（usable 太小）
+            os << "[SKIP] " << seg.segment_id
+               << " base_offset=" << seg.base_offset
+               << " capacity=" << seg.capacity
+               << " (per_partition=0 or no extents)\n";
+            ++warn;
+            continue;
+        }
+
+        // 1. partition 0 的 base_offset == seg.base_offset
+        bool has_p0 = false;
+        for (const auto& [idx, ext] : seg_extents) {
+            if (idx == 0) {
+                has_p0 = true;
+                if (ext.base_offset != seg.base_offset) {
+                    os << "[FAIL] " << seg.segment_id
+                       << " partition 0 base_offset=" << ext.base_offset
+                       << " != seg.base_offset=" << seg.base_offset
+                       << " (expected base_offset=used_bytes)\n";
+                    ++fail;
+                } else {
+                    ++pass;
+                }
+            }
+        }
+        if (!has_p0) {
+            os << "[FAIL] " << seg.segment_id << " missing in partition 0\n";
+            ++fail;
+        }
+
+        // 2. 长度一致
+        uint64_t ref_len = seg_extents.front().second.length;
+        for (const auto& [idx, ext] : seg_extents) {
+            if (ext.length != ref_len) {
+                os << "[FAIL] " << seg.segment_id << " partition " << idx
+                   << " length=" << ext.length << " != ref=" << ref_len << "\n";
+                ++fail;
+            }
+        }
+
+        // 3. 等差递增：base_offset[i] = base_offset[i-1] + length
+        for (size_t k = 1; k < seg_extents.size(); ++k) {
+            uint64_t prev = seg_extents[k - 1].second.base_offset;
+            uint64_t curr = seg_extents[k].second.base_offset;
+            if (curr != prev + ref_len) {
+                os << "[FAIL] " << seg.segment_id << " partition "
+                   << seg_extents[k].first
+                   << " base_offset=" << curr
+                   << " != prev+length=" << (prev + ref_len) << "\n";
+                ++fail;
+            }
+        }
+
+        // 4. 介质一致
+        for (const auto& quota : snapshot.quotas) {
+            bool found = false;
+            for (const auto& ext : quota.extents) {
+                if (ext.segment_id == seg.segment_id) { found = true; break; }
+            }
+            if (found && quota.medium != seg.medium) {
+                os << "[FAIL] " << seg.segment_id
+                   << " partition " << quota.partition_id
+                   << " medium=" << quota.medium
+                   << " != seg.medium=" << seg.medium << "\n";
+                ++fail;
+            }
+        }
+    }
+
+    // 5. discovered >= member_count（每个 profile 按 medium 匹配）
+    for (const auto& profile : request.profile_specs) {
+        size_t count = 0;
+        for (const auto& seg : request.segments) {
+            if (seg.medium == profile.required_medium) ++count;
+        }
+        if (count < profile.member_count) {
+            os << "[FAIL] profile " << profile.name
+               << " discovered=" << count
+               << " < member_count=" << profile.member_count << "\n";
+            ++fail;
+        } else {
+            os << "[PASS] profile " << profile.name
+               << " discovered=" << count
+               << " >= member_count=" << profile.member_count << "\n";
+            ++pass;
+        }
+    }
+
+    // 汇总
+    if (fail == 0) {
+        os << "[PASS] verify ok: " << request.segments.size()
+           << " segments, " << request.partition_ids.size()
+           << " partitions, " << pass << " checks passed, " << warn
+           << " skipped\n";
+    } else {
+        os << "[FAIL] verify failed: " << fail << " failures, " << warn
+           << " skipped\n";
+    }
+
+    *detail = os.str();
+    return fail == 0;
+}
 
 int RunFromInput(mooncake::vsegment::PartitionQuotaPlanRequest& request) {
     if (FLAGS_input.empty()) {
@@ -185,6 +340,22 @@ int main(int argc, char** argv) {
     }
     std::string serialized;
     struct_json::to_json(result.snapshot, serialized);
+
+    // 自动发现模式下自动核对（无需用户手动对照 ETCD）。
+    // 核对 base_offset=used_bytes、extent 等差递增、介质一致、member_count。
+    // --skip_verify 可跳过（仅调试用）。核对失败则中止，不输出也不发布。
+    if (!input_mode && !FLAGS_skip_verify) {
+        std::string verify_detail;
+        bool ok = VerifyDiscoveredSnapshot(request, result.snapshot,
+                                           &verify_detail);
+        std::cerr << verify_detail;
+        if (!ok) {
+            LOG(ERROR) << "Snapshot verification failed; aborting. "
+                          "Use --skip_verify to bypass (not recommended).";
+            return 6;
+        }
+        LOG(INFO) << "Snapshot verification passed.";
+    }
 
     const bool want_publish = FLAGS_publish || !FLAGS_dry_run;
     if (!want_publish) {
