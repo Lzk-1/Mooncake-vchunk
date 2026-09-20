@@ -246,8 +246,11 @@ TEST(PartitionQuotaPlannerTest, SplitsEveryMediumAcrossAllPartitions) {
     ASSERT_EQ(result.snapshot.quotas.size(), 4);
     EXPECT_EQ(result.snapshot.quotas[0].partition_id, "partition-a");
     EXPECT_EQ(result.snapshot.quotas[0].profile_name, "dram");
-    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 0);
-    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 512);
+    // partition_ids = {"partition-b", "partition-a"}: partition-b 是 index 0
+    // (base_offset=0), partition-a 是 index 1 (base_offset=512). snapshot.quotas
+    // 按 partition_id 字典序排列，partition-a 在前。
+    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 512);
+    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 0);
     EXPECT_EQ(result.snapshot.quotas[2].profile_name, "nvme");
     EXPECT_EQ(ValidateQuotaSnapshot(result.snapshot, request.segments),
               ErrorCode::OK);
@@ -349,9 +352,11 @@ TEST(PartitionQuotaPlannerTest, AppliesReservedRatioAndAlignment) {
         }
     }
     EXPECT_EQ(result.snapshot.quotas[0].partition_id, "partition-a");
-    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 0u);
+    // partition_ids = {"partition-b", "partition-a"}: partition-b 是 index 0
+    // (base_offset=0), partition-a 是 index 1 (base_offset=448).
+    EXPECT_EQ(result.snapshot.quotas[0].extents[0].base_offset, 448u);
     EXPECT_EQ(result.snapshot.quotas[1].partition_id, "partition-b");
-    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 448u);
+    EXPECT_EQ(result.snapshot.quotas[1].extents[0].base_offset, 0u);
 }
 
 TEST(VSegmentViewTest, ChecksumCoversOrderedMembers) {
