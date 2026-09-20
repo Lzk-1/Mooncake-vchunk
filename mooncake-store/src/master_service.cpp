@@ -1028,7 +1028,10 @@ MasterService::BuildAndPublishVsegmentPlan() {
     // ETCD Create 事务（create-if-not-exists）：多 master 并发时只有一个成功，
     // 失败方返回错误并在 RefreshVSegmentOwnership 中重新 Load。
     vsegment::EtcdPartitionQuotaSnapshotStore store(cluster_id_);
-    constexpr size_t kMaxEtcdValueBytes = 1500000;
+    // 32MB，与文档建议的 ETCD 服务端 --max-request-bytes 对齐。
+    // 16384 partition × 多段快照约 4.6~6.9MB，旧值 1.5MB 会导致客户端预检
+    // 直接拒绝（Create 返回 INVALID_PARAMS），方案A 对大集群形同虚设。
+    constexpr size_t kMaxEtcdValueBytes = 32 * 1024 * 1024;
     error = store.Create(result.snapshot, kMaxEtcdValueBytes, &detail);
     if (error != ErrorCode::OK) {
         LOG(WARNING) << "Auto vsegment plan: publish failed: " << detail;
