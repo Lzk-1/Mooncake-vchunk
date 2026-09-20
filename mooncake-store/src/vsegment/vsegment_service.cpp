@@ -207,13 +207,19 @@ VSegmentService::StartPutReplicasOwned(
     const std::string& profile_name) {
     auto manager = FindPartition(partition_id);
     if (!manager) return tl::make_unexpected(ErrorCode::STALE_ROUTE);
-    const auto epoch = manager->Snapshot().route_epoch;
+    // 传 0 跳过 StartPut 内部的 route_epoch 检查。该检查的本意是拒绝客户端
+    // stale route，但本路径由 master 内部调用，不存在 stale route 概念；
+    // 传 Snapshot().route_epoch 反而引入 TOCTOU race——Snapshot 和 StartPut
+    // 之间无锁，并发的 RefreshVSegmentOwnership 可更新 route_epoch_，导致
+    // StartPut 误判 STALE_ROUTE。传 0 让 StartPut 在持锁时跳过检查，
+    // FindPartition 返回 nullptr 已足够保证 partition 归属正确。
+    constexpr uint64_t kOwnedInternalEpoch = 0;
     std::vector<VSegmentPutStartResult> results;
     std::vector<std::string> selected;
     results.reserve(operation_ids.size());
     for (const auto& operation_id : operation_ids) {
         auto result = manager->StartPut(operation_id, length, profile_name,
-                                        epoch, selected);
+                                        kOwnedInternalEpoch, selected);
         if (!result) {
             // The group was not returned to the caller. Roll its earlier
             // reservations back without creating terminal abort tombstones,
