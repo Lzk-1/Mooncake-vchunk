@@ -44,11 +44,21 @@
 #include "vsegment/partition_quota_planner.h"
 // vsegment 自动规划：master 启动时若 ETCD 无快照且 --vsegment_member_count>0，
 // 自动调用 PartitionQuotaPlanner 规划并发布，无需手动运行 planner 工具。
-// Flags 在 master.cpp 中 DEFINE，此处 DECLARE 引用。
+// DEFINE 放在此处（编入 libmooncake_store.a），确保所有链接该库的目标都能
+// 解析符号；若放在 master.cpp 中则仅 master 可执行文件包含定义，测试和
+// benchmark 链接库时会出现 undefined reference。
 #include <gflags/gflags.h>
-DECLARE_uint64(vsegment_member_count);
-DECLARE_uint64(vsegment_stripe_size);
-DECLARE_uint64(vsegment_member_extent_size);
+DEFINE_uint64(vsegment_member_count, 0,
+              "vsegment member count per vsegment. 0 disables vsegment "
+              "(falls back to traditional single-psegment allocation). "
+              ">0 triggers automatic quota planning on master startup if "
+              "no snapshot exists in ETCD.");
+DEFINE_uint64(vsegment_stripe_size, 65536,
+              "vsegment stripe size in bytes. Used only when "
+              "vsegment_member_count > 0.");
+DEFINE_uint64(vsegment_member_extent_size, 1048576,
+              "vsegment member extent size in bytes. Used only when "
+              "vsegment_member_count > 0.");
 #endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
