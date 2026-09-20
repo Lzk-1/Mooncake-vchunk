@@ -2615,6 +2615,11 @@ class MasterService {
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
     ErrorCode RefreshVSegmentOwnership(const std::string& acquiring = {});
+    // vsegment 自动规划：ETCD 无快照且 --vsegment_member_count>0 时，master
+    // 启动自动调用 PartitionQuotaPlanner 规划并发布到 ETCD。ETCD Create 事务
+    // 保证多 master 只有一个发布成功，失败方重新 Load。规划失败回退传统路径。
+    tl::expected<vsegment::PartitionPhysicalQuotaSnapshot, ErrorCode>
+    BuildAndPublishVsegmentPlan();
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);

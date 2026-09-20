@@ -319,6 +319,21 @@ DEFINE_bool(cvm_segments_vsegment_exclusive, false,
             "as the allocatable range. No longer required — users need not "
             "set this for normal deployment.");
 
+// vsegment 自动规划：master 启动时若 ETCD 无配额快照且 member_count>0，leader
+// 自动调用 PartitionQuotaPlanner 规划并发布，无需手动运行 planner 工具。
+// member_count=0（默认）表示禁用 vsegment，回退传统单 psegment 分配路径。
+DEFINE_uint64(vsegment_member_count, 0,
+              "vsegment member count per vsegment. 0 disables vsegment "
+              "(falls back to traditional single-psegment allocation). "
+              ">0 triggers automatic quota planning on master startup if "
+              "no snapshot exists in ETCD.");
+DEFINE_uint64(vsegment_stripe_size, 65536,
+              "vsegment stripe size in bytes. Used only when "
+              "vsegment_member_count > 0.");
+DEFINE_uint64(vsegment_member_extent_size, 1048576,
+              "vsegment member extent size in bytes. Used only when "
+              "vsegment_member_count > 0.");
+
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
             "Enable HA metadata replication through batch-record OpLog");

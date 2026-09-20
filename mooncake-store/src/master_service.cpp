@@ -41,6 +41,14 @@
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "cvm/etcd_view_store.h"
 #include "cvm/cvm_keys.h"
+#include "vsegment/partition_quota_planner.h"
+// vsegment 自动规划：master 启动时若 ETCD 无快照且 --vsegment_member_count>0，
+// 自动调用 PartitionQuotaPlanner 规划并发布，无需手动运行 planner 工具。
+// Flags 在 master.cpp 中 DEFINE，此处 DECLARE 引用。
+#include <gflags/gflags.h>
+DECLARE_uint64(vsegment_member_count);
+DECLARE_uint64(vsegment_stripe_size);
+DECLARE_uint64(vsegment_member_extent_size);
 #endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
@@ -801,6 +809,30 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         std::string detail;
         vsegment::EtcdPartitionQuotaSnapshotStore store(cluster_id_);
         auto error = store.Load(&quota, &detail);
+        // 自动规划：ETCD 无快照 + --vsegment_member_count>0 → 规划并发布。
+        // ETCD Create 事务保证多 master 只有一个发布成功，失败方重新 Load。
+        if (error == ErrorCode::ETCD_KEY_NOT_EXIST &&
+            FLAGS_vsegment_member_count > 0) {
+            auto plan_result = BuildAndPublishVsegmentPlan();
+            if (plan_result) {
+                quota = std::move(*plan_result);
+                error = ErrorCode::OK;
+            } else {
+                // 规划失败或被其他 master 抢先发布。重新 Load 一次。
+                std::string reload_detail;
+                auto reload_error = store.Load(&quota, &reload_detail);
+                if (reload_error == ErrorCode::OK) {
+                    error = ErrorCode::OK;
+                } else {
+                    LOG(WARNING) << "Auto vsegment plan failed ("
+                                 << toString(plan_result.error())
+                                 << ") and reload also failed: "
+                                 << reload_detail
+                                 << "; falling back to traditional path";
+                    return ErrorCode::OK;
+                }
+            }
+        }
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) return ErrorCode::OK;
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "Failed to load vsegment quota: " << detail;
@@ -929,6 +961,73 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
             recovered_vsegment_snapshots_.end());
     }
     return complete ? ErrorCode::OK : ErrorCode::PERSISTENT_FAIL;
+}
+
+tl::expected<vsegment::PartitionPhysicalQuotaSnapshot, ErrorCode>
+MasterService::BuildAndPublishVsegmentPlan() {
+    // 自动规划：从 CVM 加载资源事实，调用 PartitionQuotaPlanner 规划，
+    // 再用 ETCD Create 事务发布快照。ETCD Create 保证多 master 只有一个
+    // 发布成功，其余 master 会失败并重新 Load 已发布的快照。
+    // 与 vsegment_quota_planner 工具的 RunFromDiscovery 路径一致，区别是
+    // 无需手动运行，且 etcd 客户端已在 master 启动时连接。
+    std::vector<cvm::SegmentDescriptor> descriptors;
+    std::vector<cvm::MasterRegistration> masters;
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
+    ViewVersionId revision = 0;
+    auto error = cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters,
+                                                    revision);
+    if (error == ErrorCode::OK)
+        error = cvm::EtcdViewStore::LoadAllSegmentDescriptors(
+            cluster_id_, descriptors, revision);
+    if (error == ErrorCode::OK)
+        error = cvm::EtcdViewStore::LoadAllMountEntries(cluster_id_, mounts,
+                                                        revision);
+    if (error != ErrorCode::OK) {
+        LOG(WARNING) << "Auto vsegment plan: CVM discovery failed: "
+                     << toString(error);
+        return tl::make_unexpected(error);
+    }
+
+    vsegment::VSegmentUserPolicy policy;
+    policy.member_count = static_cast<uint32_t>(FLAGS_vsegment_member_count);
+    policy.stripe_size = FLAGS_vsegment_stripe_size;
+    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
+    // required_medium 留空 → auto 模式：自动发现所有介质并按介质分别建 profile。
+    // 其余可选项使用 VSegmentUserPolicy 默认值，用户只需配 3 个核心参数。
+
+    vsegment::PartitionQuotaPlanRequest request;
+    std::string detail;
+    error = vsegment::BuildDiscoveredQuotaPlan(policy, descriptors, masters,
+                                               mounts, &request, &detail);
+    if (error != ErrorCode::OK) {
+        LOG(WARNING) << "Auto vsegment plan: BuildDiscoveredQuotaPlan failed: "
+                     << detail;
+        return tl::make_unexpected(error);
+    }
+    LOG(INFO) << "Auto vsegment plan: discovered "
+              << request.segments.size()
+              << " psegments with usable free space, "
+              << request.partition_ids.size() << " partitions";
+
+    auto result = vsegment::PartitionQuotaPlanner().Plan(request);
+    if (!result) {
+        LOG(WARNING) << "Auto vsegment plan: Plan failed: " << result.detail;
+        return tl::make_unexpected(result.error);
+    }
+
+    // ETCD Create 事务（create-if-not-exists）：多 master 并发时只有一个成功，
+    // 失败方返回错误并在 RefreshVSegmentOwnership 中重新 Load。
+    vsegment::EtcdPartitionQuotaSnapshotStore store(cluster_id_);
+    constexpr size_t kMaxEtcdValueBytes = 1500000;
+    error = store.Create(result.snapshot, kMaxEtcdValueBytes, &detail);
+    if (error != ErrorCode::OK) {
+        LOG(WARNING) << "Auto vsegment plan: publish failed: " << detail;
+        return tl::make_unexpected(error);
+    }
+    LOG(INFO) << "Auto vsegment plan: published generation "
+              << result.snapshot.config_generation << " with "
+              << result.snapshot.quotas.size() << " partition/profile quotas";
+    return result.snapshot;
 }
 
 #ifdef STORE_USE_ETCD
@@ -1621,6 +1720,10 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
 ErrorCode MasterService::StartSlotOwnerHeartbeat() { return ErrorCode::OK; }
 ErrorCode MasterService::RefreshVSegmentOwnership(const std::string&) {
     return ErrorCode::OK;
+}
+tl::expected<vsegment::PartitionPhysicalQuotaSnapshot, ErrorCode>
+MasterService::BuildAndPublishVsegmentPlan() {
+    return tl::make_unexpected(ErrorCode::ETCD_KEY_NOT_EXIST);
 }
 ErrorCode MasterService::StartInterMasterRpc() { return ErrorCode::OK; }
 void MasterService::StopInterMasterRpc() {}
